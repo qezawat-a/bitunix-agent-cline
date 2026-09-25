@@ -1,0 +1,214 @@
+import { CONFIG, parseBoolean } from './config.js';
+import { sendMessage, isOwner, esc, formatSignalReport } from './telegram-bot.js';
+import { applySettings, getTraderSettings, parseSettingValue, validateSettings } from './trader/settings.js';
+import { parseThinkingLevel } from './agent/thinking.js';
+import { detectProviders } from './agent/config.js';
+import { listOpenAiModels } from './agent/brain.js';
+
+function usage(chatId, text) {
+  return sendMessage(chatId, text).then(() => true);
+}
+
+function markCooldown(trader) {
+  if (trader?.state) trader.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
+}
+
+export function createTraderCommands({ client, scanner, trader, agent, loadSession = null, saveSession = null }) {
+  const scanState = { scanOn: true };
+  const reportState = { reportOn: true };
+
+  async function handleCommand(msg, text) {
+    const chatId = msg.chat.id;
+    if (!isOwner(msg)) {
+      await sendMessage(chatId, 'Not authorized.');
+      return true;
+    }
+    const [cmdRaw, ...rest] = text.trim().split(/\s+/);
+    const cmd = cmdRaw.replace(/^\//, '').split('@')[0];
+    const arg = rest.join(' ');
+
+    try {
+      switch (cmd) {
+        case 'start': {
+          await sendMessage(chatId, `<b>${esc(CONFIG.AGENT_NAME)}</b> started. LIVE mode; AUTO_TRADE=<code>${CONFIG.auto_trade ? 'on' : 'off'}</code>. Use /autotrade on only when ready.`);
+          return true;
+        }
+        case 'stop': {
+          CONFIG.auto_trade = false;
+          scanState.scanOn = false;
+          await sendMessage(chatId, 'Auto-trade and autonomous scans stopped.');
+          return true;
+        }
+        case 'help': {
+          await sendMessage(chatId, '<b>Commands</b>\n/start /stop /status /help /settings /set /get /signal /balance /positions /trades /pnl /close &lt;symbol&gt; &lt;positionId&gt; /close_all &lt;symbol&gt; confirm /autotrade /scan /report /leverage /symbol /margin_mode /position_mode /order_unit /position_sizing /models /thinking /memory /resume /ask /diag');
+          return true;
+        }
+        case 'status': {
+          await sendMessage(chatId, `<b>Status</b>\nsymbol <code>${esc(CONFIG.symbol)}</code>\nlev <code>${CONFIG.leverage}</code> ${esc(CONFIG.position_type)}/${esc(CONFIG.position_mode)}\nLIVE <code>enabled</code> auto_trade <code>${CONFIG.auto_trade ? 'on' : 'off'}</code>\nscan <code>${scanState.scanOn ? 'on' : 'off'}</code> report <code>${reportState.reportOn ? 'on' : 'off'}</code>\nopen <code>${trader?.state?.positions?.length ?? 0}</code>`);
+          return true;
+        }
+        case 'settings': {
+          const settings = getTraderSettings(CONFIG);
+          const rows = Object.entries(settings).map(([k, v]) => `${esc(k)}: <code>${esc(Array.isArray(v) ? v.join(',') : String(v))}</code>`).join('\n');
+          await sendMessage(chatId, `<b>Settings</b>\n${rows}`);
+          return true;
+        }
+        case 'set': {
+          const [key, ...parts] = rest;
+          if (!key || !parts.length) return usage(chatId, 'Usage: /set key value');
+          const value = parseSettingValue(key, parts.join(' '));
+          if (key === 'symbol' && String(value).toUpperCase() !== CONFIG.symbol) {
+            const positions = await client.getPendingPositions(CONFIG.symbol);
+            if (!Array.isArray(positions) || positions.length) return usage(chatId, 'Cannot change symbol while positions are open.');
+          }
+          applySettings(CONFIG, { [key]: value });
+          await sendMessage(chatId, `Set <code>${esc(key)}</code> = <code>${esc(String(value))}</code>`);
+          return true;
+        }
+        case 'get': {
+          const settings = getTraderSettings(CONFIG);
+          const key = rest[0];
+          if (!key || !Object.hasOwn(settings, key)) return usage(chatId, 'Unknown setting.');
+          await sendMessage(chatId, `<code>${esc(key)}</code> = <code>${esc(String(settings[key]))}</code>`);
+          return true;
+        }
+        case 'signal': {
+          const sym = arg || CONFIG.symbol;
+          const res = await scanner.scan(sym);
+          await sendMessage(chatId, formatSignalReport(res));
+          return true;
+        }
+        case 'balance': {
+          const acc = await client.getAccount('USDT');
+          await sendMessage(chatId, `<b>Balance</b>\n<code>${esc(JSON.stringify(acc, null, 1))}</code>`);
+          return true;
+        }
+        case 'positions': {
+          const pos = await client.getPendingPositions(CONFIG.symbol);
+          await sendMessage(chatId, `<b>Positions</b>\n<code>${esc(JSON.stringify(pos, null, 1))}</code>`);
+          return true;
+        }
+        case 'trades': {
+          const [o, p] = await Promise.all([client.getHistoryOrders(CONFIG.symbol), client.getHistoryPositions(CONFIG.symbol)]);
+          await sendMessage(chatId, `<b>Orders</b>\n<code>${esc(JSON.stringify(o, null, 1).slice(0, 2000))}</code>\n<b>Positions</b>\n<code>${esc(JSON.stringify(p, null, 1).slice(0, 1500))}</code>`);
+          return true;
+        }
+        case 'pnl': {
+          const pos = await client.getPendingPositions(CONFIG.symbol);
+          await sendMessage(chatId, `<b>PnL</b>\n<code>${esc(JSON.stringify(pos, null, 1))}</code>`);
+          return true;
+        }
+        case 'close': {
+          const [symbol, positionId] = rest;
+          if (!symbol || !positionId) return usage(chatId, 'Usage: /close SYMBOL POSITION_ID');
+          const res = await client.closePosition(symbol.toUpperCase(), positionId);
+          markCooldown(trader);
+          await sendMessage(chatId, `Closed position: <code>${esc(JSON.stringify(res))}</code>`);
+          return true;
+        }
+        case 'close_all': {
+          const [symbol, confirmation] = rest;
+          if (!symbol || confirmation?.toLowerCase() !== 'confirm') return usage(chatId, 'Usage: /close_all SYMBOL confirm');
+          const res = await client.closeAllPosition(symbol.toUpperCase());
+          markCooldown(trader);
+          await sendMessage(chatId, `Closed all positions: <code>${esc(JSON.stringify(res))}</code>`);
+          return true;
+        }
+        case 'autotrade': {
+          CONFIG.auto_trade = parseBoolean(arg, !CONFIG.auto_trade, 'autotrade');
+          if (CONFIG.auto_trade) scanState.scanOn = true;
+          await sendMessage(chatId, `AUTO_TRADE=<code>${CONFIG.auto_trade ? 'on' : 'off'}</code>`);
+          return true;
+        }
+        case 'scan': {
+          scanState.scanOn = parseBoolean(arg, !scanState.scanOn, 'scan');
+          await sendMessage(chatId, `scan <code>${scanState.scanOn ? 'on' : 'off'}</code>`);
+          return true;
+        }
+        case 'report': {
+          reportState.reportOn = parseBoolean(arg, !reportState.reportOn, 'report');
+          await sendMessage(chatId, `report <code>${reportState.reportOn ? 'on' : 'off'}</code>`);
+          return true;
+        }
+        case 'leverage': {
+          const lev = Number(arg);
+          if (!Number.isInteger(lev)) return usage(chatId, 'Usage: /leverage 10');
+          const next = { ...getTraderSettings(CONFIG), leverage: lev };
+          const errors = validateSettings(next);
+          if (errors.length) return usage(chatId, `Invalid leverage: ${esc(errors[0])}`);
+          await client.changeLeverage(CONFIG.symbol, lev);
+          applySettings(CONFIG, { leverage: lev });
+          await sendMessage(chatId, `leverage <code>${lev}</code>`);
+          return true;
+        }
+        case 'symbol': {
+          if (!arg) return usage(chatId, 'Usage: /symbol BTCUSDT');
+          const symbol = arg.toUpperCase();
+          if (!/^[A-Z0-9]{5,32}$/.test(symbol)) return usage(chatId, 'Invalid symbol.');
+          const positions = await client.getPendingPositions(CONFIG.symbol);
+          if (!Array.isArray(positions) || positions.length) return usage(chatId, 'Cannot change symbol while positions are open.');
+          applySettings(CONFIG, { symbol });
+          await sendMessage(chatId, `symbol <code>${esc(CONFIG.symbol)}</code>`);
+          return true;
+        }
+        case 'models': {
+          const provider = detectProviders();
+          if (provider === 'openai') {
+            const models = await listOpenAiModels();
+            const configured = String(CONFIG.AI_MODEL || '').toUpperCase() === 'AUTO' || !CONFIG.AI_MODEL
+              ? 'auto-detect'
+              : models.includes(CONFIG.AI_MODEL) ? 'configured' : 'not found';
+            await sendMessage(chatId, `<b>OpenAI-compatible models</b>\nconfigured: <code>${esc(CONFIG.AI_MODEL)}</code> (${configured})\n${models.slice(0, 40).map(model => `<code>${esc(model)}</code>`).join('\n')}`);
+          } else {
+            await sendMessage(chatId, `anthropic: <code>${esc(CONFIG.ANTHROPIC_MODEL)}</code>\ngoogle: <code>${esc(CONFIG.GEMINI_MODEL)}</code>`);
+          }
+          return true;
+        }
+        case 'thinking': {
+          const level = parseThinkingLevel(arg);
+          if (!arg || level === 'mid' && arg.toLowerCase() !== 'mid') return usage(chatId, 'Usage: /thinking off|low|mid|high|max');
+          CONFIG.AGENT_THINKING_ENABLED = level !== 'off';
+          if (agent) agent.thinkingLevel = level;
+          await sendMessage(chatId, `thinking <code>${esc(level)}</code>`);
+          return true;
+        }
+        case 'memory': {
+          await sendMessage(chatId, `memory keys: <code>${esc(Object.keys(agent?.memory?.all?.() || {}).join(', ') || '-')}</code>`);
+          return true;
+        }
+        case 'resume': {
+          if (!loadSession) {
+            await sendMessage(chatId, 'Session resume is not available in this runtime.');
+            return true;
+          }
+          const sessionId = arg || String(chatId);
+          const session = await loadSession(sessionId);
+          if (!session || !Array.isArray(session.history) || !agent?.replaceHistory) {
+            await sendMessage(chatId, `No saved session found for <code>${esc(sessionId)}</code>.`);
+            return true;
+          }
+          agent.replaceHistory(session.history);
+          await sendMessage(chatId, `Session resumed: <code>${esc(sessionId)}</code> (${session.history.length} messages).`);
+          return true;
+        }
+        case 'ask': {
+          const reply = await agent.say(arg || 'status?');
+          await sendMessage(chatId, esc(reply?.content || 'ok'));
+          if (saveSession) await saveSession(String(chatId), { history: agent.history });
+          return true;
+        }
+        case 'diag': {
+          await sendMessage(chatId, `<b>Diag</b>\napi <code>${client ? 'ready' : 'missing'}</code>\ndb <code>${CONFIG.DATABASE_URL ? 'postgres' : 'file'}</code>\nws <code>configured</code>`);
+          return true;
+        }
+        default:
+          return false;
+      }
+    } catch (error) {
+      await sendMessage(chatId, `Error: ${esc(error.message)}`);
+      return true;
+    }
+  }
+
+  return { handleCommand, scanState, reportState };
+}

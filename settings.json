@@ -1,0 +1,33 @@
+{
+  "agent": {
+    "name": "J-ROCK",
+    "autonomous": false,
+    "autonomousIntervalSec": 15,
+    "maxRounds": 8,
+    "autoCompact": true,
+    "thinking": { "enabled": true, "level": "mid", "budget": 5000 }
+  },
+  "trader": {
+    "symbol": "BTCUSDT",
+    "leverage": 10,
+    "position_type": "crossed",
+    "position_mode": "hedge",
+    "timeframes": ["1m", "3m", "5m", "15m", "1h"],
+    "min_confidence": 80,
+    "tf_min_confidence": 60,
+    "min_agreeing_strategies": 2,
+    "signal_confirm_scans": 1,
+    "cooldown_minutes": 5,
+    "scan_interval_sec": 15,
+    "guard_interval_sec": 15,
+    "mid_manage_interval_sec": 15,
+    "report_interval_sec": 30,
+    "breakeven_threshold_pct": 20,
+    "trailing_trigger_roi_pct": 25,
+    "reversal_enabled": true,
+    "reversal_confidence": 85,
+    "on_tpsl_failure": "close",
+    "auto_trade": false
+  },
+  "mcp": { "servers": [] }
+}
