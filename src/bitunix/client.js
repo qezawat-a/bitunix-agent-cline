@@ -111,15 +111,25 @@ export class BitunixClient {
 
   async placeOrder(params) {
     validateOrder(params);
-    return this.request('POST', '/api/v1/futures/trade/place_order', params, {});
+    const orderType = params.orderType || 'MARKET';
+    // Bitunix requires orderType and tradeSide on every place_order request,
+    // even though the docs mark only some fields required. Send explicit values
+    // so a caller that omits them still produces a valid request.
+    const payload = { orderType, tradeSide: params.tradeSide || 'OPEN', ...params, orderType };
+    if (!payload.price && orderType === 'LIMIT') throw new Error('LIMIT order price must be positive');
+    return this.request('POST', '/api/v1/futures/trade/place_order', payload, {});
   }
 
   async modifyOrder(params) {
     return this.request('POST', '/api/v1/futures/trade/modify_order', params, {});
   }
 
-  async cancelOrder(symbol, orderId) {
-    return this.request('POST', '/api/v1/futures/trade/cancel_orders', { symbol, orderId }, {});
+  async cancelOrder(symbol, orderId, clientId) {
+    if (!symbol) throw new Error('symbol is required to cancel orders');
+    if (!orderId && !clientId) throw new Error('orderId or clientId is required to cancel orders');
+    // Bitunix cancel_orders nests the identifiers under orderList.
+    const entry = orderId ? { orderId: String(orderId) } : { clientId: String(clientId) };
+    return this.request('POST', '/api/v1/futures/trade/cancel_orders', { symbol, orderList: [entry] }, {});
   }
 
   async closePosition(symbol, positionId, position = null) {
@@ -215,17 +225,29 @@ export class BitunixClient {
     return this.request('POST', '/api/v1/futures/account/change_position_mode', { positionMode: normalized }, {});
   }
 
-  async adjustPositionMargin(symbol, margin) {
-    if (!Number.isFinite(Number(margin))) throw new Error('margin must be numeric');
-    return this.request('POST', '/api/v1/futures/account/adjust_position_margin', { symbol, margin }, {});
+  async adjustPositionMargin(symbol, amount, options = {}) {
+    if (!symbol) throw new Error('symbol is required to adjust position margin');
+    if (!Number.isFinite(Number(amount))) throw new Error('amount must be numeric');
+    if (Number(amount) === 0) throw new Error('amount must be non-zero');
+    // Bitunix requires marginCoin plus one of side / positionId. The field is
+    // named `amount` (not `margin`); positive adds margin, negative removes it.
+    const marginCoin = options.marginCoin || 'USDT';
+    if (!options.side && !options.positionId) {
+      throw new Error('adjustPositionMargin requires either side (LONG/SHORT) or positionId');
+    }
+    const payload = { symbol, amount: String(amount), marginCoin };
+    if (options.side) payload.side = String(options.side).toUpperCase();
+    if (options.positionId) payload.positionId = String(options.positionId);
+    return this.request('POST', '/api/v1/futures/account/adjust_position_margin', payload, {});
   }
 
   async getFundingRate(symbol) {
     return this.request('GET', '/api/v1/futures/market/funding_rate', null, { symbol }, { signed: false });
   }
 
-  async getFundingRateBatch(symbols) {
-    return this.request('GET', '/api/v1/futures/market/funding_rate_batch', null, { symbols: Array.isArray(symbols) ? symbols.join(',') : symbols }, { signed: false });
+  async getFundingRateBatch() {
+    // The official batch endpoint is slash-separated and takes no parameters.
+    return this.request('GET', '/api/v1/futures/market/funding_rate/batch', null, {}, { signed: false });
   }
 
   async getTradingPairs(symbols = '') {

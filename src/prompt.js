@@ -17,7 +17,13 @@ export async function buildSystemPrompt({ skills = [], tools = [], memory = {} }
   try { soul = await fs.readFile('soul/SOUL.md', 'utf8'); } catch {}
   try { style = await fs.readFile('soul/STYLE.md', 'utf8'); } catch {}
 
-  const skillBlock = skills.map(skill => `## Skill: ${skill.name}\n${skill.content}`).join('\n\n');
+  // Only the skill catalog (name + description) goes into the prompt. The full
+  // body is loaded on demand via the agent_skill_read tool, which keeps the
+  // system prompt small as the skills folder grows.
+  const skillBlock = skills.length
+    ? `${skills.map(skill => `- ${skill.name}${skill.description ? `: ${skill.description}` : ''}`).join('\n')}\n\n` +
+      'To read a skill in full, call agent_skill_read with its id.'
+    : 'No skills are currently loaded.';
   const toolBlock = tools.map(tool => `- ${tool.name}: ${tool.description}`).join('\n');
   const memBlock = safeMemory(memory).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join('\n');
   const thinking = CONFIG.AGENT_THINKING_ENABLED

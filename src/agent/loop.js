@@ -93,7 +93,11 @@ export async function say(agent, text) {
           const tool = agent.tools.find(candidate => candidate.name === name);
           if (!tool) throw new Error(`unknown tool: ${name}`);
           validateToolArguments(tool.parameters || {}, args);
-          result = await withTimeout(signal => tool.handler(args, { signal }), 20000);
+          // Accept both contracts: this repo's tools use handler(args, ctx) so they
+          // receive an AbortSignal, while ported CRAG-style tools use run(args).
+          const invoke = tool.handler || tool.run;
+          if (typeof invoke !== 'function') throw new Error(`tool ${name} has no handler/run`);
+          result = await withTimeout(signal => invoke(args, { signal }), 20000);
         } catch (error) {
           result = { error: error.message || String(error) };
         }
@@ -105,7 +109,14 @@ export async function say(agent, text) {
     finalText = `LLM error: ${error.message}. (AI key/model o check kon — /models ro bebin)`;
   }
 
-  if (!finalText) finalText = 'Hichi bar nagasht — dobare bepors.';
+  if (!finalText) {
+    const failures = agent.history.filter(
+      entry => entry.role === 'tool' && /"error"\s*:/.test(String(entry.content)),
+    );
+    finalText = failures.length
+      ? `Tool error: ${String(failures[failures.length - 1].content).slice(0, 300)}`
+      : 'Model returned no text (Hichi bar nagasht). Try /models or /thinking off, ya dobare bepors.';
+  }
   agent.history.push({ role: 'assistant', content: finalText });
   return { role: 'assistant', content: finalText };
 }

@@ -34,6 +34,9 @@ export const ALIASES = {
   position_type: 'position_type',
   symbol: 'symbol',
   leverage: 'leverage',
+  tf: 'timeframes',
+  timeframes: 'timeframes',
+  tf_min: 'tf_min_confidence',
 };
 
 export const SETTING_KEYS = Object.freeze(Object.keys(DEFAULTS));
@@ -204,6 +207,13 @@ export function applyPersistedSettings(target, stored) {
   if (errors.length) throw new Error(`invalid persisted settings: ${errors.join('; ')}`);
   Object.assign(target, normalized);
   return getTraderSettings(target);
+}
+
+// resolveSettingKey(key) — map an alias to its canonical setting name.
+// Returns the input unchanged when it is already a valid key.
+export function resolveSettingKey(key) {
+  const wanted = String(key || '').trim();
+  return ALIASES[wanted] || wanted;
 }
 
 export function parseSettingValue(key, raw) {

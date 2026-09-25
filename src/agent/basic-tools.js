@@ -75,15 +75,38 @@ export const basicTools = [
   },
   {
     name: 'agent_skills',
-    description: 'List skills',
+    description: 'List available skills with their name and description',
     parameters: { type: 'object', properties: {} },
     async handler() {
-      try {
-        const fs = await import('fs/promises');
-        const entries = await fs.readdir('skills');
-        const skills = entries.filter(e => e.endsWith('.md'));
-        return { skills };
-      } catch { return { skills: [] }; }
+      const { listSkills } = await import('./skills.js');
+      const skills = listSkills('skills');
+      return {
+        count: skills.length,
+        skills: skills.map(s => ({ id: s.id, name: s.name, description: s.description })),
+      };
+    },
+  },
+  {
+    name: 'agent_skill_read',
+    description: 'Read the full body of a skill by id (use agent_skills first to see ids)',
+    parameters: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+    async handler({ id }) {
+      const { loadSkill } = await import('./skills.js');
+      const skill = loadSkill(id, 'skills');
+      if (!skill) {
+        const { listSkills } = await import('./skills.js');
+        return { error: `skill "${id}" not found`, available: listSkills('skills').map(s => s.id) };
+      }
+      return { id: skill.id, name: skill.name, description: skill.description, body: skill.body };
+    },
+  },
+  {
+    name: 'agent_mcp',
+    description: 'List MCP servers and the tools they expose',
+    parameters: { type: 'object', properties: {} },
+    async handler() {
+      const { listMcpTools, mcpServerNames } = await import('./mcp.js');
+      return { servers: mcpServerNames(), tools: listMcpTools().map(t => ({ name: t.name, description: t.description })) };
     },
   },
   {

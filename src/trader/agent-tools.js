@@ -1,5 +1,5 @@
 import { CONFIG } from '../config.js';
-import { applySettings, getTraderSettings } from './settings.js';
+import { applySettings, getTraderSettings, resolveSettingKey } from './settings.js';
 
 let sharedTrader = null;
 let sharedClient = null;
@@ -58,7 +58,7 @@ export const traderTools = [
       type: 'object',
       properties: {
         key: { type: 'string' },
-        value: { type: ['string', 'number', 'boolean'] },
+        value: { type: ['string', 'number', 'boolean', 'array', 'null'] },
       },
       required: ['key', 'value'],
     },
@@ -70,7 +70,10 @@ export const traderTools = [
         if (!Array.isArray(positions) || positions.length) throw new Error('cannot change symbol while positions are open');
       }
       const settings = applySettings(CONFIG, { [key]: value });
-      return { ok: true, key, value: settings[key] };
+      // applySettings keys the result canonically, so resolve the alias to echo
+      // back the stored value (e.g. key "tf" -> "timeframes").
+      const canonical = resolveSettingKey(key);
+      return { ok: true, key: canonical, value: settings[canonical] };
     },
   },
   {

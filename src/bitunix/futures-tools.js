@@ -72,16 +72,17 @@ export const bitunixTools = [
   },
   {
     name: 'bitunix_place_order',
-    description: 'Place a live Bitunix futures order', 
+    description: 'Place a live Bitunix futures order. orderType defaults to MARKET; tradeSide defaults to OPEN. Hedge CLOSE requires positionId.',
     parameters: {
       type: 'object',
       properties: {
         symbol: { type: 'string' },
         side: { type: 'string', enum: ['BUY', 'SELL'] },
         qty: { type: 'string' },
-        price: { type: 'string' },
+        price: { type: 'string', description: 'Required when orderType is LIMIT' },
         orderType: { type: 'string', enum: ['LIMIT', 'MARKET'] },
-        tradeSide: { type: 'string' },
+        tradeSide: { type: 'string', enum: ['OPEN', 'CLOSE'] },
+        positionId: { type: 'string', description: 'Required when tradeSide is CLOSE (hedge mode)' },
         reduceOnly: { type: 'boolean' },
       },
       required: ['symbol', 'side', 'qty'],
@@ -92,10 +93,20 @@ export const bitunixTools = [
   },
   {
     name: 'bitunix_place_tpsl',
-    description: 'Place TP/SL order',
-    parameters: { type: 'object', properties: { symbol: { type: 'string' }, positionId: { type: 'string' }, tpPrice: { type: 'string' }, slPrice: { type: 'string' } } },
-    async handler(params) {
-      return requireClient().placeTPSL(params);
+    description: 'Place a position TP/SL order. Requires symbol + positionId and at least one of tpPrice / slPrice.',
+    parameters: {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string' },
+        positionId: { type: 'string' },
+        tpPrice: { type: 'string', description: 'Take-profit trigger price' },
+        slPrice: { type: 'string', description: 'Stop-loss trigger price' },
+      },
+      required: ['symbol', 'positionId'],
+    },
+    async handler({ symbol, positionId, tpPrice, slPrice }) {
+      if (!tpPrice && !slPrice) throw new Error('at least one of tpPrice or slPrice is required');
+      return requireClient().placeTPSL({ symbol, positionId, ...(tpPrice ? { tpPrice } : {}), ...(slPrice ? { slPrice } : {}) });
     },
   },
   {
@@ -148,10 +159,20 @@ export const bitunixTools = [
   },
   {
     name: 'bitunix_adjust_position_margin',
-    description: 'Adjust position margin',
-    parameters: { type: 'object', properties: { symbol: { type: 'string' }, margin: { type: 'string' } }, required: ['symbol', 'margin'] },
-    async handler({ symbol, margin }) {
-      return requireClient().adjustPositionMargin(symbol, margin);
+    description: 'Adjust position margin. amount>0 adds margin, amount<0 removes it. Requires marginCoin and one of side/positionId.',
+    parameters: {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string' },
+        amount: { type: 'string', description: 'Signed amount as string, e.g. "-100" or "25"' },
+        marginCoin: { type: 'string', description: 'Margin coin, usually USDT' },
+        side: { type: 'string', enum: ['LONG', 'SHORT'] },
+        positionId: { type: 'string' },
+      },
+      required: ['symbol', 'amount', 'marginCoin'],
+    },
+    async handler({ symbol, amount, marginCoin, side, positionId }) {
+      return requireClient().adjustPositionMargin(symbol, amount, { marginCoin, side, positionId });
     },
   },
   {

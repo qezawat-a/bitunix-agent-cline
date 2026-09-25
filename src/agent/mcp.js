@@ -1,7 +1,19 @@
 import { spawn } from 'child_process';
 
 const activeChildren = new Set();
+const serverRegistry = new Map();
+let loadedTools = [];
 let nextId = 0;
+
+// Names of MCP servers that were configured, and the tools they exposed.
+// Used by the /mcp command and the agent_mcp tool.
+export function mcpServerNames() {
+  return [...serverRegistry.keys()];
+}
+
+export function listMcpTools() {
+  return loadedTools;
+}
 
 function serverEnvironment(server) {
   const environment = {};
@@ -80,6 +92,8 @@ export function disposeMcpTools() {
     try { child.kill(); } catch {}
   }
   activeChildren.clear();
+  serverRegistry.clear();
+  loadedTools = [];
 }
 
 export async function loadMcpTools(servers = []) {
@@ -92,6 +106,7 @@ export async function loadMcpTools(servers = []) {
       console.error(`MCP server ${server.name} failed:`, error.message);
     }
   }
+  loadedTools = tools;
   return tools;
 }
 
@@ -112,7 +127,7 @@ async function connectMcpServer(server) {
     });
     sendNotification(proc, 'notifications/initialized');
     const list = await sendJsonRpc(proc, 'tools/list');
-    return (list?.tools || []).map(tool => ({
+    const mapped = (list?.tools || []).map(tool => ({
       name: `mcp_${server.name}_${tool.name}`,
       description: tool.description || `MCP ${server.name} tool ${tool.name}`,
       parameters: tool.inputSchema || { type: 'object', properties: {} },
@@ -120,6 +135,8 @@ async function connectMcpServer(server) {
         return sendJsonRpc(proc, 'tools/call', { name: tool.name, arguments: args });
       },
     }));
+    serverRegistry.set(server.name, { command: server.command, args: server.args || [], toolCount: mapped.length });
+    return mapped;
   } catch (error) {
     try { proc.kill(); } catch {}
     activeChildren.delete(proc);

@@ -115,6 +115,12 @@ export async function setCommands() {
     { command: 'memory', description: 'Memory show' },
     { command: 'resume', description: 'Resume session' },
     { command: 'ask', description: 'Ask the agent' },
+    { command: 'skills', description: 'List agent skills' },
+    { command: 'skill', description: 'Read a skill: /skill id' },
+    { command: 'mcp', description: 'MCP servers and tools' },
+    { command: 'harness', description: 'Headless agent usage' },
+    { command: 'tools', description: 'List agent tools' },
+    { command: 'check_ai', description: 'Test AI connection' },
     { command: 'diag', description: 'Diagnostics' },
   ];
   await postTelegram(`https://api.telegram.org/bot${token}/setMyCommands`, { commands });

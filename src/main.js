@@ -66,6 +66,7 @@ async function main() {
     scanner,
     trader,
     agent,
+    tools,
     loadSession,
     saveSession,
   });

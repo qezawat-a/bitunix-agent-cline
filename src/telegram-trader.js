@@ -13,7 +13,7 @@ function markCooldown(trader) {
   if (trader?.state) trader.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
 }
 
-export function createTraderCommands({ client, scanner, trader, agent, loadSession = null, saveSession = null }) {
+export function createTraderCommands({ client, scanner, trader, agent, tools = [], loadSession = null, saveSession = null }) {
   const scanState = { scanOn: true };
   const reportState = { reportOn: true };
 
@@ -200,6 +200,18 @@ export function createTraderCommands({ client, scanner, trader, agent, loadSessi
         case 'diag': {
           await sendMessage(chatId, `<b>Diag</b>\napi <code>${client ? 'ready' : 'missing'}</code>\ndb <code>${CONFIG.DATABASE_URL ? 'postgres' : 'file'}</code>\nws <code>configured</code>`);
           return true;
+        }
+        // Agent-layer commands (/skills /skill /mcp /harness /tools /check_ai).
+        // They live in agent-commands.js and return handled:false for anything
+        // they do not own, so this falls through to the agent chat below.
+        case 'skills': case 'skill': case 'mcp': case 'harness': case 'tools': case 'check_ai': {
+          const { handleAgentCommand } = await import('./agent-commands.js');
+          const result = await handleAgentCommand(text, { agent, tools, say: t => agent.say(t) });
+          if (result.handled) {
+            await sendMessage(chatId, esc(result.reply));
+            return true;
+          }
+          return false;
         }
         default:
           return false;
