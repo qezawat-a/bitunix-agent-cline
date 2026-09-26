@@ -225,6 +225,28 @@ describe('exchange safety', () => {
     assert.equal(result.signal, 'hold');
   });
 
+  it('uses the live ticker price, not a stale kline close, for lastPrice', async () => {
+    // The last kline's close (100 + 59*59 = 3581) is stale by up to a full
+    // bar; the real-time tickers endpoint is the source of truth for price.
+    const klines = Array.from({ length: 60 }, (_, index) => ({ close: String(100 + index * index), high: String(101 + index * index), low: String(99 + index * index), baseVol: '10' }));
+    const scanner = new Scanner({
+      getKlines: async () => klines,
+      getFundingRate: async () => ({ value: 0 }),
+      getTickers: async () => [{ symbol: 'BTCUSDT', lastPrice: '99999.5', markPrice: '99999.1' }],
+    });
+    Object.assign(CONFIG, { timeframes: ['1m'], min_agreeing_strategies: 1, tf_min_confidence: 0, min_confidence: 0 });
+    const result = await scanner.scan('BTCUSDT');
+    assert.equal(result.lastPrice, 99999.5);
+  });
+
+  it('falls back to the kline close if the ticker call fails', async () => {
+    const klines = Array.from({ length: 60 }, (_, index) => ({ close: String(100 + index * index), high: String(101 + index * index), low: String(99 + index * index), baseVol: '10' }));
+    const scanner = new Scanner({ getKlines: async () => klines, getFundingRate: async () => ({ value: 0 }) });
+    Object.assign(CONFIG, { timeframes: ['1m'], min_agreeing_strategies: 1, tf_min_confidence: 0, min_confidence: 0 });
+    const result = await scanner.scan('BTCUSDT');
+    assert.equal(result.lastPrice, klines.at(-1).close);
+  });
+
   it('does not order when auto-trade is disabled', async () => {
     const calls = [];
     const client = {
