@@ -13,7 +13,7 @@ function markCooldown(trader) {
   if (trader?.state) trader.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
 }
 
-export function createTraderCommands({ client, scanner, trader, agent, tools = [], loadSession = null, saveSession = null }) {
+export function createTraderCommands({ client, scanner, trader, agent, tools = [], loadSession = null, saveSession = null, deleteSession = null }) {
   const scanState = { scanOn: true };
   const reportState = { reportOn: true };
 
@@ -40,7 +40,7 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           return true;
         }
         case 'help': {
-          await sendMessage(chatId, '<b>Commands</b>\n/start /stop /status /help /settings /set /get /signal /balance /positions /trades /pnl /close &lt;symbol&gt; &lt;positionId&gt; /close_all &lt;symbol&gt; confirm /autotrade /scan /report /leverage /symbol /margin_mode /position_mode /order_unit /position_sizing /models /thinking /memory /resume /ask /diag');
+          await sendMessage(chatId, '<b>Commands</b>\n/start /stop /status /help /settings /set /get /signal /balance /positions /trades /pnl /close &lt;symbol&gt; &lt;positionId&gt; /close_all &lt;symbol&gt; confirm /autotrade /scan /report /leverage /symbol /margin_mode /position_mode /order_unit /position_sizing /models /thinking /memory /resume /reset /ask /skills /skill /mcp /tools /diag');
           return true;
         }
         case 'status': {
@@ -189,6 +189,21 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           }
           agent.replaceHistory(session.history);
           await sendMessage(chatId, `Session resumed: <code>${esc(sessionId)}</code> (${session.history.length} messages).`);
+          return true;
+        }
+        case 'reset': {
+          if (!agent?.replaceHistory) {
+            await sendMessage(chatId, 'No agent session in this runtime.');
+            return true;
+          }
+          agent.replaceHistory([]);
+          let cleared = 'in-memory only';
+          if (deleteSession) {
+            try {
+              cleared = (await deleteSession(String(chatId))) ? 'saved session deleted' : 'no saved session';
+            } catch (error) { cleared = `saved session kept (${error.message})`; }
+          }
+          await sendMessage(chatId, `Agent conversation cleared — <code>${esc(cleared)}</code>. The trader, scanner and open positions are untouched.`);
           return true;
         }
         case 'ask': {

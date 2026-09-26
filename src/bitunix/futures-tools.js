@@ -32,10 +32,10 @@ export const bitunixTools = [
   },
   {
     name: 'bitunix_get_depth',
-    description: 'Get order book depth',
-    parameters: { type: 'object', properties: { symbol: { type: 'string' } }, required: ['symbol'] },
-    async handler({ symbol }) {
-      return requireClient().getDepth(symbol);
+    description: 'Get order book depth. limit is a fixed gear: 1, 5, 15, 50 or max (default: exchange default).',
+    parameters: { type: 'object', properties: { symbol: { type: 'string' }, limit: { type: 'string', enum: ['1', '5', '15', '50', 'max'] } }, required: ['symbol'] },
+    async handler({ symbol, limit }) {
+      return requireClient().getDepth(symbol, limit);
     },
   },
   {

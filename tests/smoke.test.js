@@ -1,4 +1,4 @@
-import { describe, it, afterEach } from 'node:test';
+import { describe, it, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { ema, rsi, bollinger, atr, macd, superTrend, atrBreakout, computeSignal } from '../src/bitunix/indicators.js';
 import {
@@ -20,11 +20,19 @@ import { PositionManager } from '../src/trader/position-manager.js';
 import { setPositionManager, setTraderInstances, traderTools } from '../src/trader/agent-tools.js';
 import { bitunixTools, setBitunixClient } from '../src/bitunix/futures-tools.js';
 import { detectProviders } from '../src/agent/config.js';
-import { chat, listOpenAiModels, resolveOpenAiModelsUrl, resolveOpenAiUrl } from '../src/agent/brain.js';
-import { createAgent } from '../src/agent/loop.js';
+import { chat, listOpenAiModels, resolveOpenAiModelsUrl, resolveOpenAiUrl, shouldSendTemperature } from '../src/agent/brain.js';
+import { createAgent, sanitizeHistory, say, resetAgent } from '../src/agent/loop.js';
 import { stringifyToolResult, validateToolArguments } from '../src/agent/tools.js';
 import { splitHtml } from '../src/telegram-bot.js';
-import { BitunixWs } from '../src/bitunix/ws.js';
+import {
+  BitunixWs,
+  KLINE_INTERVALS,
+  PRIVATE_CHANNELS,
+  normalizePrivateChannel,
+  normalizePublicChannel,
+} from '../src/bitunix/ws.js';
+import crypto from 'node:crypto';
+import { mock } from 'node:test';
 
 const originalConfig = { ...CONFIG, timeframes: [...CONFIG.timeframes] };
 const originalFetch = globalThis.fetch;
@@ -455,6 +463,47 @@ describe('provider and websocket safety', () => {
     assert.equal(resolveOpenAiUrl('https://example.test/custom/chat/completions'), 'https://example.test/custom/chat/completions');
   });
 
+  it('sanitizes history into a provider-safe tool sequence', () => {
+    const history = [
+      { role: 'user', content: 'set tf' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'set_tf', arguments: { tf: '5m' } } }] },
+      { role: 'tool', tool_call_id: 'c1', name: 'set_tf', content: { ok: true } },
+      { role: 'assistant', content: 'done' },
+    ];
+    const clean = sanitizeHistory(history, 20);
+    assert.equal(clean.length, 4);
+    assert.equal(clean[1].tool_calls[0].function.arguments, '{"tf":"5m"}');
+    assert.deepEqual(Object.keys(clean[2]).sort(), ['content', 'role', 'tool_call_id']);
+    assert.equal(clean[2].content, '{"ok":true}');
+    // A window that cuts the assistant call away must drop the orphaned result,
+    // otherwise the provider answers 400 and the session stays poisoned.
+    const cut = sanitizeHistory(history, 2);
+    assert.ok(!cut.some(message => message.role === 'tool'));
+    assert.ok(!sanitizeHistory([{ role: 'assistant', content: null }], 5).length);
+    assert.ok(!sanitizeHistory([{ role: 'assistant', content: '', tool_calls: [{ id: 'x', function: { name: 'f' } }] }], 5).length);
+  });
+
+  it('omits temperature for reasoning endpoints and sends it elsewhere', () => {
+    assert.equal(shouldSendTemperature('ag/gemini-3.8-flash-high', ''), undefined);
+    assert.equal(shouldSendTemperature('kc/deepseek/deepseek-reasoner', ''), undefined);
+    assert.equal(shouldSendTemperature('kc/openai/o3', ''), undefined);
+    assert.equal(shouldSendTemperature('ag/gemini-3-flash', ''), 0.7);
+    assert.equal(shouldSendTemperature('ag/gemini-3-flash', '0.2'), 0.2);
+  });
+
+  it('rolls a failed turn back so the next message starts clean', async () => {
+    Object.assign(CONFIG, { AI_PROVIDER: 'auto', AI_API_KEY: 'test-key', AI_BASE_URL: 'https://example.test/v1', AI_MODEL: 'fixed-model', ANTHROPIC_API_KEY: '', GEMINI_API_KEY: '' });
+    const agent = createAgent({ system: 'rules', tools: [], history: [{ role: 'user', content: 'earlier' }, { role: 'assistant', content: 'noted' }] });
+    globalThis.fetch = async () => ({ ok: false, status: 400, text: async () => 'invalid_request_error' });
+    const failed = await say(agent, 'set timeframes');
+    assert.equal(failed.error, true);
+    assert.match(failed.content, /LLM error/);
+    assert.equal(agent.history.length, 2);
+    assert.equal(agent.history[1].content, 'noted');
+    assert.equal(resetAgent(agent), 2);
+    assert.equal(agent.history.length, 0);
+  });
+
   it('auto-selects an available provider', () => {
     Object.assign(CONFIG, { AI_PROVIDER: 'auto', AI_API_KEY: '', ANTHROPIC_API_KEY: 'anthropic-key', GEMINI_API_KEY: '' });
     assert.equal(detectProviders(), 'anthropic');
@@ -519,4 +568,141 @@ describe('telegram formatting', () => {
       assert.equal((chunk.match(/<b>/g) || []).length, (chunk.match(/<\/b>/g) || []).length);
     }
   });
+
+describe('bitunix websocket channel contracts', () => {
+  it('maps documented channel names and common aliases', () => {
+    assert.deepEqual(normalizePublicChannel({ ch: 'tickers', symbol: 'BTCUSDT' }), { symbol: 'BTCUSDT', ch: 'tickers' });
+    assert.deepEqual(normalizePublicChannel('price'), { ch: 'price' });
+    assert.deepEqual(normalizePublicChannel('depth'), { ch: 'depth_books' });
+    assert.deepEqual(normalizePublicChannel('market_price'), { ch: 'price' });
+    assert.deepEqual(normalizePublicChannel('depth_book1'), { ch: 'depth_book1' });
+  });
+
+  it('translates kline intervals to the websocket naming scheme', () => {
+    assert.deepEqual(normalizePublicChannel({ ch: 'kline', interval: '15m', symbol: 'BTCUSDT' }), { symbol: 'BTCUSDT', ch: 'market_kline_15min' });
+    assert.deepEqual(normalizePublicChannel('mark_kline_1h'), { ch: 'mark_kline_60min' });
+    assert.deepEqual(normalizePublicChannel('market_kline_1d'), { ch: 'market_kline_1day' });
+    assert.deepEqual(normalizePublicChannel('market_kline_1M'), { ch: 'market_kline_1month' });
+    assert.equal(normalizePublicChannel({ ch: 'kline', interval: '1week' }).ch, 'market_kline_1week');
+    assert.ok(KLINE_INTERVALS.includes('1min') && KLINE_INTERVALS.includes('1month'));
+  });
+
+  it('rejects channels the server would silently ignore', () => {
+    for (const bad of ['', 'depths', 'klines', 'ticker_1s']) {
+      assert.throws(() => normalizePublicChannel(bad), /public WS channel/);
+    }
+    assert.throws(() => normalizePublicChannel({ ch: 'kline', symbol: 'BTCUSDT' }), /interval/);
+    assert.throws(() => normalizePublicChannel({ ch: 'kline', interval: '7m' }), /interval/);
+    assert.throws(() => normalizePublicChannel('market_kline_3s'), /interval/);
+  });
+
+  it('normalizes private channels, including the tp_sl alias', () => {
+    assert.equal(normalizePrivateChannel('tp_sl'), 'tpsl');
+    assert.equal(normalizePrivateChannel({ ch: 'TPSL' }), 'tpsl');
+    for (const channel of PRIVATE_CHANNELS) assert.equal(normalizePrivateChannel(channel), channel);
+    assert.throws(() => normalizePrivateChannel('positions'), /unknown private WS channel/);
+  });
+});
+
+
+describe('bitunix websocket frames', () => {
+  let sockets = [];
+  class FakeSocket {
+    static OPEN = 1;
+    constructor(url) { this.url = url; this.readyState = FakeSocket.OPEN; this.handlers = {}; this.sent = []; sockets.push(this); }
+    on(event, handler) { this.handlers[event] = handler; }
+    send(payload) { this.sent.push(JSON.parse(payload)); }
+    close() { this.readyState = 3; this.handlers.close?.(); }
+    open() { this.handlers.open?.(); }
+    message(payload) { this.handlers.message?.(Buffer.from(JSON.stringify(payload))); }
+  }
+
+  beforeEach(() => { sockets = []; });
+
+  it('sends normalized subscribe args and forwards only channel data', () => {
+    const received = [];
+    const ws = new BitunixWs({ onPublic: message => received.push(message) }, FakeSocket);
+    const socket = ws.connectPublic(['tickers', { ch: 'depth', symbol: 'BTCUSDT' }]);
+    socket.open();
+    assert.deepEqual(socket.sent[0], { op: 'subscribe', args: [{ ch: 'tickers' }, { symbol: 'BTCUSDT', ch: 'depth_books' }] });
+    socket.message({ op: 'connect', data: { result: true } });
+    socket.message({ op: 'ping', pong: 1, ping: 2 });
+    socket.message({ ch: 'tickers', symbol: 'BTCUSDT', data: [{ s: 'BTCUSDT' }] });
+    assert.equal(received.length, 1);
+    assert.equal(received[0].ch, 'tickers');
+    ws.close();
+  });
+
+  it('logs in with an integer seconds timestamp and a matching signature', () => {
+    Object.assign(CONFIG, { BITUNIX_API_KEY: 'test-key', BITUNIX_API_SECRET: 'test-secret' });
+    const ws = new BitunixWs({}, FakeSocket);
+    const socket = ws.connectPrivate(['balance', 'tp_sl']);
+    socket.open();
+    const [login, subscribe] = socket.sent;
+    assert.equal(login.op, 'login');
+    const arg = login.args[0];
+    assert.equal(typeof arg.timestamp, 'number');
+    assert.ok(Math.abs(arg.timestamp - Math.floor(Date.now() / 1000)) <= 2);
+    assert.equal(arg.apiKey, 'test-key');
+    assert.match(arg.nonce, /^[0-9a-f]{32}$/);
+    assert.match(arg.sign, /^[0-9a-f]{64}$/);
+    const params = `apiKey${arg.apiKey}nonce${arg.nonce}timestamp${arg.timestamp}`;
+    const digest = crypto.createHash('sha256').update(`${arg.nonce}${arg.timestamp}${arg.apiKey}${params}`).digest('hex');
+    assert.equal(arg.sign, crypto.createHash('sha256').update(digest + 'test-secret').digest('hex'));
+    assert.deepEqual(subscribe, { op: 'subscribe', args: [{ ch: 'balance' }, { ch: 'tpsl' }] });
+    ws.close();
+  });
+
+  it('refuses to open a socket for an unknown channel', () => {
+    const ws = new BitunixWs({}, FakeSocket);
+    assert.throws(() => ws.connectPublic(['depth_book7']), /unknown public WS channel/);
+    assert.throws(() => ws.connectPrivate(['tp_sl_v2']), /unknown private WS channel/);
+    assert.equal(sockets.length, 0);
+  });
+
+  it('requires an unsubscribe before switching kline intervals', () => {
+    const ws = new BitunixWs({}, FakeSocket);
+    const socket = ws.connectPublic([{ ch: 'kline', interval: '1m', symbol: 'BTCUSDT' }]);
+    socket.open();
+    assert.deepEqual(socket.sent[0].args[0], { symbol: 'BTCUSDT', ch: 'market_kline_1min' });
+    ws.unsubscribePublic([{ ch: 'kline', interval: '5m', symbol: 'BTCUSDT' }]);
+    ws.subscribePublic([{ ch: 'kline', interval: '5m', symbol: 'BTCUSDT' }]);
+    assert.deepEqual(socket.sent.at(-2), { op: 'unsubscribe', args: [{ symbol: 'BTCUSDT', ch: 'market_kline_5min' }] });
+    assert.deepEqual(socket.sent.at(-1), { op: 'subscribe', args: [{ symbol: 'BTCUSDT', ch: 'market_kline_5min' }] });
+    ws.close();
+  });
+
+  it('keeps the connection alive with a ping frame and stops it on close', () => {
+    mock.timers.enable({ apis: ['setInterval'] });
+    try {
+      const ws = new BitunixWs({}, FakeSocket);
+      const socket = ws.connectPublic(['tickers']);
+      socket.open();
+      mock.timers.tick(15000);
+      const ping = socket.sent.at(-1);
+      assert.equal(ping.op, 'ping');
+      assert.equal(typeof ping.ping, 'number');
+      assert.ok(Math.abs(ping.ping - Math.floor(Date.now() / 1000)) <= 2);
+      mock.timers.tick(15000);
+      assert.equal(socket.sent.length, 3);
+      ws.close();
+      mock.timers.tick(60000);
+      assert.equal(socket.sent.length, 3);
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
+  it('surfaces socket errors without reconnecting after close', () => {
+    const errors = [];
+    const ws = new BitunixWs({ onError: error => errors.push(error.message) }, FakeSocket);
+    const socket = ws.connectPublic(['tickers']);
+    socket.handlers.error(new Error('boom'));
+    assert.deepEqual(errors, ['boom']);
+    ws.close();
+    assert.equal(ws.publicWs, null);
+    assert.equal(ws.publicPingTimer, null);
+  });
+});
+
 });

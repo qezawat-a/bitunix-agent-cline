@@ -114,6 +114,7 @@ export async function setCommands() {
     { command: 'thinking', description: 'thinking off|low|mid|high|max' },
     { command: 'memory', description: 'Memory show' },
     { command: 'resume', description: 'Resume session' },
+    { command: 'reset', description: 'Clear agent conversation' },
     { command: 'ask', description: 'Ask the agent' },
     { command: 'skills', description: 'List agent skills' },
     { command: 'skill', description: 'Read a skill: /skill id' },

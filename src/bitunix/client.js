@@ -105,8 +105,12 @@ export class BitunixClient {
     return this.request('GET', '/api/v1/futures/market/tickers', null, { symbols: symbol || '' }, { signed: false });
   }
 
-  async getDepth(symbol) {
-    return this.request('GET', '/api/v1/futures/market/depth', null, { symbol }, { signed: false });
+  async getDepth(symbol, limit = '') {
+    if (!symbol) throw new Error('symbol is required to read the order book');
+    // Docs accept a fixed gear (1/5/15/50/max); empty returns the default gear.
+    const gear = limit === '' || limit === null || limit === undefined ? '' : String(limit);
+    if (gear && !/^(1|5|15|50|max)$/i.test(gear)) throw new Error('depth limit must be one of 1, 5, 15, 50, max');
+    return this.request('GET', '/api/v1/futures/market/depth', null, { symbol, limit: gear }, { signed: false });
   }
 
   async placeOrder(params) {

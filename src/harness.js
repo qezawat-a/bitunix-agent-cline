@@ -60,15 +60,27 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const { buildRuntime } = await import('./agent/runtime.js');
   const { detectProviders } = await import('./agent/config.js');
 
-  const { agent } = await buildRuntime();
+  const { agent, tools } = await buildRuntime();
+  const { handleAgentCommand } = await import('./agent-commands.js');
   const provider = detectProviders();
 
   startHarness({
     log,
     say: async text => {
+      // Slash commands are answered locally, exactly like the TUI and Telegram,
+      // so probing them does not burn an LLM round-trip.
+      if (/^\/[a-z]/i.test(text)) {
+        const handled = await handleAgentCommand(text, { agent, tools, say: t => agent.say(t) });
+        if (handled?.handled) return { reply: handled.reply, rounds: 0, provider };
+      }
       const before = agent.history.length;
       const reply = await agent.say(text);
-      return { reply: reply.content, rounds: Math.max(1, (agent.history.length - before) / 2), provider };
+      return {
+        reply: reply.content,
+        error: Boolean(reply.error),
+        rounds: Math.max(1, (agent.history.length - before) / 2),
+        provider,
+      };
     },
   });
 }

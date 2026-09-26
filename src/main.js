@@ -18,7 +18,7 @@ import { Memory } from './agent/memory.js';
 import { listSkills } from './agent/skills.js';
 import { loadMcpTools, disposeMcpTools } from './agent/mcp.js';
 import { loadStore, saveStore, closePersist } from './store/persist.js';
-import { loadSession, saveSession } from './session-store.js';
+import { loadSession, saveSession, deleteSession } from './session-store.js';
 import { applyPersistedSettings, getPersistentSettings, getTraderSettings, validateSettings } from './trader/settings.js';
 
 async function main() {
@@ -69,6 +69,7 @@ async function main() {
     tools,
     loadSession,
     saveSession,
+    deleteSession,
   });
 
   if (CONFIG.BITUNIX_API_KEY) {
@@ -84,10 +85,12 @@ async function main() {
   const ws = new BitunixWs({
     onPublic: () => {},
     onPrivate: event => { trader.handlePrivateEvent(event).catch(error => console.error('private state refresh error:', error.message)); },
+    onError: error => console.error('bitunix websocket error:', error?.message || error),
   });
-  try { ws.connectPublic([{ ch: 'tickers', symbol: CONFIG.symbol }]); } catch {}
+  try { ws.connectPublic([{ ch: 'tickers', symbol: CONFIG.symbol }]); } catch (error) { console.error('public websocket not started:', error.message); }
   if (CONFIG.BITUNIX_API_KEY) {
-    try { ws.connectPrivate(['balance', 'order', 'position', 'tp_sl']); } catch {}
+    // `tpsl` is the documented private channel name (the server ignores tp_sl).
+    try { ws.connectPrivate(['balance', 'order', 'position', 'tpsl']); } catch (error) { console.error('private websocket not started:', error.message); }
   }
 
   await setCommands().catch(() => {});

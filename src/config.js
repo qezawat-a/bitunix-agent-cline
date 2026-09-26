@@ -37,6 +37,12 @@ export const CONFIG = {
   AI_AUTO_REFRESH: B(S('AI_AUTO_REFRESH', '1'), true, 'AI_AUTO_REFRESH'),
   AI_MODEL_TTL: Number(S('AI_MODEL_TTL', 600000)),
   AGENT_AUTO_COMPACT: B(S('AGENT_AUTO_COMPACT', '1'), true, 'AGENT_AUTO_COMPACT'),
+  // Empty means "pick per model": reasoning/thinking endpoints reject a non-default
+  // temperature outright, so it is only sent when explicitly asked for.
+  AI_TEMPERATURE: S('AI_TEMPERATURE', ''),
+  // Dump the exact outbound request body + provider response to stderr.
+  AI_DEBUG_LOG: B(S('AI_DEBUG_LOG', '0'), false, 'AI_DEBUG_LOG'),
+
 
   // Bitunix
   BITUNIX_API_KEY: S('BITUNIX_API_KEY', ''),

@@ -42,12 +42,15 @@ let autoModelState = { key: null, model: null };
 
 function rankDiscoveredModels(models) {
   const blocked = /embed|whisper|tts|audio|dall|image|moderation|rerank|realtime|omni|fine-tune|guard/i;
-  const preferred = /free|flash|mini|lite|nano|small|distil/i;
+  const preferred = /flash|mini|lite|nano|small|distil/i;
   const usable = models.filter(model => !blocked.test(model));
+  // Free tiers were previously tried first and they are the most rate-limited
+  // group, so AUTO gave up on the whole list when the cheapest tier hiccuped.
+  // General-purpose models come first now; free tier is still reachable.
   return [
+    ...usable.filter(model => preferred.test(model) && !/:free$/i.test(model)),
+    ...usable.filter(model => !preferred.test(model) && !/:free$/i.test(model)),
     ...usable.filter(model => /:free$/i.test(model)),
-    ...usable.filter(model => preferred.test(model)),
-    ...usable.filter(model => !/:free$/i.test(model) && !preferred.test(model)),
   ];
 }
 
@@ -55,12 +58,16 @@ async function probeOpenAiModel(model, signal) {
   const res = await fetch(resolveOpenAiUrl(), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${CONFIG.AI_API_KEY}` },
-    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 8 }),
+    // A tiny budget only looks available: reasoning models spend it entirely on
+    // thinking and either 400 or answer with no visible content at all.
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 128 }),
     signal,
   });
+  // A 2xx is the availability signal. Requiring visible text here rejected every
+  // thinking model, which is what produced "No discovered model passed the probe".
   if (!res.ok) return false;
   const data = await res.json().catch(() => ({}));
-  return Boolean(data?.choices?.[0]?.message);
+  return Boolean(data?.choices?.length);
 }
 
 async function resolveOpenAiModel(signal) {
@@ -69,15 +76,49 @@ async function resolveOpenAiModel(signal) {
   const key = `${resolveOpenAiUrl()}|${CONFIG.AI_API_KEY ? 'configured' : 'missing'}`;
   if (autoModelState.key === key && autoModelState.model) return autoModelState.model;
   const models = rankDiscoveredModels(await listOpenAiModels(signal));
-  for (const candidate of models.slice(0, 10)) {
-    try {
-      if (await probeOpenAiModel(candidate, signal)) {
-        autoModelState = { key, model: candidate };
-        return candidate;
+  // Probing only the first few candidates meant AUTO gave up while perfectly
+  // good models further down the list were never tested. Probe the whole ranked
+  // list, a few at a time, and keep the ranked order when reporting a winner.
+  const concurrency = 6;
+  const verdicts = new Map();
+  let next = 0;
+  const worker = async () => {
+    while (next < models.length) {
+      const index = next++;
+      try {
+        verdicts.set(index, await probeOpenAiModel(models[index], signal));
+      } catch {
+        verdicts.set(index, false);
       }
-    } catch {}
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(concurrency, models.length) }, worker));
+  for (let index = 0; index < models.length; index += 1) {
+    if (verdicts.get(index)) {
+      autoModelState = { key, model: models[index] };
+      return models[index];
+    }
   }
-  throw new Error('No discovered model passed the availability probe; set AI_MODEL explicitly');
+  throw new Error(`None of the ${models.length} discovered models passed the availability probe; set AI_MODEL explicitly (see /models)`);
+}
+
+// Reasoning and thinking endpoints commonly reject a non-default temperature with
+// a bare invalid_request_error, so it is only sent when explicitly configured.
+export function shouldSendTemperature(model, configured = CONFIG.AI_TEMPERATURE) {
+  const raw = String(configured ?? '').trim();
+  if (raw !== '') {
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : undefined;
+  }
+  if (/thinking|reasoner|reason|-high$|-medium$|(^|[\/-])o[1-9]([-.]|$)/i.test(String(model || ''))) return undefined;
+  return 0.7;
+}
+
+function debugLog(label, payload) {
+  if (!CONFIG.AI_DEBUG_LOG) return;
+  let text;
+  try { text = typeof payload === 'string' ? payload : JSON.stringify(payload); } catch { text = String(payload); }
+  console.error(`[ai-debug] ${label}: ${text.slice(0, 6000)}`);
 }
 
 function toolDefinitions(tools) {
@@ -190,12 +231,15 @@ function geminiMessages(messages) {
 async function chatOpenAI(messages, key, tools, options) {
   const url = resolveOpenAiUrl();
   const model = await resolveOpenAiModel(options.signal);
-  const body = { model, messages, max_tokens: 2048, temperature: 0.7 };
+  const body = { model, messages, max_tokens: 2048 };
+  const temperature = shouldSendTemperature(model);
+  if (temperature !== undefined) body.temperature = temperature;
   const definitions = toOpenAIToolDefs(tools);
   if (definitions.length) {
     body.tools = definitions;
     body.tool_choice = 'auto';
   }
+  debugLog('openai request', body);
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
@@ -208,9 +252,12 @@ async function chatOpenAI(messages, key, tools, options) {
       const parsed = new URL(url);
       endpoint = `${parsed.origin}${parsed.pathname}`;
     } catch {}
-    throw new Error(`openai ${res.status} at ${endpoint} (model=${model}): ${(await res.text()).slice(0, 300)}`);
+    const detail = await res.text();
+    debugLog('openai rejected', detail);
+    throw new Error(`openai ${res.status} at ${endpoint} (model=${model}): ${detail.slice(0, 300)}`);
   }
   const data = await res.json();
+  debugLog('openai response', data);
   const message = data.choices?.[0]?.message || {};
   return {
     text: message.content || '',
@@ -222,17 +269,29 @@ async function chatAnthropic(messages, key, tools, options) {
   const url = CONFIG.ANTHROPIC_BASE_URL || 'https://api.anthropic.com/v1/messages';
   const model = CONFIG.ANTHROPIC_MODEL && CONFIG.ANTHROPIC_MODEL !== 'AUTO' ? CONFIG.ANTHROPIC_MODEL : 'claude-3-haiku-20240307';
   const { system, history } = splitSystem(messages);
-  const body = { model, messages: anthropicMessages(history), max_tokens: Math.max(1024, Number(options.thinkingBudget) || 2048), temperature: 0.7 };
+  const body = { model, messages: anthropicMessages(history), max_tokens: Math.max(1024, Number(options.thinkingBudget) || 2048) };
+  // Anthropic rejects `temperature` outright when thinking is enabled, so only
+  // send it when the user pinned a value.
+  if (String(CONFIG.AI_TEMPERATURE || '').trim() !== '') {
+    const value = Number(CONFIG.AI_TEMPERATURE);
+    if (Number.isFinite(value)) body.temperature = value;
+  }
   if (system) body.system = system;
   if (tools?.length) body.tools = toAnthropicToolDefs(tools);
+  debugLog('anthropic request', body);
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify(body),
     signal: options.signal,
   });
-  if (!res.ok) throw new Error(`anthropic ${res.status}: ${(await res.text()).slice(0, 300)}`);
+  if (!res.ok) {
+    const detail = await res.text();
+    debugLog('anthropic rejected', detail);
+    throw new Error(`anthropic ${res.status}: ${detail.slice(0, 300)}`);
+  }
   const data = await res.json();
+  debugLog('anthropic response', data);
   const content = Array.isArray(data.content) ? data.content : [];
   return {
     text: content.filter(item => item.type === 'text').map(item => item.text || '').join(''),
