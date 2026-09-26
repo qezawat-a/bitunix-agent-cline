@@ -668,9 +668,13 @@ describe('bitunix websocket frames', () => {
     assert.equal(arg.apiKey, 'test-key');
     assert.match(arg.nonce, /^[0-9a-f]{32}$/);
     assert.match(arg.sign, /^[0-9a-f]{64}$/);
-    const params = `apiKey${arg.apiKey}nonce${arg.nonce}timestamp${arg.timestamp}`;
-    const digest = crypto.createHash('sha256').update(`${arg.nonce}${arg.timestamp}${arg.apiKey}${params}`).digest('hex');
+    const digest = crypto.createHash('sha256').update(`${arg.nonce}${arg.timestamp}${arg.apiKey}`).digest('hex');
     assert.equal(arg.sign, crypto.createHash('sha256').update(digest + 'test-secret').digest('hex'));
+    // The docs sign ONLY nonce+timestamp+apiKey; the REST-style sorted key/value
+    // blob must not creep back in or every private login is rejected.
+    const restStyle = `apiKey${arg.apiKey}nonce${arg.nonce}timestamp${arg.timestamp}`;
+    const restDigest = crypto.createHash('sha256').update(`${arg.nonce}${arg.timestamp}${arg.apiKey}${restStyle}`).digest('hex');
+    assert.notEqual(arg.sign, crypto.createHash('sha256').update(restDigest + 'test-secret').digest('hex'));
     assert.deepEqual(subscribe, { op: 'subscribe', args: [{ ch: 'balance' }, { ch: 'tpsl' }] });
     ws.close();
   });

@@ -61,10 +61,12 @@ export function normalizePrivateChannel(channel) {
   return resolved;
 }
 
+// WS login signature (NOT the REST one in client.js, which also folds in the
+// canonical query string and body): sign = sha256(sha256(nonce + timestamp +
+// apiKey) + secretKey) with NO sorted key/value blob appended.
+// https://www.bitunix.com/api-docs/futures/websocket/prepare/WebSocket.html
 function signWs(params, secret) {
-  const keys = Object.keys(params).filter(key => key !== 'sign').sort();
-  const value = keys.map(key => `${key}${params[key]}`).join('');
-  const digest = crypto.createHash('sha256').update(`${params.nonce}${params.timestamp}${params.apiKey}${value}`).digest('hex');
+  const digest = crypto.createHash('sha256').update(`${params.nonce}${params.timestamp}${params.apiKey}`).digest('hex');
   return crypto.createHash('sha256').update(digest + secret).digest('hex');
 }
 
@@ -161,7 +163,9 @@ export class BitunixWs {
         if (login) {
           const nonce = crypto.randomBytes(16).toString('hex');
           // Docs type the login timestamp as Int Unix seconds; the signature is
-          // computed over the exact value that gets sent.
+          // sha256(sha256(nonce + timestamp + apiKey) + secretKey) over the exact
+          // values that get sent.
+          // https://www.bitunix.com/api-docs/futures/websocket/prepare/WebSocket.html
           const timestamp = Math.floor(Date.now() / 1000);
           const base = { apiKey: CONFIG.BITUNIX_API_KEY, nonce, timestamp };
           const sign = signWs(base, CONFIG.BITUNIX_API_SECRET);

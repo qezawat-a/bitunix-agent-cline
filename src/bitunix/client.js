@@ -288,12 +288,15 @@ export class BitunixClient {
     return Array.isArray(data) ? data : data?.orderList || [];
   }
 
+  // get_order_detail accepts only orderId (or clientId) — there is no `symbol`
+  // parameter, and sending one is rejected as a Parameter Error. A two-argument
+  // call is still tolerated for call-site convenience, but the leading symbol is
+  // deliberately dropped from the query.
+  // https://www.bitunix.com/api-docs/futures/trade/get_order_detail.html
   async getOrderDetail(symbolOrOrderId, maybeOrderId) {
-    const hasSymbol = maybeOrderId !== undefined;
-    const symbol = hasSymbol ? String(symbolOrOrderId) : '';
-    const orderId = hasSymbol ? String(maybeOrderId) : String(symbolOrOrderId);
+    const orderId = maybeOrderId === undefined ? String(symbolOrOrderId) : String(maybeOrderId);
     if (!orderId) throw new Error('orderId is required');
-    return this.request('GET', '/api/v1/futures/trade/get_order_detail', null, { orderId, ...(symbol ? { symbol } : {}) });
+    return this.request('GET', '/api/v1/futures/trade/get_order_detail', null, { orderId });
   }
 
   async getHistoryOrders(symbol, options = {}) {

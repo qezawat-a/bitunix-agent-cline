@@ -160,12 +160,15 @@ export class PositionManager {
   }
 
   async moveSLToEntry(positionId, entryPrice) {
+    // /tpsl/position/modify_order takes only symbol, positionId, the tp*/sl*
+    // trigger prices and their stop types — the trigger's order type is not a
+    // parameter here, so it is not sent.
+    // https://www.bitunix.com/api-docs/futures/tp_sl/modify_position_tp_sl_order.html
     return this.client.modifyTPSL({
       symbol: this.symbol,
       positionId,
       slPrice: formatPrice(entryPrice),
       slStopType: 'MARK_PRICE',
-      slOrderType: 'MARKET',
     });
   }
 
@@ -185,12 +188,13 @@ export class PositionManager {
   }
 
   async updateTrailingSL(positionId, newSL) {
+    // See moveSLToEntry: no slOrderType — it is not a documented parameter of
+    // /tpsl/position/modify_order.
     return this.client.modifyTPSL({
       symbol: this.symbol,
       positionId,
       slPrice: formatPrice(newSL),
       slStopType: 'MARK_PRICE',
-      slOrderType: 'MARKET',
     });
   }
 
