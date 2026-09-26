@@ -94,6 +94,12 @@ export const CONFIG = {
   order_unit: S('order_unit', 'cost'),
   position_sizing_margin_pct: Number(S('position_sizing_margin_pct', 2)),
   auto_trade: B(S('AUTO_TRADE', '0'), false, 'AUTO_TRADE'),
+  // Trading authority is deliberately NOT persisted (getPersistentSettings drops
+  // it), so auto_trade is always off after a restart. That is the safe default,
+  // but it means /autotrade on silently reverts on every redeploy. Set
+  // AUTO_TRADE_PERSIST=1 to opt into restoring it, which also persists the
+  // flag when it is switched from Telegram.
+  AUTO_TRADE_PERSIST: B(S('AUTO_TRADE_PERSIST', '0'), false, 'AUTO_TRADE_PERSIST'),
   store_id: S('STORE_ID', 'j-rock-1'),
 };
 

@@ -17,7 +17,7 @@ import { bitunixTools } from './bitunix/futures-tools.js';
 import { Memory } from './agent/memory.js';
 import { listSkills } from './agent/skills.js';
 import { loadMcpTools, disposeMcpTools } from './agent/mcp.js';
-import { loadStore, saveStore, closePersist } from './store/persist.js';
+import { loadStore, saveStore, closePersist, didLoadFail } from './store/persist.js';
 import { loadSession, saveSession, deleteSession } from './session-store.js';
 import { applyPersistedSettings, getPersistentSettings, getTraderSettings, validateSettings } from './trader/settings.js';
 
@@ -42,7 +42,24 @@ async function main() {
       console.warn('[warn] ignoring invalid persisted settings:', error.message);
     }
   }
-  await saveStore({ settings: getPersistentSettings(CONFIG) });
+  // Only write the store back when the read actually succeeded. If the database
+  // was unreachable, loadStore() fell back to an empty local file, and saving
+  // here would persist the defaults over the settings that are really stored.
+  if (didLoadFail()) {
+    console.error('[persistence] store read failed — skipping write-back so stored settings are not overwritten with defaults');
+  } else {
+    await saveStore({ settings: getPersistentSettings(CONFIG) });
+  }
+
+  // Telegram /set, /leverage and /symbol mutate CONFIG in memory. Without an
+  // explicit save after each one, every change is lost on the next deploy.
+  const persistSettings = async () => {
+    try {
+      await saveStore({ settings: getPersistentSettings(CONFIG) });
+    } catch (error) {
+      console.error('settings save error:', error.message);
+    }
+  };
 
   const client = new BitunixClient();
   const scanner = new Scanner(client);
@@ -70,6 +87,7 @@ async function main() {
     loadSession,
     saveSession,
     deleteSession,
+    persistSettings,
   });
 
   if (CONFIG.BITUNIX_API_KEY) {
@@ -146,8 +164,22 @@ async function main() {
     try {
       if (scanState.scanOn) {
         const signal = await trader.scanCycle();
-        if (signal && reportState.reportOn && CONFIG.ALLOWED_USER_ID) {
-          await sendMessage(CONFIG.ALLOWED_USER_ID, `<b>${esc(CONFIG.AGENT_NAME)}</b> signal <b>${esc(signal.signal)}</b> <code>${esc(signal.symbol)}</code> @ <code>${esc(String(signal.price ?? signal.lastPrice ?? '-'))}</code>`);
+        if (signal) {
+          // scanCycle() only *produces* a signal. Turning it into a live order is
+          // a separate step, and it has to happen here: without this call the
+          // autonomous loop reports signals to Telegram but never trades, so
+          // /autotrade on appears to do nothing.
+          if (CONFIG.auto_trade && ['bullish', 'bearish'].includes(signal.signal)) {
+            const result = await trader.executeSignal(signal);
+            if (result?.executed) {
+              console.log(`[trade] ${CONFIG.symbol} ${signal.signal} @ ${result.price}`);
+            } else if (result?.reason) {
+              console.log(`[trade] skipped: ${result.reason}`);
+            }
+          }
+          if (reportState.reportOn && CONFIG.ALLOWED_USER_ID) {
+            await sendMessage(CONFIG.ALLOWED_USER_ID, `<b>${esc(CONFIG.AGENT_NAME)}</b> signal <b>${esc(signal.signal)}</b> <code>${esc(signal.symbol)}</code> @ <code>${esc(String(signal.price ?? signal.lastPrice ?? '-'))}</code>`);
+          }
         }
       } else {
         await Promise.allSettled([trader.guard(), trader.midManage(), trader.report()]);

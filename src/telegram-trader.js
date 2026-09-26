@@ -13,9 +13,14 @@ function markCooldown(trader) {
   if (trader?.state) trader.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
 }
 
-export function createTraderCommands({ client, scanner, trader, agent, tools = [], loadSession = null, saveSession = null, deleteSession = null }) {
+export function createTraderCommands({ client, scanner, trader, agent, tools = [], loadSession = null, saveSession = null, deleteSession = null, persistSettings = null }) {
   const scanState = { scanOn: true };
   const reportState = { reportOn: true };
+  // Settings live in CONFIG in memory; without an explicit write after every
+  // change they are lost whenever the process restarts or is redeployed.
+  const save = async () => {
+    if (persistSettings) await persistSettings();
+  };
 
   async function handleCommand(msg, text) {
     const chatId = msg.chat.id;
@@ -36,6 +41,8 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
         case 'stop': {
           CONFIG.auto_trade = false;
           scanState.scanOn = false;
+          // Persist the stop so a restart does not bring auto-trade back.
+          await save();
           await sendMessage(chatId, 'Auto-trade and autonomous scans stopped.');
           return true;
         }
@@ -62,6 +69,7 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
             if (!Array.isArray(positions) || positions.length) return usage(chatId, 'Cannot change symbol while positions are open.');
           }
           applySettings(CONFIG, { [key]: value });
+          await save();
           await sendMessage(chatId, `Set <code>${esc(key)}</code> = <code>${esc(String(value))}</code>`);
           return true;
         }
@@ -115,8 +123,24 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           return true;
         }
         case 'autotrade': {
-          CONFIG.auto_trade = parseBoolean(arg, !CONFIG.auto_trade, 'autotrade');
-          if (CONFIG.auto_trade) scanState.scanOn = true;
+          const next = parseBoolean(arg, !CONFIG.auto_trade, 'autotrade');
+          if (next) {
+            // Align the exchange with the configured leverage/margin/position
+            // mode before granting trading authority. verifyAccountSettings()
+            // throws on a mismatch, so a silent mismatch can never be reported
+            // back to the user as a successful enable.
+            if (trader?.syncAccountSettings) {
+              try {
+                await trader.syncAccountSettings({ apply: true });
+              } catch (error) {
+                return usage(chatId, `Cannot enable: ${esc(error.message)}`);
+              }
+            }
+            scanState.scanOn = true;
+          }
+          CONFIG.auto_trade = next;
+          // Persist the new authority state when the operator opted in.
+          await save();
           await sendMessage(chatId, `AUTO_TRADE=<code>${CONFIG.auto_trade ? 'on' : 'off'}</code>`);
           return true;
         }
@@ -138,6 +162,7 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           if (errors.length) return usage(chatId, `Invalid leverage: ${esc(errors[0])}`);
           await client.changeLeverage(CONFIG.symbol, lev);
           applySettings(CONFIG, { leverage: lev });
+          await save();
           await sendMessage(chatId, `leverage <code>${lev}</code>`);
           return true;
         }
@@ -148,6 +173,7 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           const positions = await client.getPendingPositions(CONFIG.symbol);
           if (!Array.isArray(positions) || positions.length) return usage(chatId, 'Cannot change symbol while positions are open.');
           applySettings(CONFIG, { symbol });
+          await save();
           await sendMessage(chatId, `symbol <code>${esc(CONFIG.symbol)}</code>`);
           return true;
         }

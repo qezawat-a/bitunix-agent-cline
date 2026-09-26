@@ -12,6 +12,7 @@ import {
 } from '../src/trader/settings.js';
 import { parseThinkingLevel } from '../src/agent/thinking.js';
 import { CONFIG, parseBoolean, applySettingsFile } from '../src/config.js';
+import { createTraderCommands } from '../src/telegram-trader.js';
 import { BitunixClient } from '../src/bitunix/client.js';
 import Scanner from '../src/bitunix/scanner.js';
 import { liqDistanceOk } from '../src/bitunix/risk.js';
@@ -140,6 +141,7 @@ describe('safety configuration', () => {
 
   it('exposes only public settings and excludes auto_trade from persistence', () => {
     CONFIG.BITUNIX_API_SECRET = 'secret-sentinel';
+    CONFIG.AUTO_TRADE_PERSIST = false;
     const publicSettings = getTraderSettings(CONFIG);
     assert.equal(Object.hasOwn(publicSettings, 'BITUNIX_API_SECRET'), false);
     const persistent = getPersistentSettings(CONFIG);
@@ -147,6 +149,28 @@ describe('safety configuration', () => {
     assert.equal(Object.hasOwn(persistent, 'auto_trade'), false);
     assert.equal(Object.hasOwn(persistent, 'symbol'), true);
     assert.equal(Object.hasOwn(persistent, 'BITUNIX_API_SECRET'), false);
+  });
+
+  it('keeps auto_trade out of the store by default but honours AUTO_TRADE_PERSIST', () => {
+    // Default (off): the flag must never reach the store, so a redeploy cannot
+    // silently resume live trading.
+    const off = { ...getTraderSettings(CONFIG), auto_trade: true, AUTO_TRADE_PERSIST: false };
+    assert.equal(Object.hasOwn(getPersistentSettings(off), 'auto_trade'), false);
+
+    // Opted in: /autotrade on is expected to survive a deploy.
+    const on = { ...getTraderSettings(CONFIG), auto_trade: true, AUTO_TRADE_PERSIST: true };
+    const persisted = getPersistentSettings(on);
+    assert.equal(Object.hasOwn(persisted, 'auto_trade'), true);
+    assert.equal(persisted.auto_trade, true);
+
+    // applyPersistedSettings must mirror it in both directions.
+    const restoreDefault = { ...getTraderSettings(CONFIG), auto_trade: false, AUTO_TRADE_PERSIST: false };
+    applyPersistedSettings(restoreDefault, { auto_trade: true });
+    assert.equal(restoreDefault.auto_trade, false, 'default must not restore trading authority');
+
+    const restoreOptIn = { ...getTraderSettings(CONFIG), auto_trade: false, AUTO_TRADE_PERSIST: true };
+    applyPersistedSettings(restoreOptIn, { auto_trade: true });
+    assert.equal(restoreOptIn.auto_trade, true, 'AUTO_TRADE_PERSIST=1 must restore auto_trade');
   });
 });
 
@@ -728,6 +752,120 @@ describe('bitunix websocket frames', () => {
     ws.close();
     assert.equal(ws.publicWs, null);
     assert.equal(ws.publicPingTimer, null);
+  });
+});
+
+describe('telegram settings persistence and autotrade', () => {
+  const replies = [];
+  const realFetch = globalThis.fetch;
+  let savedToken;
+  let savedOwner;
+
+  beforeEach(() => {
+    replies.length = 0;
+    savedToken = CONFIG.TELEGRAM_BOT_TOKEN;
+    savedOwner = CONFIG.ALLOWED_USER_ID;
+    CONFIG.TELEGRAM_BOT_TOKEN = 'test-token';
+    CONFIG.ALLOWED_USER_ID = '42';
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('sendMessage')) {
+        replies.push(JSON.parse(init.body).text);
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    };
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    CONFIG.TELEGRAM_BOT_TOKEN = savedToken;
+    CONFIG.ALLOWED_USER_ID = savedOwner;
+  });
+
+  const ownerMsg = { chat: { id: 42 }, from: { id: 42 } };
+
+  it('persists the store after /set, /leverage and /symbol', async () => {
+    const saves = [];
+    const { handleCommand } = createTraderCommands({
+      client: { getPendingPositions: async () => [], changeLeverage: async () => ({}) },
+      scanner: {}, trader: {}, agent: {},
+      persistSettings: async () => { saves.push({ ...CONFIG }); },
+    });
+
+    await handleCommand(ownerMsg, '/set min_confidence 65');
+    await handleCommand(ownerMsg, '/leverage 12');
+    await handleCommand(ownerMsg, '/symbol ETHUSDT');
+
+    // Every mutating command must write through, otherwise the change is lost
+    // on the next deploy.
+    assert.equal(saves.length, 3, 'each settings change must persist once');
+    assert.equal(saves[0].min_confidence, 65);
+    assert.equal(saves[1].leverage, 12);
+    assert.equal(saves[2].symbol, 'ETHUSDT');
+  });
+
+  it('refuses to enable auto-trade when the exchange does not match config', async () => {
+    const savedAuto = CONFIG.auto_trade;
+    CONFIG.auto_trade = false;
+    try {
+      const { handleCommand } = createTraderCommands({
+        client: {},
+        scanner: {},
+        trader: {
+          syncAccountSettings: async () => { throw new Error('exchange leverage 20 does not match configured leverage 10'); },
+        },
+        agent: {},
+        persistSettings: async () => {},
+      });
+
+      await handleCommand(ownerMsg, '/autotrade on');
+      // It must not report success, and must not grant trading authority.
+      assert.equal(CONFIG.auto_trade, false, 'auto_trade must stay off when verification fails');
+      assert.match(replies.join('\n'), /Cannot enable/);
+    } finally {
+      CONFIG.auto_trade = savedAuto;
+    }
+  });
+
+  it('enables auto-trade and turns scanning on once the exchange matches', async () => {
+    const savedAuto = CONFIG.auto_trade;
+    CONFIG.auto_trade = false;
+    let synced = null;
+    try {
+      const { handleCommand, scanState } = createTraderCommands({
+        client: {},
+        scanner: {},
+        trader: { syncAccountSettings: async (opts) => { synced = opts; return { applied: true }; } },
+        agent: {},
+        persistSettings: async () => {},
+      });
+
+      await handleCommand(ownerMsg, '/autotrade on');
+      assert.equal(CONFIG.auto_trade, true);
+      assert.equal(scanState.scanOn, true);
+      assert.deepEqual(synced, { apply: true }, 'must sync the exchange before granting authority');
+      assert.match(replies.join('\n'), /AUTO_TRADE=<code>on<\/code>/);
+    } finally {
+      CONFIG.auto_trade = savedAuto;
+    }
+  });
+
+  it('persists /stop so a restart cannot bring auto-trade back', async () => {
+    const savedAuto = CONFIG.auto_trade;
+    CONFIG.auto_trade = true;
+    let persisted = 0;
+    try {
+      const { handleCommand, scanState } = createTraderCommands({
+        client: {}, scanner: {}, trader: {}, agent: {},
+        persistSettings: async () => { persisted += 1; },
+      });
+      await handleCommand(ownerMsg, '/stop');
+      assert.equal(CONFIG.auto_trade, false);
+      assert.equal(scanState.scanOn, false);
+      assert.equal(persisted, 1, '/stop must persist the stop');
+    } finally {
+      CONFIG.auto_trade = savedAuto;
+    }
   });
 });
 

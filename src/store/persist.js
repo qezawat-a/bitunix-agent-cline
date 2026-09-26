@@ -3,6 +3,14 @@ import { CONFIG } from '../config.js';
 import { readLocal, writeLocal } from './memory.js';
 
 let pool = null;
+// True when the last loadStore() hit the database and failed. Boot must not
+// write back after a failed read: doing so would overwrite good stored
+// settings with the defaults merely because the DB was briefly unreachable.
+let lastLoadFailed = false;
+
+export function didLoadFail() {
+  return lastLoadFailed;
+}
 
 function getPool() {
   if (!CONFIG.DATABASE_URL) return null;
@@ -30,7 +38,8 @@ export async function ensureSchema() {
 
 export async function loadStore() {
   const p = getPool();
-  if (!p) return readLocal();
+  if (!p) { lastLoadFailed = false; return readLocal(); }
+  lastLoadFailed = false;
   try {
     await ensureSchema();
     const client = await p.connect();
@@ -45,6 +54,7 @@ export async function loadStore() {
     }
   } catch (error) {
     console.error('persist load error:', error.message);
+    lastLoadFailed = true;
     return readLocal();
   }
 }

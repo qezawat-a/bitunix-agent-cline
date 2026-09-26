@@ -180,7 +180,10 @@ export function getTraderSettings(source = CONFIG) {
 
 export function getPersistentSettings(source = CONFIG) {
   const settings = getTraderSettings(source);
-  delete settings.auto_trade; // never resume trading authority after a restart
+  // auto_trade is trading authority: by default it is never written, so a
+  // restart can never silently resume live trading. AUTO_TRADE_PERSIST=1 is the
+  // explicit opt-in for operators who want /autotrade on to survive a deploy.
+  if (!source.AUTO_TRADE_PERSIST) delete settings.auto_trade;
   return settings;
 }
 
@@ -201,7 +204,9 @@ export function applyPersistedSettings(target, stored) {
     if (SETTING_KEY_SET.has(canonical)) filtered[canonical] = value;
   }
   const normalized = normalizePatch(filtered);
-  delete normalized.auto_trade;
+  // Mirrors getPersistentSettings: only restore auto_trade when the operator has
+  // explicitly opted in via AUTO_TRADE_PERSIST=1.
+  if (!target.AUTO_TRADE_PERSIST) delete normalized.auto_trade;
   const next = { ...getTraderSettings(target), ...normalized };
   const errors = validateSettings(next);
   if (errors.length) throw new Error(`invalid persisted settings: ${errors.join('; ')}`);
