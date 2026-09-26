@@ -7,6 +7,7 @@ let pool = null;
 // write back after a failed read: doing so would overwrite good stored
 // settings with the defaults merely because the DB was briefly unreachable.
 let lastLoadFailed = false;
+let lastError = null;
 
 export function didLoadFail() {
   return lastLoadFailed;
@@ -15,10 +16,14 @@ export function didLoadFail() {
 function getPool() {
   if (!CONFIG.DATABASE_URL) return null;
   if (!pool) {
-    pool = new Pool({
-      connectionString: CONFIG.DATABASE_URL,
-      ssl: { rejectUnauthorized: true },
-    });
+    // Do NOT force ssl options here. `pg` only applies its own SSL defaults when
+    // the caller does not pass `ssl`, and the sslmode in the connection string
+    // is parsed by pg's connection-string parser. Hardcoding
+    // { rejectUnauthorized: true } overrode sslmode=require and made every
+    // connection to a provider with its own CA (Neon, RDS, Supabase, ...) fail
+    // with DEPTH_ZERO_SELF_SIGNED_CERT, so loadStore() silently fell back to
+    // the local file and settings appeared to reset on every deploy.
+    pool = new Pool({ connectionString: CONFIG.DATABASE_URL });
   }
   return pool;
 }
@@ -53,10 +58,23 @@ export async function loadStore() {
       client.release();
     }
   } catch (error) {
-    console.error('persist load error:', error.message);
+    // Loud on purpose. Falling back to the local file without a clear warning is
+    // what made this look like "settings reset on deploy": the file is wiped on
+    // every release, so a silent fallback looks exactly like lost settings.
+    console.error(`[persistence] DATABASE_URL is set but the store could not be read (${error.code || error.message}). Falling back to the local file — settings will NOT survive a redeploy until this is fixed.`);
     lastLoadFailed = true;
+    lastError = error.code || error.message;
     return readLocal();
   }
+}
+
+/** Human-readable store status for /diag and boot logging. */
+export function storeStatus() {
+  return {
+    backend: CONFIG.DATABASE_URL ? 'postgres' : 'file',
+    lastLoadFailed,
+    lastError,
+  };
 }
 
 export async function saveStore(data) {

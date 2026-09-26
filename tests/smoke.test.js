@@ -1,5 +1,7 @@
 import { describe, it, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { Pool } from 'pg';
 import { ema, rsi, bollinger, atr, macd, superTrend, atrBreakout, computeSignal } from '../src/bitunix/indicators.js';
 import {
   applyPersistedSettings,
@@ -866,6 +868,29 @@ describe('telegram settings persistence and autotrade', () => {
     } finally {
       CONFIG.auto_trade = savedAuto;
     }
+  });
+});
+
+describe('store ssl contract', () => {
+  it('does not override the sslmode from the connection string', () => {
+    // Regression: persist.js hardcoded ssl:{rejectUnauthorized:true}, which made
+    // pg ignore sslmode in DATABASE_URL and fail against any provider with its
+    // own CA (Neon) using DEPTH_ZERO_SELF_SIGNED_CERT. That silently downgraded
+    // the store to the local file, which is why settings reset on every deploy.
+    const source = readFileSync(new URL('../src/store/persist.js', import.meta.url), 'utf8');
+    const poolBlock = source.slice(source.indexOf('new Pool('), source.indexOf('new Pool(') + 220);
+    assert.ok(poolBlock.includes('connectionString: CONFIG.DATABASE_URL'), 'pool must use the connection string');
+    assert.equal(/ssl\s*:\s*\{/.test(poolBlock), false, 'pool must not hardcode an ssl object');
+  });
+
+  it('resolves a Neon-style connection string to no forced ssl override', () => {
+    // The real pg behaviour: passing ssl explicitly is what broke it.
+    const withSsl = new Pool({ connectionString: 'postgres://u:p@ep-x.neon.tech/db?sslmode=require', ssl: { rejectUnauthorized: true } });
+    const withoutSsl = new Pool({ connectionString: 'postgres://u:p@ep-x.neon.tech/db?sslmode=require' });
+    assert.deepEqual(withoutSsl.options.ssl, undefined, 'sslmode alone must let pg decide');
+    assert.deepEqual(withSsl.options.ssl, { rejectUnauthorized: true }, 'explicit ssl overrides the connection string');
+    withSsl.end().catch(() => {});
+    withoutSsl.end().catch(() => {});
   });
 });
 

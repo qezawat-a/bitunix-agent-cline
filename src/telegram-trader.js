@@ -4,6 +4,7 @@ import { applySettings, getTraderSettings, parseSettingValue, validateSettings }
 import { parseThinkingLevel } from './agent/thinking.js';
 import { detectProviders } from './agent/config.js';
 import { listOpenAiModels } from './agent/brain.js';
+import { storeStatus } from './store/persist.js';
 
 function usage(chatId, text) {
   return sendMessage(chatId, text).then(() => true);
@@ -239,7 +240,11 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           return true;
         }
         case 'diag': {
-          await sendMessage(chatId, `<b>Diag</b>\napi <code>${client ? 'ready' : 'missing'}</code>\ndb <code>${CONFIG.DATABASE_URL ? 'postgres' : 'file'}</code>\nws <code>configured</code>`);
+          const store = storeStatus();
+          const dbLine = store.backend === 'postgres'
+            ? (store.lastLoadFailed ? `postgres BROKEN (${store.lastError || 'unknown'}) — settings are NOT persisting` : 'postgres OK')
+            : 'file only — set DATABASE_URL to survive redeploys';
+          await sendMessage(chatId, `<b>Diag</b>\napi <code>${client ? 'ready' : 'missing'}</code>\ndb <code>${esc(dbLine)}</code>\nws <code>configured</code>`);
           return true;
         }
         // Agent-layer commands (/skills /skill /mcp /harness /tools /check_ai).

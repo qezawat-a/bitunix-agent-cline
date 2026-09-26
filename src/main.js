@@ -17,7 +17,7 @@ import { bitunixTools } from './bitunix/futures-tools.js';
 import { Memory } from './agent/memory.js';
 import { listSkills } from './agent/skills.js';
 import { loadMcpTools, disposeMcpTools } from './agent/mcp.js';
-import { loadStore, saveStore, closePersist, didLoadFail } from './store/persist.js';
+import { loadStore, saveStore, closePersist, didLoadFail, storeStatus } from './store/persist.js';
 import { loadSession, saveSession, deleteSession } from './session-store.js';
 import { applyPersistedSettings, getPersistentSettings, getTraderSettings, validateSettings } from './trader/settings.js';
 
@@ -50,6 +50,8 @@ async function main() {
   } else {
     await saveStore({ settings: getPersistentSettings(CONFIG) });
   }
+  const bootStore = storeStatus();
+  console.log(`[persistence] backend=${bootStore.backend} loadFailed=${bootStore.lastLoadFailed}${bootStore.lastError ? ` (${bootStore.lastError})` : ''}`);
 
   // Telegram /set, /leverage and /symbol mutate CONFIG in memory. Without an
   // explicit save after each one, every change is lost on the next deploy.
