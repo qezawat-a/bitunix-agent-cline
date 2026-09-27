@@ -2,6 +2,8 @@ import 'dotenv/config';
 import fs from 'fs/promises';
 
 const S = (v, fallback) => process.env[v] ?? fallback;
+// Comma-separated numeric list, used for the partial take-profit ladder.
+const A = (v, fallback) => S(v, fallback).split(',').map(part => Number(part.trim())).filter(Number.isFinite);
 const E = (fallback, ...names) => {
   for (const name of names) {
     const value = process.env[name];
@@ -92,6 +94,12 @@ export const CONFIG = {
   report_interval_sec: Number(S('report_interval_sec', 30)),
   mid_manage_interval_sec: Number(S('mid_manage_interval_sec', 15)),
   order_unit: S('order_unit', 'cost'),
+  tpsl_method: S('tpsl_method', 'position'),
+  partial_tp_fractions: A('partial_tp_fractions', '0.3,0.4,0.3'),
+  partial_tp_roi_steps: A('partial_tp_roi_steps', '1,2,3'),
+  trailing_callback_pct: Number(S('trailing_callback_pct', 5)),
+  account_tp_roi_pct: Number(S('account_tp_roi_pct', 0)),
+  account_sl_roi_pct: Number(S('account_sl_roi_pct', 0)),
   position_sizing_margin_pct: Number(S('position_sizing_margin_pct', 2)),
   auto_trade: B(S('AUTO_TRADE', '0'), false, 'AUTO_TRADE'),
   // Trading authority is deliberately NOT persisted (getPersistentSettings drops
@@ -109,6 +117,8 @@ const FILE_TRADER_KEYS = new Set([
   'cooldown_minutes', 'max_positions', 'position_mode', 'scan_interval_sec', 'guard_interval_sec',
   'breakeven_threshold_pct', 'trailing_trigger_roi_pct', 'sl_liquidation_safety', 'on_tpsl_failure', 'reversal_enabled', 'reversal_confidence',
   'report_interval_sec', 'mid_manage_interval_sec', 'order_unit', 'position_sizing_margin_pct',
+  'tpsl_method', 'partial_tp_fractions', 'partial_tp_roi_steps', 'trailing_callback_pct',
+  'account_tp_roi_pct', 'account_sl_roi_pct',
 ]);
 
 function isPlainObject(value) {

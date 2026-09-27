@@ -7,10 +7,59 @@ function positiveNumber(value) {
   return Number.isFinite(number) && number > 0;
 }
 
+// The SDK exposes the order side as an enum (OrderSide.Buy / OrderSide.Sell),
+// but PlaceOrderRequest#setSide takes a plain String and the SDK's own
+// reference test sends the literal "BUY", so the REST wire value is upper case.
+// We therefore widen the accepted *input* to both casings and keep sending
+// upper case: rejecting "Buy"/"Sell" would fail a caller that copied the SDK
+// enum verbatim, while emitting "Buy"/"Sell" would change live trading on a
+// guess. Position sides are a different enum (PositionSide LONG/SHORT) and are
+// untouched here.
+function normalizeOrderSide(value) {
+  const side = String(value ?? '').trim().toLowerCase();
+  if (side === 'buy') return 'BUY';
+  if (side === 'sell') return 'SELL';
+  return null;
+}
+
+// The SDK returns either a bare list or a CommonResult.data envelope that
+// extends PageResp (`total` + one named list field: orderList / tradeList /
+// positionList). Prefer the SDK field name, keep the bare-array path, and hand
+// back the raw payload when nothing matches so callers keep ownership of the
+// "this is not the documented shape" error instead of silently seeing [].
+function listFrom(data, keys) {
+  if (Array.isArray(data)) return data;
+  for (const key of keys) {
+    if (Array.isArray(data?.[key])) return data[key];
+  }
+  return null;
+}
+
+// TpslOrderType / OrderType are LIMIT(1) / MARKET(2) in the SDK, but the ints
+// are the WS/serialised form: Jackson writes an enum by name, and
+// PlaceTpslOrderRequest types tpOrderType/slOrderType as plain Strings, so the
+// REST body must carry "LIMIT"/"MARKET". Rejecting the int form here catches the
+// most likely copy-paste from the SDK enum into a REST body.
+function validateTPSLOrderEnums(params) {
+  for (const field of ['tpOrderType', 'slOrderType']) {
+    if (params[field] !== undefined && !['LIMIT', 'MARKET'].includes(String(params[field]).toUpperCase())) {
+      throw new Error(`${field} must be LIMIT or MARKET`);
+    }
+  }
+  for (const field of ['tpStopType', 'slStopType']) {
+    if (params[field] !== undefined && !['LAST_PRICE', 'MARK_PRICE'].includes(String(params[field]).toUpperCase())) {
+      throw new Error(`${field} must be LAST_PRICE or MARK_PRICE`);
+    }
+  }
+  for (const field of ['tpQty', 'slQty']) {
+    if (params[field] !== undefined && !positiveNumber(params[field])) throw new Error(`${field} must be a positive partial quantity`);
+  }
+}
+
 function validateOrder(params) {
   if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('order parameters must be an object');
   if (typeof params.symbol !== 'string' || !/^[A-Z0-9]{5,32}$/.test(params.symbol)) throw new Error('invalid order symbol');
-  if (!['BUY', 'SELL'].includes(params.side)) throw new Error('order side must be BUY or SELL');
+  if (!normalizeOrderSide(params.side)) throw new Error('order side must be BUY or SELL');
   if (!positiveNumber(params.qty)) throw new Error('order qty must be positive');
   const orderType = params.orderType || 'MARKET';
   if (!['LIMIT', 'MARKET'].includes(orderType)) throw new Error('orderType must be LIMIT or MARKET');
@@ -119,7 +168,7 @@ export class BitunixClient {
     // Bitunix requires orderType and tradeSide on every place_order request,
     // even though the docs mark only some fields required. Send explicit values
     // so a caller that omits them still produces a valid request.
-    const payload = { orderType, tradeSide: params.tradeSide || 'OPEN', ...params, orderType };
+    const payload = { orderType, tradeSide: params.tradeSide || 'OPEN', ...params, orderType, side: normalizeOrderSide(params.side) };
     if (!payload.price && orderType === 'LIMIT') throw new Error('LIMIT order price must be positive');
     return this.request('POST', '/api/v1/futures/trade/place_order', payload, {});
   }
@@ -193,23 +242,61 @@ export class BitunixClient {
     return this.request('POST', '/api/v1/futures/tpsl/cancel_order', { symbol, orderId }, {});
   }
 
+  // Order-level TP/SL, i.e. NOT the position-level placeTPSL above. This is the
+  // only TP/SL pair that carries tpQty/slQty, so it is what makes a PARTIAL
+  // take-profit / stop-loss possible: a position-level TP/SL exits the whole
+  // position and takes no quantity.
+  // https://www.bitunix.com/api-docs/futures/tpsl/place_tp_sl_order.html
+  async placeTPSLOrder(params) {
+    if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('TP/SL order parameters must be an object');
+    if (typeof params.symbol !== 'string' || !params.symbol.trim()) throw new Error('TP/SL order requires a symbol');
+    if (!positiveNumber(params.tpPrice) && !positiveNumber(params.slPrice)) {
+      throw new Error('TP/SL order requires at least one of tpPrice or slPrice');
+    }
+    validateTPSLOrderEnums(params);
+    return this.request('POST', '/api/v1/futures/tpsl/place_order', params, {});
+  }
+
+  // Keyed by orderId, NOT by positionId — this addresses the order created by
+  // placeTPSLOrder, so a positionId here silently matches nothing. The SDK
+  // marks orderId as the sole required field of ModifyTpslOrderRequest.
+  // https://www.bitunix.com/api-docs/futures/tpsl/modify_tp_sl_order.html
+  async modifyTPSLOrder(params) {
+    if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('TP/SL order parameters must be an object');
+    if (params.orderId === undefined || params.orderId === null || String(params.orderId).trim() === '') {
+      throw new Error('modifyTPSLOrder requires orderId (the order-level TP/SL id, not a positionId)');
+    }
+    validateTPSLOrderEnums(params);
+    return this.request('POST', '/api/v1/futures/tpsl/modify_order', params, {});
+  }
+
   async getPendingPositions(symbol) {
-    return this.request('GET', '/api/v1/futures/position/get_pending_positions', null, { symbol });
+    const data = await this.request('GET', '/api/v1/futures/position/get_pending_positions', null, { symbol });
+    // SDK: bare ArrayList<PositionPendingResp>. There is no markPrice in the
+    // model (avgOpenPrice/qty/liqPrice/unrealizedPNL/margin/leverage only), so
+    // the mark price must come from /market/tickers — position-manager owns
+    // that fallback. Anything else is returned raw so it can still fail loudly.
+    return listFrom(data, ['positionList', 'positions']) ?? data;
   }
 
   async getHistoryPositions(symbol, options = {}) {
     const data = await this.request('GET', '/api/v1/futures/position/get_history_positions', null, { symbol, ...options });
-    return Array.isArray(data) ? data : data?.positionList || [];
+    // SDK: PositionHistoryPageResp extends PageResp, list field is `positionList`.
+    return listFrom(data, ['positionList', 'positionHistories']) ?? [];
   }
 
   async getPendingTPSL(symbol) {
     const data = await this.request('GET', '/api/v1/futures/tpsl/get_pending_orders', null, { symbol });
-    return Array.isArray(data) ? data : [];
+    // SDK: bare ArrayList<TpslPendingOrderResp>, whose id field is `id` (not
+    // `orderId`) and whose stop price is `slPrice` alongside `positionId` — feed
+    // that `id` to cancelTPSL as the orderId.
+    return listFrom(data, ['tpslList', 'orderList', 'pendingTpslOrders']) ?? [];
   }
 
   async getHistoryTPSL(symbol) {
     const data = await this.request('GET', '/api/v1/futures/tpsl/get_history_orders', null, { symbol });
-    return Array.isArray(data) ? data : data?.orderList || data?.tpslList || [];
+    // SDK: TpslHistoryOrdersPageResp extends PageResp, list field is `orderList`.
+    return listFrom(data, ['orderList', 'tpslList']) ?? [];
   }
 
   async changeLeverage(symbol, leverage) {
@@ -255,7 +342,11 @@ export class BitunixClient {
   }
 
   async getTradingPairs(symbols = '') {
-    return this.request('GET', '/api/v1/futures/market/trading_pairs', null, { symbols }, { signed: false });
+    const data = await this.request('GET', '/api/v1/futures/market/trading_pairs', null, { symbols }, { signed: false });
+    // SDK: bare ArrayList<TradingPair> (basePrecision / quotePrecision /
+    // minTradeVolume / maxMarketOrderVolume / maxLimitOrderVolume / maxLeverage),
+    // returned raw so callers keep the full precision metadata.
+    return listFrom(data, ['tradingPairs', 'list']) ?? data;
   }
 
   async getLeverageAndMarginMode(symbol, marginCoin = 'USDT') {
@@ -271,12 +362,21 @@ export class BitunixClient {
   }
 
   async getPositionTiers(symbol) {
-    return this.request('GET', '/api/v1/futures/position/get_position_tiers', null, { symbol }, { signed: false });
+    const data = await this.request('GET', '/api/v1/futures/position/get_position_tiers', null, { symbol }, { signed: false });
+    // SDK: bare ArrayList<PositionTiersResp>.
+    return listFrom(data, ['positionTiers', 'list']) ?? data;
   }
 
   async batchOrder(symbol, orderList) {
     if (!Array.isArray(orderList) || orderList.length < 1 || orderList.length > 5) throw new Error('orderList must contain 1-5 orders');
-    return this.request('POST', '/api/v1/futures/trade/batch_order', { symbol, orderList }, {});
+    // Accept the SDK Buy/Sell casing per entry, same as placeOrder. Entries
+    // without a recognisable side are forwarded untouched so the exchange, not
+    // this client, reports what is wrong with them.
+    const orders = orderList.map(order => {
+      const side = order && typeof order === 'object' ? normalizeOrderSide(order.side) : null;
+      return side ? { ...order, side } : order;
+    });
+    return this.request('POST', '/api/v1/futures/trade/batch_order', { symbol, orderList: orders }, {});
   }
 
   async cancelAllOrders(symbol) {
@@ -285,7 +385,8 @@ export class BitunixClient {
 
   async getPendingOrders(symbol, options = {}) {
     const data = await this.request('GET', '/api/v1/futures/trade/get_pending_orders', null, { symbol, ...options });
-    return Array.isArray(data) ? data : data?.orderList || [];
+    // SDK: OrderPageResp extends PageResp, list field is `orderList`.
+    return listFrom(data, ['orderList']) ?? [];
   }
 
   // get_order_detail accepts only orderId (or clientId) — there is no `symbol`
@@ -301,12 +402,14 @@ export class BitunixClient {
 
   async getHistoryOrders(symbol, options = {}) {
     const data = await this.request('GET', '/api/v1/futures/trade/get_history_orders', null, { symbol, ...options });
-    return Array.isArray(data) ? data : data?.orderList || [];
+    // SDK: OrderPageResp extends PageResp, list field is `orderList`.
+    return listFrom(data, ['orderList']) ?? [];
   }
 
   async getHistoryTrades(symbol, options = {}) {
     const data = await this.request('GET', '/api/v1/futures/trade/get_history_trades', null, { symbol, ...options });
-    return Array.isArray(data) ? data : data?.tradeList || [];
+    // SDK: TradePageResp extends PageResp, list field is `tradeList`.
+    return listFrom(data, ['tradeList']) ?? [];
   }
 
   async flashClosePosition(positionId) {

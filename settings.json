@@ -27,6 +27,13 @@
     "reversal_enabled": true,
     "reversal_confidence": 85,
     "on_tpsl_failure": "close",
+    "order_unit": "cost",
+    "tpsl_method": "position",
+    "partial_tp_fractions": [0.3, 0.4, 0.3],
+    "partial_tp_roi_steps": [1, 2, 3],
+    "trailing_callback_pct": 5,
+    "account_tp_roi_pct": 0,
+    "account_sl_roi_pct": 0,
     "auto_trade": false
   },
   "mcp": { "servers": [] }

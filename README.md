@@ -25,6 +25,13 @@ explicitly switch with `/dryrun 0` and enable `/autotrade on` in Telegram.
 - Multi-timeframe signal gate (`1m`, `3m`, `5m`, `15m`, `1h`): min confidence, tf confidence, agreement,
   confirm scans, cooldown
 - Dynamic ATR-based TP/SL, breakeven, trailing, liquidation-distance guard
+- All four Bitunix TP/SL methods via `tpsl_method`: `position` (all-in/all-out),
+  `partial` (staged closes at `partial_tp_fractions` / `partial_tp_roi_steps`),
+  `trailing` (activation + `trailing_callback_pct` retrace), `account`
+  (`account_tp_roi_pct` / `account_sl_roi_pct` on aggregate PnL)
+- All three Bitunix order units via `order_unit`: `nominal` (notional USDT),
+  `cost` (margin paid), `qty` (base coin), converted with the pair's
+  `basePrecision` and checked against `minTradeVolume` / max order volume
 - Autonomous agent loop with thinking levels, model auto-refresh, sessions
 - Telegram bot: `/status`, `/start`, `/stop`, `/settings`, `/dryrun`,
   `/autotrade`, `/memory`, `/resume`, `/models`, `/ask`
@@ -57,10 +64,12 @@ src/
 │   ├── indicators.js
 │   ├── scanner.js
 │   ├── risk.js
+│   ├── order-units.js
 │   └── futures-tools.js
 ├── trader/
 │   ├── trader.js
 │   ├── position-manager.js
+│   ├── tpsl.js
 │   └── agent-tools.js
 ├── store/
 │   ├── memory.js
@@ -72,6 +81,21 @@ skills/
 soul/
 tests/
 ```
+
+## API demo
+
+`scripts/api-demo.js` exercises every REST endpoint, ported from the official
+Bitunix Java SDK (`github.com/qezawat-a/open-api`, `Demo/Java/src`).
+
+```bash
+npm run demo -- --list      # every endpoint, method, and whether it mutates
+npm run demo -- --dry-run   # the exact request each one would send, no network
+npm run demo                # live read-only calls (needs BITUNIX_API_KEY/SECRET)
+```
+
+It is safe by default: with no credentials it sends nothing, and the mutating
+calls additionally require `BITUNIX_DEMO_TRADE=1`. See `docs/api-demo.md` and
+`docs/api-parity.md` for the endpoint tables and the Java-to-Node mapping.
 
 ## Safety
 

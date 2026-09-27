@@ -1,4 +1,5 @@
 import Scanner from '../bitunix/scanner.js';
+import { positionSizeFromUnit } from '../bitunix/order-units.js';
 import { PositionManager } from './position-manager.js';
 import { CONFIG } from '../config.js';
 
@@ -229,13 +230,26 @@ export class Trader {
     const pairs = await this.client.getTradingPairs(CONFIG.symbol);
     const pair = (Array.isArray(pairs) ? pairs : []).find(item => String(item.symbol).toUpperCase() === CONFIG.symbol.toUpperCase());
     if (!pair) throw new Error(`trading pair metadata missing for ${CONFIG.symbol}`);
-    const precision = Number.isInteger(Number(pair.basePrecision)) ? Number(pair.basePrecision) : 8;
-    const notional = available * Number(CONFIG.position_sizing_margin_pct) / 100 * CONFIG.leverage;
-    const size = notional / Number(entryPrice);
-    const rounded = Math.floor(size * 10 ** precision) / 10 ** precision;
-    if (!validPositive(rounded)) throw new Error('calculated position size must be positive');
-    if (pair.minTradeVolume && rounded < Number(pair.minTradeVolume)) throw new Error(`position size ${rounded} is below Bitunix minimum ${pair.minTradeVolume}`);
-    return rounded;
+    // Delegate to the shared converter so the order_unit setting (nominal /
+    // cost / qty) actually drives sizing, and so the exchange's own volume
+    // limits are enforced here rather than being rejected by the API.
+    const sized = positionSizeFromUnit({
+      available,
+      unit: CONFIG.order_unit,
+      price: entryPrice,
+      leverage: CONFIG.leverage,
+      marginPct: CONFIG.position_sizing_margin_pct,
+      pair,
+    });
+    if (!sized.ok) {
+      const detail = sized.reason === 'below_min_trade_volume'
+        ? `below the Bitunix minimum ${pair.minTradeVolume}`
+        : sized.reason === 'above_max_order_volume'
+          ? 'exceeds the Bitunix maximum order volume'
+          : 'is not a tradable size';
+      throw new Error(`position size ${sized.qty} ${detail}`);
+    }
+    return sized.qty;
   }
 
   async guard() {

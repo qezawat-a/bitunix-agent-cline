@@ -1,5 +1,7 @@
 import { CONFIG } from '../config.js';
 import { applySettings, getTraderSettings, resolveSettingKey } from './settings.js';
+import { convert, positionSizeFromUnit } from '../bitunix/order-units.js';
+import { describeTpslMethods } from './tpsl.js';
 
 let sharedTrader = null;
 let sharedClient = null;
@@ -115,6 +117,85 @@ export const traderTools = [
       markCooldown();
       if (sharedTrader?.reconcilePositions) await sharedTrader.reconcilePositions();
       return { order };
+    },
+  },
+  {
+    name: 'trader_convert_order_unit',
+    description: 'Convert an order size between Bitunix\'s three order units (nominal/notional in USDT, cost/margin paid, qty in base coin) and show what it would cost to trade',
+    parameters: {
+      type: 'object',
+      properties: {
+        value: { type: 'number' },
+        from: { type: 'string', enum: ['nominal', 'cost', 'qty'] },
+        to: { type: 'string', enum: ['nominal', 'cost', 'qty'] },
+        price: { type: 'number', description: 'current mark price of the symbol' },
+        leverage: { type: 'number' },
+      },
+      required: ['value', 'from', 'to', 'price', 'leverage'],
+    },
+    async handler({ value, from, to, price, leverage }) {
+      return convert({ value: Number(value), from, to, price: Number(price), leverage: Number(leverage) });
+    },
+  },
+  {
+    name: 'trader_preview_position_size',
+    description: 'Preview the exchange-legal order size for a margin budget, in any of the three Bitunix order units, including precision rounding and min/max volume limits',
+    parameters: {
+      type: 'object',
+      properties: {
+        available: { type: 'number', description: 'free USDT balance; omit to use the live account' },
+        unit: { type: 'string', enum: ['nominal', 'cost', 'qty'] },
+        price: { type: 'number' },
+        leverage: { type: 'number' },
+        marginPct: { type: 'number' },
+      },
+      required: ['price'],
+    },
+    async handler({ available, unit, price, leverage, marginPct }) {
+      const client = requireClient();
+      const lev = Number(leverage ?? CONFIG.leverage);
+      const mark = Number(price);
+      let balance = Number(available);
+      if (!Number.isFinite(balance) || balance <= 0) {
+        const account = await client.getAccount('USDT');
+        balance = Number(account?.available);
+      }
+      if (!Number.isFinite(balance) || balance <= 0) throw new Error('available USDT balance must be positive');
+      const pairs = await client.getTradingPairs(CONFIG.symbol);
+      const pair = (Array.isArray(pairs) ? pairs : [])
+        .find(item => String(item.symbol).toUpperCase() === CONFIG.symbol.toUpperCase());
+      if (!pair) throw new Error(`trading pair metadata missing for ${CONFIG.symbol}`);
+      return {
+        ...positionSizeFromUnit({
+          available: balance,
+          unit: unit || CONFIG.order_unit,
+          price: mark,
+          leverage: lev,
+          marginPct: Number(marginPct ?? CONFIG.position_sizing_margin_pct),
+          pair,
+        }),
+        pair: { symbol: pair.symbol, basePrecision: pair.basePrecision, minTradeVolume: pair.minTradeVolume },
+      };
+    },
+  },
+  {
+    name: 'trader_explain_tpsl',
+    description: 'Explain Bitunix\'s four take-profit/stop-loss methods and show the plan currently configured for this account',
+    parameters: { type: 'object', properties: {} },
+    async handler() {
+      return {
+        methods: describeTpslMethods(),
+        active: {
+          tpsl_method: CONFIG.tpsl_method,
+          partial_tp_fractions: CONFIG.partial_tp_fractions,
+          partial_tp_roi_steps: CONFIG.partial_tp_roi_steps,
+          trailing_callback_pct: CONFIG.trailing_callback_pct,
+          account_tp_roi_pct: CONFIG.account_tp_roi_pct,
+          account_sl_roi_pct: CONFIG.account_sl_roi_pct,
+          order_unit: CONFIG.order_unit,
+        },
+        reference: 'https://www.bitunix.com/hub/helpcenter/article/bitunix-futures-position-a-guide-to-four-take-profit-and-stop-loss-methods-web?id=290',
+      };
     },
   },
   {

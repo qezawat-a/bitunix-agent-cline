@@ -25,13 +25,36 @@ export const DEFAULTS = {
   report_interval_sec: 30,
   mid_manage_interval_sec: 15,
   order_unit: 'cost',
+  // Which of Bitunix's four take-profit / stop-loss methods protects a position:
+  // position (all-in/all-out), partial (laddered closes), trailing (peak + callback),
+  // or account (aggregate PnL across every open position).
+  tpsl_method: 'position',
+  // Partial TP/SL ladder. fractions are shares of the position closed at each
+  // step; the remainder (1 - sum) keeps riding with the breakeven/trailing stop.
+  partial_tp_fractions: [0.3, 0.4, 0.3],
+  // Each step triggers at roiSteps[i] x the base ATR take-profit distance.
+  partial_tp_roi_steps: [1, 2, 3],
+  trailing_callback_pct: 5,
+  // Account-level TP/SL. 0 disables that side; values are ROI percent on the
+  // sum of unrealised PnL across all open positions.
+  account_tp_roi_pct: 0,
+  account_sl_roi_pct: 0,
   position_sizing_margin_pct: 2,
   auto_trade: false,
 };
 
+// Bitunix exposes three order units (help centre "Explanation of the Order Units
+// in Futures Trading"): nominal (contract size in USDT), cost (margin actually
+// paid) and qty (base-asset quantity).
+const ORDER_UNITS = ['nominal', 'cost', 'qty'];
+// The four take-profit / stop-loss methods Bitunix offers for futures positions.
+const TPSL_METHODS = ['position', 'partial', 'trailing', 'account'];
+
 export const ALIASES = {
   margin_mode: 'position_type',
   position_type: 'position_type',
+  tpsl: 'tpsl_method',
+  order_units: 'order_unit',
   symbol: 'symbol',
   leverage: 'leverage',
   tf: 'timeframes',
@@ -62,12 +85,19 @@ const NUMBER_KEYS = new Set([
   'report_interval_sec',
   'mid_manage_interval_sec',
   'position_sizing_margin_pct',
+  'trailing_callback_pct',
+  'account_tp_roi_pct',
+  'account_sl_roi_pct',
 ]);
+// Arrays that must hold finite numbers. Declared separately from timeframes,
+// which are validated as a set of unique interval strings.
+const NUMERIC_ARRAY_KEYS = new Set(['partial_tp_fractions', 'partial_tp_roi_steps']);
 const BOOLEAN_KEYS = new Set(['auto_trade', 'reversal_enabled']);
 const ENUMS = {
   position_type: ['crossed', 'isolated'],
   position_mode: ['hedge', 'one-way'],
-  order_unit: ['cost', 'qty'],
+  order_unit: ORDER_UNITS,
+  tpsl_method: TPSL_METHODS,
   on_tpsl_failure: ['cancel', 'close', 'alert'],
 };
 
@@ -75,8 +105,20 @@ function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+function toNumberArray(value, key) {
+  const list = Array.isArray(value) ? value : String(value).split(',');
+  const out = list.map(item => {
+    const n = Number(String(item).trim());
+    if (!Number.isFinite(n)) throw new Error(`${key} must contain only numbers`);
+    return n;
+  }).filter(item => String(item).trim() !== '');
+  if (!out.length) throw new Error(`${key} must not be empty`);
+  return out;
+}
+
 function normalizeValue(key, value) {
   if (key === 'symbol') return String(value).trim().toUpperCase();
+  if (NUMERIC_ARRAY_KEYS.has(key)) return toNumberArray(value, key);
   if (key === 'timeframes') {
     const values = Array.isArray(value) ? value : String(value).split(',');
     return [...new Set(values.map(item => String(item).trim().toLowerCase()).filter(Boolean))];
@@ -145,6 +187,33 @@ export function validateSettings(s) {
   addRangeError(errors, 'report_interval_sec', s.report_interval_sec, 5, 86400, true);
   addRangeError(errors, 'mid_manage_interval_sec', s.mid_manage_interval_sec, 5, 86400, true);
   addRangeError(errors, 'position_sizing_margin_pct', s.position_sizing_margin_pct, 0.01, 100);
+  addRangeError(errors, 'trailing_callback_pct', s.trailing_callback_pct, 0.1, 90);
+  // 0 disables the account-level side, so the lower bound is 0 rather than >0.
+  addRangeError(errors, 'account_tp_roi_pct', s.account_tp_roi_pct, 0, 10000);
+  addRangeError(errors, 'account_sl_roi_pct', s.account_sl_roi_pct, 0, 10000);
+
+  // Partial TP/SL ladder: the two arrays must line up, every step must be
+  // positive, ROI steps must strictly increase, and the fractions must not
+  // attempt to close more than the whole position.
+  const fractions = s.partial_tp_fractions;
+  const steps = s.partial_tp_roi_steps;
+  const fractionsOk = Array.isArray(fractions) && fractions.length > 0 && fractions.length <= 10
+    && fractions.every(n => validNumber(n) && n > 0 && n <= 1);
+  const stepsOk = Array.isArray(steps) && steps.length > 0 && steps.length <= 10
+    && steps.every(n => validNumber(n) && n > 0);
+  if (!fractionsOk) errors.push('partial_tp_fractions must be 1-10 numbers, each greater than 0 and at most 1');
+  if (!stepsOk) errors.push('partial_tp_roi_steps must be 1-10 positive numbers');
+  if (fractionsOk && stepsOk) {
+    if (fractions.length !== steps.length) {
+      errors.push('partial_tp_fractions and partial_tp_roi_steps must have the same length');
+    } else {
+      const total = fractions.reduce((sum, n) => sum + n, 0);
+      if (total > 1 + 1e-9) errors.push('partial_tp_fractions must not total more than 1 (100% of the position)');
+      for (let i = 1; i < steps.length; i += 1) {
+        if (steps[i] <= steps[i - 1]) errors.push('partial_tp_roi_steps must be strictly increasing');
+      }
+    }
+  }
 
   for (const [key, values] of Object.entries(ENUMS)) {
     if (typeof s[key] !== 'string' || !values.includes(s[key])) {
@@ -230,6 +299,7 @@ export function parseSettingValue(key, raw) {
     if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
     throw new Error(`${canonical} must be true/false or 1/0`);
   }
+  if (NUMERIC_ARRAY_KEYS.has(canonical)) return toNumberArray(raw, canonical);
   if (NUMBER_KEYS.has(canonical) || INTEGER_KEYS.has(canonical)) {
     const value = Number(raw);
     if (!Number.isFinite(value)) throw new Error(`${canonical} must be numeric`);

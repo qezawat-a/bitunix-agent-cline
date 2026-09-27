@@ -1,14 +1,14 @@
 import { atr as calculateAtr } from '../bitunix/indicators.js';
-
-function finitePositive(value) {
-  const number = Number(value);
-  return Number.isFinite(number) && number > 0;
-}
-
-function formatPrice(value) {
-  if (!finitePositive(value)) throw new Error('price must be a positive finite number');
-  return String(Number(Number(value).toFixed(8)));
-}
+import {
+  accountPnlSummary,
+  atrMultiples,
+  buildPartialLadder,
+  evaluateTrailingCallback,
+  finitePositive,
+  formatPrice,
+  formatQty,
+  normalizeMethod,
+} from './tpsl.js';
 
 export class PositionManager {
   client;
@@ -16,6 +16,13 @@ export class PositionManager {
   state = { positions: [], lastManage: 0, lastGuard: 0, cooldownUntil: 0 };
   fetchInFlight = null;
   protectionAttempts = new Map();
+  // Method 3 (trailing): { peak, armed, activatedAt } per positionId. The peak
+  // only means something while the position is open, so entries are dropped as
+  // soon as the position disappears from getPendingPositions.
+  trailingState = new Map();
+  // Method 4 (account): a fired guard must not re-send close-all on the next
+  // mid-manage tick while the exchange is still settling the closes.
+  accountGuardFiredAt = 0;
 
   constructor(client, _symbol, settings) {
     this.client = client;
@@ -24,6 +31,11 @@ export class PositionManager {
 
   get symbol() {
     return this.settings.symbol;
+  }
+
+  // Which of the four Bitunix TP/SL methods protects a position right now.
+  activeMethod() {
+    return normalizeMethod(this.settings.tpsl_method);
   }
 
   async fetchMarkPrice(symbol) {
@@ -61,6 +73,12 @@ export class PositionManager {
         }
       }
       this.state.positions = normalized;
+      // A trailing peak only means something while its position is open;
+      // keeping a stale peak would arm a future position against old history.
+      const live = new Set(normalized.map(position => String(position.positionId)));
+      for (const key of this.trailingState.keys()) {
+        if (!live.has(key)) this.trailingState.delete(key);
+      }
       return this.state.positions;
     })();
     try {
@@ -81,9 +99,9 @@ export class PositionManager {
     if (!['bullish', 'bearish'].includes(direction)) throw new Error('direction must be bullish or bearish');
     const normalizedConfidence = Math.max(0, Math.min(100, Number(confidence) || 0));
     // More confidence -> tighter stop and a slightly more ambitious target; ATR remains the only source of distance.
-    const strength = normalizedConfidence / 100;
-    const stopMultiple = 1.55 - strength * 0.45;
-    const targetMultiple = 1.8 + strength * 1.2;
+    // The multiples live in tpsl.js so the partial ladder's first step lands on
+    // exactly this target.
+    const { stopMultiple, targetMultiple } = atrMultiples(normalizedConfidence);
     const atrDist = this.getAtr(entryPrice, atr);
     const tpDist = atrDist * targetMultiple;
     const slDist = atrDist * stopMultiple;
@@ -121,6 +139,95 @@ export class PositionManager {
       symbol: this.symbol,
       positionId,
       ...levels,
+    });
+  }
+
+  // Method 2 (partial): the pure ladder. Each leg closes `fraction` of the
+  // position at `roiSteps[i] x` the base ATR take-profit distance; `remainder`
+  // keeps riding the stop.
+  buildPartialTPSL(position, entryPrice, direction, atr, confidence) {
+    return buildPartialLadder({
+      position,
+      entryPrice,
+      direction,
+      atr,
+      confidence,
+      fractions: this.settings.partial_tp_fractions,
+      steps: this.settings.partial_tp_roi_steps,
+    });
+  }
+
+  // Method 2 (partial): place the ladder with the order-level endpoint, the
+  // only TP/SL pair that carries tpQty/slQty and therefore the only one that
+  // can close part of a position.
+  async placePartialTPSL(position, entryPrice, direction, atr, confidence) {
+    if (typeof this.client.placeTPSLOrder !== 'function') {
+      throw new Error('partial TP/SL requires the order-level placeTPSLOrder endpoint');
+    }
+    const { legs, remainder } = this.buildPartialTPSL(position, entryPrice, direction, atr, confidence);
+    const levels = this.computeTPSL(entryPrice, direction, atr, confidence);
+    // SAFETY: place the furthest target first. A rejection part-way through then
+    // leaves the far targets armed and every placed slice already carrying its
+    // stop, so the un-placed remainder is never left naked. Near-first would risk
+    // spending the position's best exit first and stranding the rest.
+    const ordered = [...legs].sort((a, b) => Math.abs(b.tpPrice - entryPrice) - Math.abs(a.tpPrice - entryPrice));
+    const placed = [];
+    for (const leg of ordered) {
+      const qty = formatQty(leg.qty);
+      try {
+        const result = await this.client.placeTPSLOrder({
+          symbol: this.symbol,
+          positionId: position.positionId,
+          tpPrice: leg.tpPrice,
+          tpOrderType: leg.tpOrderType,
+          tpStopType: leg.tpStopType,
+          tpQty: qty,
+          // Every leg carries the same stop for its own slice, so a ladder that
+          // never reaches a target still exits the whole position.
+          slPrice: levels.slPrice,
+          slOrderType: 'MARKET',
+          slStopType: levels.slStopType,
+          slQty: qty,
+        });
+        placed.push({ ...leg, slPrice: levels.slPrice, result });
+      } catch (error) {
+        return { placed, remainder, error: `partial TP/SL leg ${leg.index} rejected: ${error.message}` };
+      }
+    }
+    // The remainder gets no take-profit leg of its own, so it needs a stop of
+    // its own: placed last, after every target is already armed, and only when
+    // the fractions did not consume the whole position.
+    if (remainder > 0) {
+      try {
+        const result = await this.client.placeTPSLOrder({
+          symbol: this.symbol,
+          positionId: position.positionId,
+          slPrice: levels.slPrice,
+          slOrderType: 'MARKET',
+          slStopType: levels.slStopType,
+          slQty: formatQty(remainder),
+        });
+        placed.push({ index: 'remainder', fraction: null, qty: remainder, slPrice: levels.slPrice, result });
+      } catch (error) {
+        return { placed, remainder, error: `partial TP/SL remainder stop rejected: ${error.message}` };
+      }
+    }
+    return { placed, remainder };
+  }
+
+  // Methods 3 (trailing) and 4 (account) do not exit on a fixed per-position
+  // target: the trailing callback and the account PnL threshold own the exit.
+  // They still get the ATR stop as the hard backstop, because "at least one of
+  // tpPrice or slPrice is required" and a position with no stop at all is never
+  // acceptable.
+  // https://www.bitunix.com/api-docs/futures/tp_sl/place_position_tp_sl_order.html
+  async placeTPSLStop(positionId, entryPrice, direction, atr, confidence) {
+    const { slPrice, slStopType } = this.computeTPSL(entryPrice, direction, atr, confidence);
+    return this.client.placeTPSL({
+      symbol: this.symbol,
+      positionId,
+      slPrice,
+      slStopType,
     });
   }
 
@@ -198,6 +305,58 @@ export class PositionManager {
     });
   }
 
+  // Method 3 (trailing). The exchange has no server-side "peak minus a
+  // callback" trigger, so the peak is tracked here: arm at
+  // trailing_trigger_roi_pct (the article's activation price), follow the
+  // favourable extreme, and close the position once the mark retraces
+  // trailing_callback_pct from that peak. Shorts mirror it.
+  async checkTrailingCallback(position) {
+    if (this.activeMethod() !== 'trailing') return { skipped: 'trailing callback not the active method' };
+    const key = String(position.positionId);
+    const outcome = evaluateTrailingCallback({
+      side: position.side,
+      mark: Number(position.markPrice),
+      favorableRoi: this.favorableRoiPct(position),
+      triggerRoiPct: this.settings.trailing_trigger_roi_pct,
+      callbackPct: this.settings.trailing_callback_pct,
+      previous: this.trailingState.get(key) || null,
+    });
+    if (outcome.skipped) return outcome;
+    this.trailingState.set(key, {
+      peak: outcome.peak,
+      armed: outcome.armed,
+      activatedAt: outcome.armedNow ? Date.now() : outcome.activatedAt,
+    });
+    if (!outcome.triggered) return outcome;
+    // The position is gone; keeping its peak would mis-arm a later position that
+    // reuses the id.
+    this.trailingState.delete(key);
+    this.state.cooldownUntil = Date.now() + Number(this.settings.cooldown_minutes) * 60000;
+    const result = await this.client.closePosition(this.symbol, position.positionId, position);
+    return { ...outcome, closed: true, result };
+  }
+
+  // Method 4 (account). One control unit for the whole account instead of
+  // per-position triggers: when the aggregate unrealised PnL reaches either
+  // threshold, every futures position on the symbol is closed.
+  async checkAccountGuard() {
+    const tpThreshold = Number(this.settings.account_tp_roi_pct) || 0;
+    const slThreshold = Number(this.settings.account_sl_roi_pct) || 0;
+    if (this.activeMethod() !== 'account') return { skipped: 'account guard not the active method' };
+    if (tpThreshold <= 0 && slThreshold <= 0) return { skipped: 'account guard disabled' };
+    if (typeof this.client.closeAllPosition !== 'function') return { skipped: 'close-all endpoint unavailable' };
+    if (Date.now() - this.accountGuardFiredAt < 60000) return { skipped: 'account guard already fired' };
+    const { totalPnl, totalMargin, roi } = accountPnlSummary(this.state.positions, this.settings.leverage);
+    const triggered = (tpThreshold > 0 && roi >= tpThreshold) ? 'tp' : (slThreshold > 0 && roi <= -slThreshold) ? 'sl' : null;
+    if (!triggered) return { skipped: 'account thresholds not reached', roi, totalPnl, totalMargin };
+    this.accountGuardFiredAt = Date.now();
+    this.state.cooldownUntil = Date.now() + Number(this.settings.cooldown_minutes) * 60000;
+    await this.client.closeAllPosition(this.symbol);
+    // The peaks belonged to positions that no longer exist.
+    this.trailingState.clear();
+    return { triggered, roi, totalPnl, totalMargin };
+  }
+
   async checkLiquidationGuard(position) {
     const mark = Number(position.markPrice);
     const liq = Number(position.liqPrice);
@@ -224,7 +383,24 @@ export class PositionManager {
       const existing = pending.find(item => String(item.positionId) === key && finitePositive(item.slPrice ?? item.stopPrice));
       if (existing) return { verified: true, result: existing };
       const atr = await this.getAtrForPosition(position);
-      const result = await this.placeTPSL(position.positionId, Number(position.avgPrice), direction, atr, position.signalConfidence ?? this.settings.min_confidence);
+      const confidence = position.signalConfidence ?? this.settings.min_confidence;
+      const entryPrice = Number(position.avgPrice);
+      // Method dispatch: 'partial' replaces the single all-in TP with an
+      // order-level ladder; 'trailing' and 'account' keep the position-level
+      // pair because that is the only pair that exits the whole position at
+      // once, but they take the stop alone and leave the exit to the callback
+      // or the account guard. 'position' keeps today's fixed TP + SL.
+      const method = this.activeMethod();
+      if (method === 'partial') {
+        const ladder = await this.placePartialTPSL(position, entryPrice, direction, atr, confidence);
+        if (ladder.error) throw new Error(ladder.error);
+        return { placed: true, result: ladder };
+      }
+      if (method === 'trailing' || method === 'account') {
+        const result = await this.placeTPSLStop(position.positionId, entryPrice, direction, atr, confidence);
+        return { placed: true, result, method };
+      }
+      const result = await this.placeTPSL(position.positionId, entryPrice, direction, atr, confidence);
       return { placed: true, result };
     } catch (error) {
       if (this.settings.on_tpsl_failure === 'close') {
@@ -238,6 +414,14 @@ export class PositionManager {
   async midManage() {
     await this.fetchPositions();
     const errors = [];
+    // Method 4 runs once per cycle, before the per-position work: when it
+    // closes everything there is nothing left to protect this tick.
+    try {
+      const accountGuard = await this.checkAccountGuard();
+      if (accountGuard?.triggered) return errors;
+    } catch (error) {
+      errors.push({ positionId: 'account', message: error.message });
+    }
     for (const position of this.state.positions) {
       let protectionFailed = false;
       try {
@@ -257,6 +441,15 @@ export class PositionManager {
         const trailing = await this.checkTrailing(position);
         if (trailing?.slPrice) position.slPrice = trailing.slPrice;
         await this.checkLiquidationGuard(position);
+        // Method 3: the peak/callback exit only runs under the trailing method;
+        // the ATR stop tightening above stays on as the hard backstop.
+        if (this.activeMethod() === 'trailing') {
+          const callback = await this.checkTrailingCallback(position);
+          if (callback?.closed) {
+            this.state.cooldownUntil = Date.now() + Number(this.settings.cooldown_minutes) * 60000;
+            continue;
+          }
+        }
       } catch (error) {
         errors.push({ positionId: position.positionId, message: error.message });
       }
