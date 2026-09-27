@@ -94,7 +94,32 @@ export class PositionManager {
     return Number(atr);
   }
 
-  computeTPSL(entryPrice, direction, atr, confidence) {
+  // The pair's quotePrecision, needed to emit TP/SL prices the exchange will
+  // accept. Cached because it never changes for a symbol, and an absent or
+  // unreachable metadata source must not stop a position being protected — the
+  // 8-decimal default is only used as a fallback.
+  quotePrecisionCache = new Map();
+
+  async getQuotePrecision(symbol = this.symbol) {
+    const key = String(symbol || '').toUpperCase();
+    if (this.quotePrecisionCache.has(key)) return this.quotePrecisionCache.get(key);
+    let digits = 8;
+    try {
+      if (typeof this.client.getTradingPairs === 'function') {
+        const pairs = await this.client.getTradingPairs(symbol);
+        const pair = (Array.isArray(pairs) ? pairs : []).find(item => String(item?.symbol).toUpperCase() === key);
+        const value = Number(pair?.quotePrecision);
+        if (Number.isInteger(value) && value >= 0 && value <= 20) digits = value;
+      }
+    } catch {
+      // Fall through to the default: an unprotected position is worse than a
+      // price with more decimals than ideal.
+    }
+    this.quotePrecisionCache.set(key, digits);
+    return digits;
+  }
+
+  computeTPSL(entryPrice, direction, atr, confidence, quotePrecision = 8) {
     if (!finitePositive(entryPrice)) throw new Error('entryPrice must be positive');
     if (!['bullish', 'bearish'].includes(direction)) throw new Error('direction must be bullish or bearish');
     const normalizedConfidence = Math.max(0, Math.min(100, Number(confidence) || 0));
@@ -108,15 +133,15 @@ export class PositionManager {
 
     if (direction === 'bullish') {
       return {
-        tpPrice: formatPrice(entryPrice + tpDist),
-        slPrice: formatPrice(entryPrice - slDist),
+        tpPrice: formatPrice(entryPrice + tpDist, quotePrecision),
+        slPrice: formatPrice(entryPrice - slDist, quotePrecision),
         tpStopType: 'MARK_PRICE',
         slStopType: 'MARK_PRICE',
       };
     }
     return {
-      tpPrice: formatPrice(entryPrice - tpDist),
-      slPrice: formatPrice(entryPrice + slDist),
+      tpPrice: formatPrice(entryPrice - tpDist, quotePrecision),
+      slPrice: formatPrice(entryPrice + slDist, quotePrecision),
       tpStopType: 'MARK_PRICE',
       slStopType: 'MARK_PRICE',
     };
@@ -134,7 +159,7 @@ export class PositionManager {
   }
 
   async placeTPSL(positionId, entryPrice, direction, atr, confidence) {
-    const levels = this.computeTPSL(entryPrice, direction, atr, confidence);
+    const levels = this.computeTPSL(entryPrice, direction, atr, confidence, await this.getQuotePrecision());
     return this.client.placeTPSL({
       symbol: this.symbol,
       positionId,
@@ -145,13 +170,14 @@ export class PositionManager {
   // Method 2 (partial): the pure ladder. Each leg closes `fraction` of the
   // position at `roiSteps[i] x` the base ATR take-profit distance; `remainder`
   // keeps riding the stop.
-  buildPartialTPSL(position, entryPrice, direction, atr, confidence) {
+  buildPartialTPSL(position, entryPrice, direction, atr, confidence, quotePrecision = 8) {
     return buildPartialLadder({
       position,
       entryPrice,
       direction,
       atr,
       confidence,
+      quotePrecision,
       fractions: this.settings.partial_tp_fractions,
       steps: this.settings.partial_tp_roi_steps,
     });
@@ -164,8 +190,9 @@ export class PositionManager {
     if (typeof this.client.placeTPSLOrder !== 'function') {
       throw new Error('partial TP/SL requires the order-level placeTPSLOrder endpoint');
     }
-    const { legs, remainder } = this.buildPartialTPSL(position, entryPrice, direction, atr, confidence);
-    const levels = this.computeTPSL(entryPrice, direction, atr, confidence);
+    const quotePrecision = await this.getQuotePrecision();
+    const { legs, remainder } = this.buildPartialTPSL(position, entryPrice, direction, atr, confidence, quotePrecision);
+    const levels = this.computeTPSL(entryPrice, direction, atr, confidence, quotePrecision);
     // SAFETY: place the furthest target first. A rejection part-way through then
     // leaves the far targets armed and every placed slice already carrying its
     // stop, so the un-placed remainder is never left naked. Near-first would risk
@@ -222,7 +249,7 @@ export class PositionManager {
   // acceptable.
   // https://www.bitunix.com/api-docs/futures/tp_sl/place_position_tp_sl_order.html
   async placeTPSLStop(positionId, entryPrice, direction, atr, confidence) {
-    const { slPrice, slStopType } = this.computeTPSL(entryPrice, direction, atr, confidence);
+    const { slPrice, slStopType } = this.computeTPSL(entryPrice, direction, atr, confidence, await this.getQuotePrecision());
     return this.client.placeTPSL({
       symbol: this.symbol,
       positionId,
@@ -267,6 +294,7 @@ export class PositionManager {
   }
 
   async moveSLToEntry(positionId, entryPrice) {
+    const quotePrecision = await this.getQuotePrecision();
     // /tpsl/position/modify_order takes only symbol, positionId, the tp*/sl*
     // trigger prices and their stop types — the trigger's order type is not a
     // parameter here, so it is not sent.
@@ -274,7 +302,7 @@ export class PositionManager {
     return this.client.modifyTPSL({
       symbol: this.symbol,
       positionId,
-      slPrice: formatPrice(entryPrice),
+      slPrice: formatPrice(entryPrice, quotePrecision),
       slStopType: 'MARK_PRICE',
     });
   }
@@ -289,7 +317,7 @@ export class PositionManager {
       const newSL = position.side === 'BUY' ? mark - trailDistance : mark + trailDistance;
       if (!finitePositive(newSL) || !this.shouldTighten(position, newSL)) return { skipped: 'trailing would loosen stop' };
       const result = await this.updateTrailingSL(position.positionId, newSL);
-      return { ...result, slPrice: formatPrice(newSL) };
+      return { ...result, slPrice: formatPrice(newSL, await this.getQuotePrecision()) };
     }
     return { skipped: 'threshold not reached' };
   }
@@ -300,7 +328,7 @@ export class PositionManager {
     return this.client.modifyTPSL({
       symbol: this.symbol,
       positionId,
-      slPrice: formatPrice(newSL),
+      slPrice: formatPrice(newSL, await this.getQuotePrecision()),
       slStopType: 'MARK_PRICE',
     });
   }

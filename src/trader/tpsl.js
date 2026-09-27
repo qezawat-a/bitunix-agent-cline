@@ -16,18 +16,41 @@ export function finitePositive(value) {
 }
 
 // Prices travel to the exchange as strings; never send a rounded-up price that
-// the exchange would reject or fill at a worse level than intended.
-export function formatPrice(value) {
+// the exchange would reject or fill at a worse level than intended. `digits` is
+// the pair's quotePrecision: a price carrying more decimals than that is
+// rejected outright with "10002 Parameter error", so the default is 8 (the
+// widest a USDT-M pair is likely to use) and callers holding real pair metadata
+// must pass the true value. Rounding here also means a level derived from an
+// already-rounded entry price cannot reintroduce extra decimals by arithmetic.
+export function formatPrice(value, digits = 8) {
   if (!finitePositive(value)) throw new Error('price must be a positive finite number');
-  return String(Number(Number(value).toFixed(8)));
+  const places = Number.isInteger(Number(digits)) && Number(digits) >= 0 && Number(digits) <= 20
+    ? Number(digits)
+    : 8;
+  // Number#toString switches to exponent form below 1e-6 ("1e-8"), which is not a
+  // decimal string the exchange will parse. toFixed is plain decimal, so keep
+  // its output and strip only the redundant trailing zeros and a bare "." —
+  // never round-trip through Number, which would re-introduce the exponent.
+  return trimDecimal(value.toFixed(places));
+}
+
+// "116543.20000" -> "116543.2", "500.00" -> "500", "0.00" -> "0".
+function trimDecimal(text) {
+  if (!text.includes('.')) return text;
+  const trimmed = text.replace(/0+$/, '').replace(/\.$/, '');
+  return trimmed === '' || trimmed === '-' ? '0' : trimmed;
 }
 
 // Quantities are strings on the wire too. A partial close is sized by
 // subtraction, so it is floored (never rounded up) at base precision.
-export function formatQty(value) {
+export function formatQty(value, digits = 8) {
   const number = Number(value);
   if (!Number.isFinite(number) || number <= 0) throw new Error('quantity must be a positive finite number');
-  return String(Number(number.toFixed(8)));
+  const places = Number.isInteger(Number(digits)) && Number(digits) >= 0 && Number(digits) <= 20
+    ? Number(digits)
+    : 8;
+  // See formatPrice: avoid exponent notation such as "1e-8" on the wire.
+  return trimDecimal(number.toFixed(places));
 }
 
 // Bitunix names the open quantity differently across endpoints/models; the
@@ -107,7 +130,7 @@ export function splitQuantity(totalQty, fractions, precision) {
 // Method 2 (partial). Each step i triggers at `roiSteps[i] x` the base ATR
 // take-profit distance and closes `fraction` of the open quantity. Whatever
 // the fractions do not cover is the remainder that keeps riding the stop.
-export function buildPartialLadder({ position, entryPrice, direction, atr, confidence, fractions, steps }) {
+export function buildPartialLadder({ position, entryPrice, direction, atr, confidence, fractions, steps, quotePrecision = 8 }) {
   if (!finitePositive(entryPrice)) throw new Error('entryPrice must be positive');
   if (!finitePositive(atr)) throw new Error('ATR is required for dynamic TP/SL; refusing a static fallback');
   if (!['bullish', 'bearish'].includes(direction)) throw new Error('direction must be bullish or bearish');
@@ -126,7 +149,7 @@ export function buildPartialLadder({ position, entryPrice, direction, atr, confi
     legs.push({
       index,
       fraction: item.fraction,
-      tpPrice: formatPrice(entryPrice + sign * tpDist * item.step),
+      tpPrice: formatPrice(entryPrice + sign * tpDist * item.step, quotePrecision),
       qty: parts[index] / scale,
       tpOrderType: 'MARKET',
       tpStopType: 'MARK_PRICE',

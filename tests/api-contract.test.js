@@ -12,12 +12,15 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { BitunixClient, canonicalQuery } from '../src/bitunix/client.js';
-import { convert, normalizeUnit, positionSizeFromUnit, roundQty } from '../src/bitunix/order-units.js';
+import { convert, normalizeUnit, positionSizeFromUnit, roundPrice, roundQty } from '../src/bitunix/order-units.js';
+import { assertOrderMatchesPair as traderReject } from '../src/trader/trader.js';
 import {
   TPSL_METHODS,
   accountPnlSummary,
   buildPartialLadder,
   evaluateTrailingCallback,
+  formatPrice,
+  formatQty,
   normalizeMethod,
   validateLadder,
 } from '../src/trader/tpsl.js';
@@ -982,5 +985,91 @@ describe('four take-profit / stop-loss methods (help centre id=290)', () => {
     assert.equal(derived.totalPnl, 10, '(110 - 100) * 1');
     assert.equal(derived.roi, 10);
     assert.equal(accountPnlSummary([]).roi, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: live orders were rejected with
+//   "10002 Parameter error" on POST /futures/trade/place_order.
+//
+// Cause: the scanner returns a raw market price (e.g. 116543.2187) and the
+// order body echoed it as a 4-decimal string, but the live BTCUSDT pair has
+// quotePrecision 1. Bitunix rejects any price carrying more decimals than
+// quotePrecision, and reports it only as an opaque 10002. The same flaw sat in
+// the TP/SL levels, which were formatted with a hard-coded toFixed(8).
+// ---------------------------------------------------------------------------
+
+describe('order precision matches the live pair metadata', () => {
+  // Exactly what trading_pairs returns for BTCUSDT.
+  const BTCUSDT = {
+    symbol: 'BTCUSDT',
+    minTradeVolume: 0.0001,
+    basePrecision: 4,
+    quotePrecision: 1,
+    maxLimitOrderVolume: 1200,
+    maxMarketOrderVolume: 120,
+  };
+  const SCANNER_PRICE = 116543.2187;
+  const decimals = (value) => {
+    const parts = String(value).split('.');
+    return parts[1] ? parts[1].length : 0;
+  };
+
+  it('rounds a raw scanner price onto the pair tick', () => {
+    assert.equal(String(roundPrice(SCANNER_PRICE, BTCUSDT)), '116543.2');
+    assert.ok(decimals(roundPrice(SCANNER_PRICE, BTCUSDT)) <= BTCUSDT.quotePrecision);
+  });
+
+  it('formats TP/SL levels at quotePrecision, not a hard-coded 8dp', () => {
+    // Regression: the old formatPrice always used toFixed(8), so a 1dp pair
+    // produced 4dp stop levels and the same 10002 rejection.
+    assert.equal(formatPrice(SCANNER_PRICE, 1), '116543.2');
+    assert.equal(formatPrice(SCANNER_PRICE + 1380.0004, 1), '117923.2');
+    // The default is still permissive for callers without pair metadata, and
+    // must never emit exponent notation the exchange cannot parse.
+    assert.equal(formatPrice(0.00000001), '0.00000001');
+    assert.equal(formatPrice(1e-8, 8), '0.00000001');
+    assert.equal(formatQty(0.00000001), '0.00000001');
+  });
+
+  it('keeps every price on an order inside quotePrecision', () => {
+    const pm = new PositionManager({}, null, { symbol: 'BTCUSDT' });
+    const levels = pm.computeTPSL(116543.2, 'bullish', 500, 80, BTCUSDT.quotePrecision);
+    for (const field of ['tpPrice', 'slPrice']) {
+      assert.ok(decimals(levels[field]) <= BTCUSDT.quotePrecision,
+        `${field} ${levels[field]} exceeds quotePrecision ${BTCUSDT.quotePrecision}`);
+    }
+  });
+
+  it('rejects a malformed order locally, naming the offending field', () => {
+    // The pre-fix body: raw price, no effect check.
+    assert.throws(() => traderReject({
+      symbol: 'BTCUSDT', side: 'BUY', price: '116543.2187', qty: '0.02',
+      orderType: 'LIMIT', effect: 'GTC',
+      tpPrice: '117923.2187', slPrice: '115948.2187',
+    }, BTCUSDT), /quotePrecision/);
+  });
+
+  it('caps volume by the order type actually sent', () => {
+    // 500 is legal for a LIMIT (cap 1200) but illegal for a MARKET (cap 120),
+    // so the guard must use the cap that matches the order type being sent.
+    const base = { symbol: 'BTCUSDT', side: 'BUY', price: '116543.2', qty: '500', effect: 'GTC' };
+    assert.throws(() => traderReject({ ...base, orderType: 'MARKET' }, BTCUSDT), /maxMarketOrderVolume/);
+    assert.doesNotThrow(() => traderReject({ ...base, orderType: 'LIMIT' }, BTCUSDT));
+  });
+
+  it('requires an effect on a LIMIT order', () => {
+    assert.throws(() => traderReject({
+      symbol: 'BTCUSDT', side: 'BUY', price: '116543.2', qty: '0.02', orderType: 'LIMIT',
+    }, BTCUSDT), /effect/);
+  });
+
+  it('keeps qty inside basePrecision and above minTradeVolume', () => {
+    assert.throws(() => traderReject({
+      symbol: 'BTCUSDT', side: 'BUY', price: '116543.2', qty: '0.00001', orderType: 'LIMIT', effect: 'GTC',
+    }, BTCUSDT), /minTradeVolume/);
+    assert.throws(() => traderReject({
+      symbol: 'BTCUSDT', side: 'BUY', price: '116543.2', qty: '0.000012345', orderType: 'LIMIT', effect: 'GTC',
+    }, BTCUSDT), /basePrecision/);
   });
 });

@@ -1,11 +1,63 @@
 import Scanner from '../bitunix/scanner.js';
-import { positionSizeFromUnit } from '../bitunix/order-units.js';
+import { positionSizeFromUnit, roundPrice } from '../bitunix/order-units.js';
 import { PositionManager } from './position-manager.js';
 import { CONFIG } from '../config.js';
 
 function validPositive(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0;
+}
+
+// Bitunix rejects a request with "10002 Parameter error" rather than naming the
+// offending field, so catch the pair-metadata violations locally where the
+// message can actually say what is wrong.
+function decimalsOf(value) {
+  const text = String(value);
+  const dot = text.indexOf('.');
+  return dot === -1 ? 0 : text.length - dot - 1;
+}
+
+// Exported so the order-precision rules can be tested directly: this is the
+// guard that stops a malformed order reaching the exchange as an opaque
+// "10002 Parameter error".
+export function assertOrderMatchesPair(body, pair) {
+  if (!pair || typeof pair !== 'object') return;
+  const errors = [];
+  const quotePrecision = Number(pair.quotePrecision);
+  const basePrecision = Number(pair.basePrecision);
+  if (Number.isInteger(quotePrecision) && quotePrecision >= 0) {
+    for (const field of ['price', 'tpPrice', 'slPrice']) {
+      const value = body[field];
+      if (value === undefined || value === null || value === '') continue;
+      if (decimalsOf(value) > quotePrecision) {
+        errors.push(`${field} ${value} has ${decimalsOf(value)} decimals but ${pair.symbol} allows quotePrecision ${quotePrecision}`);
+      }
+    }
+  }
+  if (Number.isInteger(basePrecision) && basePrecision >= 0) {
+    const qtyDecimals = decimalsOf(body.qty);
+    if (qtyDecimals > basePrecision) {
+      errors.push(`qty ${body.qty} has ${qtyDecimals} decimals but ${pair.symbol} allows basePrecision ${basePrecision}`);
+    }
+  }
+  const minVolume = Number(pair.minTradeVolume);
+  if (Number.isFinite(minVolume) && minVolume > 0 && Number(body.qty) < minVolume) {
+    errors.push(`qty ${body.qty} is below minTradeVolume ${pair.minTradeVolume}`);
+  }
+  // MARKET orders are capped by maxMarketOrderVolume, LIMIT ones by
+  // maxLimitOrderVolume, so the cap depends on the order type actually sent.
+  const capField = body.orderType === 'LIMIT' ? 'maxLimitOrderVolume' : 'maxMarketOrderVolume';
+  const cap = Number(pair[capField]);
+  if (Number.isFinite(cap) && cap > 0 && Number(body.qty) > cap) {
+    errors.push(`qty ${body.qty} exceeds ${capField} ${pair[capField]} for a ${body.orderType} order`);
+  }
+  if (body.orderType === 'LIMIT' && !validPositive(body.price)) {
+    errors.push('a LIMIT order requires a positive price');
+  }
+  if (body.orderType === 'LIMIT' && !body.effect) {
+    errors.push('a LIMIT order requires an effect (GTC, IOC, FOK or POST_ONLY)');
+  }
+  if (errors.length) throw new Error(`order rejected before sending: ${errors.join('; ')}`);
 }
 
 export class Trader {
@@ -178,15 +230,24 @@ export class Trader {
     this.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
     this.state.confirmations.delete(symbol);
 
-    const qty = await this.computePositionSize(entryPrice);
+    const { qty, pair } = await this.computePositionSize(entryPrice, 'LIMIT');
     const clientId = `jrock-open-${symbol}-${Date.now()}`;
-    const levels = this.positionManager.computeTPSL(entryPrice, direction, atr, signalConfidence ?? CONFIG.min_confidence);
+    // Snap the order price to the pair's quotePrecision BEFORE deriving the
+    // TP/SL, so the limit price and its stop levels all sit on ticks the
+    // exchange will actually accept. Bitunix answers a price carrying more
+    // decimals than quotePrecision with "10002 Parameter error", and the raw
+    // scanner price (e.g. 116543.2187 at 1dp) is exactly that shape.
+    const price = roundPrice(entryPrice, pair);
+    if (!(price > 0)) throw new Error(`order price ${entryPrice} rounds to zero at quotePrecision ${pair.quotePrecision}`);
+    const levels = this.positionManager.computeTPSL(price, direction, atr, signalConfidence ?? CONFIG.min_confidence, Number(pair.quotePrecision) || 8);
     const body = {
       symbol,
       side: direction === 'bullish' ? 'BUY' : 'SELL',
-      price: String(Number(Number(entryPrice).toFixed(8))),
+      price: String(price),
       qty: String(qty),
       orderType: 'LIMIT',
+      // A LIMIT order without an effect is a parameter error on Bitunix, and
+      // GTC is the documented default the docs also spell out explicitly.
       effect: 'GTC',
       ...levels,
       tpOrderType: 'MARKET',
@@ -195,6 +256,7 @@ export class Trader {
       tradeSide: 'OPEN',
       clientId,
     };
+    assertOrderMatchesPair(body, pair);
 
     if (!CONFIG.auto_trade) throw new Error('auto_trade was disabled before order submission');
     if (CONFIG.symbol !== symbol) throw new Error('symbol changed before order submission');
@@ -219,7 +281,10 @@ export class Trader {
     return order;
   }
 
-  async computePositionSize(entryPrice) {
+  // `orderType` must match the order actually placed, because the exchange caps
+  // LIMIT and MARKET volume differently. Defaulting to MARKET here while the
+  // caller places a LIMIT would validate against the wrong (much smaller) cap.
+  async computePositionSize(entryPrice, orderType = 'MARKET') {
     if (!validPositive(entryPrice)) throw new Error('entry price must be positive');
     if (!Number.isInteger(CONFIG.leverage) || CONFIG.leverage < 1 || CONFIG.leverage > 125) {
       throw new Error('leverage must be an integer 1-125');
@@ -230,26 +295,30 @@ export class Trader {
     const pairs = await this.client.getTradingPairs(CONFIG.symbol);
     const pair = (Array.isArray(pairs) ? pairs : []).find(item => String(item.symbol).toUpperCase() === CONFIG.symbol.toUpperCase());
     if (!pair) throw new Error(`trading pair metadata missing for ${CONFIG.symbol}`);
+    // Size against the price the exchange will actually see, so the qty and the
+    // margin it commits are consistent with the limit price we submit.
+    const price = roundPrice(entryPrice, pair);
     // Delegate to the shared converter so the order_unit setting (nominal /
     // cost / qty) actually drives sizing, and so the exchange's own volume
     // limits are enforced here rather than being rejected by the API.
     const sized = positionSizeFromUnit({
       available,
       unit: CONFIG.order_unit,
-      price: entryPrice,
+      price,
       leverage: CONFIG.leverage,
       marginPct: CONFIG.position_sizing_margin_pct,
       pair,
+      orderType,
     });
     if (!sized.ok) {
       const detail = sized.reason === 'below_min_trade_volume'
         ? `below the Bitunix minimum ${pair.minTradeVolume}`
         : sized.reason === 'above_max_order_volume'
-          ? 'exceeds the Bitunix maximum order volume'
+          ? `exceeds the Bitunix maximum volume for a ${orderType} order`
           : 'is not a tradable size';
       throw new Error(`position size ${sized.qty} ${detail}`);
     }
-    return sized.qty;
+    return { qty: sized.qty, pair };
   }
 
   async guard() {
