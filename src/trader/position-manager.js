@@ -23,6 +23,10 @@ export class PositionManager {
   // Method 4 (account): a fired guard must not re-send close-all on the next
   // mid-manage tick while the exchange is still settling the closes.
   accountGuardFiredAt = 0;
+  // Position ids closed during the current midManage tick. A position closed by
+  // the liquidation guard must not also be closed by the trailing callback in
+  // the same tick: Bitunix rejects the repeat with 30042 Client ID duplicate.
+  closedThisCycle = new Set();
 
   constructor(client, _symbol, settings) {
     this.client = client;
@@ -360,6 +364,7 @@ export class PositionManager {
     // reuses the id.
     this.trailingState.delete(key);
     this.state.cooldownUntil = Date.now() + Number(this.settings.cooldown_minutes) * 60000;
+    this.closedThisCycle.add(key);
     const result = await this.client.closePosition(this.symbol, position.positionId, position);
     return { ...outcome, closed: true, result };
   }
@@ -394,7 +399,12 @@ export class PositionManager {
     const distance = Math.abs(mark - liq) / mark;
     if (distance >= Number(this.settings.sl_liquidation_safety) / 100) return { skipped: 'liquidation distance safe' };
     this.state.cooldownUntil = Date.now() + Number(this.settings.cooldown_minutes) * 60000;
-    return this.client.closePosition(this.symbol, position.positionId, position);
+    // `closed: true` lets midManage stop working this position. Without it the
+    // trailing callback below would close the same positionId again in the same
+    // tick, and Bitunix answers the repeat with 30042 Client ID duplicate.
+    const result = await this.client.closePosition(this.symbol, position.positionId, position);
+    this.closedThisCycle.add(String(position.positionId));
+    return { closed: true, trigger: 'liquidation_guard', result };
   }
 
   async ensureProtection(position) {
@@ -442,6 +452,9 @@ export class PositionManager {
   async midManage() {
     await this.fetchPositions();
     const errors = [];
+    // The set is per-tick: a position closed now is gone on the next fetch, and
+    // the same positionId must be allowed to close again if it is ever reopened.
+    this.closedThisCycle.clear();
     // Method 4 runs once per cycle, before the per-position work: when it
     // closes everything there is nothing left to protect this tick.
     try {
@@ -470,8 +483,10 @@ export class PositionManager {
         if (trailing?.slPrice) position.slPrice = trailing.slPrice;
         await this.checkLiquidationGuard(position);
         // Method 3: the peak/callback exit only runs under the trailing method;
-        // the ATR stop tightening above stays on as the hard backstop.
-        if (this.activeMethod() === 'trailing') {
+        // the ATR stop tightening above stays on as the hard backstop. Skipped
+        // when the liquidation guard already closed this position, otherwise the
+        // same positionId is closed twice in one tick (Bitunix: 30042).
+        if (this.activeMethod() === 'trailing' && !this.closedThisCycle.has(String(position.positionId))) {
           const callback = await this.checkTrailingCallback(position);
           if (callback?.closed) {
             this.state.cooldownUntil = Date.now() + Number(this.settings.cooldown_minutes) * 60000;

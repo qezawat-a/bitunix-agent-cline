@@ -1073,3 +1073,89 @@ describe('order precision matches the live pair metadata', () => {
     }, BTCUSDT), /basePrecision/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Regression: a position could be closed twice in one mid-manage tick.
+//
+// midManage runs checkLiquidationGuard and then, under the trailing method,
+// checkTrailingCallback. Both call closePosition with the clientId
+// "jrock-close-<positionId>", so a position that tripped both would send the
+// same clientId twice and Bitunix would reject the second with
+// 30042 "Client ID duplicate" (docs/futures/ErrorCode/error_code.html).
+// ---------------------------------------------------------------------------
+
+describe('a position is closed at most once per manage cycle', () => {
+  const settings = (over = {}) => ({
+    symbol: 'BTCUSDT', leverage: 10, min_confidence: 80,
+    tpsl_method: 'trailing', breakeven_threshold_pct: 20, trailing_trigger_roi_pct: 25,
+    trailing_callback_pct: 5, sl_liquidation_safety: 90, cooldown_minutes: 1,
+    on_tpsl_failure: 'close', max_positions: 3,
+    account_tp_roi_pct: 0, account_sl_roi_pct: 0,
+    partial_tp_fractions: [0.3, 0.4, 0.3], partial_tp_roi_steps: [1, 2, 3],
+    ...over,
+  });
+
+  // Mark 100 vs liq 99.5 = 0.5% distance, under the 90% safety setting, so the
+  // liquidation guard fires. ROI +10% at 10x leverage also exceeds the 25%
+  // activation, so the trailing callback would fire too on its next tick.
+  const danger = {
+    positionId: 'p1', symbol: 'BTCUSDT', side: 'BUY', qty: '1',
+    avgPrice: '100', markPrice: '110', liqPrice: '99.5',
+  };
+
+  it('does not close the same positionId twice when both guards trip', async () => {
+    const closes = [];
+    const client = {
+      getPendingPositions: async () => [danger],
+      closePosition: async (_symbol, positionId) => { closes.push(positionId); return { orderId: `x-${positionId}` }; },
+      getPendingTPSL: async () => [],
+      // Protection must SUCCEED here, otherwise ensureProtection's on_tpsl_failure
+      // branch closes the position and the liquidation guard is never reached.
+      placeTPSL: async () => ({ orderId: 'sl-1' }),
+      // breakeven/trailing both move the stop; without this they throw and abort
+      // the tick before the liquidation guard is ever reached.
+      modifyTPSL: async () => ({ orderId: 'sl-1' }),
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getTickers: async () => [{ markPrice: '110' }],
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings());
+    // First tick arms the trailing peak; the liquidation guard closes here.
+    await pm.midManage();
+    assert.equal(closes.filter(id => id === 'p1').length, 1,
+      `expected exactly one close, got ${JSON.stringify(closes)}`);
+    // The guard recorded the close, so a later tick on the still-open position
+    // cannot fire the callback close for the same id either.
+    assert.equal(pm.closedThisCycle.has('p1'), true);
+  });
+
+  it('clears the per-tick record so a legitimately reopened id can close again', async () => {
+    const closes = [];
+    const client = {
+      getPendingPositions: async () => [danger],
+      closePosition: async (_symbol, positionId) => { closes.push(positionId); return {}; },
+      getPendingTPSL: async () => [],
+      // Protection must SUCCEED here, otherwise ensureProtection's on_tpsl_failure
+      // branch closes the position and the liquidation guard is never reached.
+      placeTPSL: async () => ({ orderId: 'sl-1' }),
+      // breakeven/trailing both move the stop; without this they throw and abort
+      // the tick before the liquidation guard is ever reached.
+      modifyTPSL: async () => ({ orderId: 'sl-1' }),
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getTickers: async () => [{ markPrice: '110' }],
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings());
+    await pm.midManage();
+    // The record holds this tick's closes; it is reset at the START of the next
+    // tick, so the same positionId can legitimately close again.
+    assert.equal(pm.closedThisCycle.size, 1, 'the tick records what it closed');
+    const afterFirst = closes.length;
+    assert.ok(afterFirst >= 1, 'the first tick must close');
+    await pm.midManage();
+    assert.ok(closes.length > afterFirst,
+      'a still-open position must be closable again on the next tick');
+    assert.equal(closes.filter(id => id === 'p1').length, closes.length,
+      'every close targets the reopened position');
+  });
+});

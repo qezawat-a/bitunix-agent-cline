@@ -411,7 +411,13 @@ describe('exchange safety', () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0][0], 'BTCUSDT');
     assert.equal(calls[0][1], 'p1');
-    assert.equal(result.closed, 'p1');
+    // The guard now reports `closed: true` so midManage can tell it closed the
+    // position (and skip the trailing callback, which would otherwise close the
+    // same positionId again and draw Bitunix 30042 Client ID duplicate). The raw
+    // client result stays reachable under `result`.
+    assert.equal(result.closed, true);
+    assert.equal(result.trigger, 'liquidation_guard');
+    assert.equal(result.result.closed, 'p1');
   });
 
   it('leaves positions alone when the liquidation distance is safe', async () => {
