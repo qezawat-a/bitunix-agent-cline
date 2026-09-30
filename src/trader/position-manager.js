@@ -27,10 +27,39 @@ export class PositionManager {
   // the liquidation guard must not also be closed by the trailing callback in
   // the same tick: Bitunix rejects the repeat with 30042 Client ID duplicate.
   closedThisCycle = new Set();
+  // Pending TP/SL rows for the current tick, keyed by positionId. Fetched at
+  // most once per tick and reset by resetTpslCache(), so the whole manage pass
+  // sees one consistent view of what the exchange actually has armed.
+  tpslCache = null;
+  tpslCacheInFlight = null;
 
   constructor(client, _symbol, settings) {
     this.client = client;
     this.settings = settings;
+  }
+
+  // Optional observer for the position lifecycle. Main.js sets this to the
+  // Telegram notifier; tests leave it unset. Every close below records its
+  // reason first, so the notification can say *why* a position went away
+  // instead of only that it did.
+  notifier = null;
+
+  noteClose(positionId, reason) {
+    try {
+      this.notifier?.noteClose?.(positionId, reason);
+    } catch {
+      // A notification hook must never be able to break a live close.
+    }
+  }
+
+  // Stop-move notifications are advisory, so a failure here must never abort
+  // the manage tick that just moved a stop on the exchange.
+  reportStopMove(position, action, price) {
+    try {
+      this.notifier?.reportStopMove?.(position, action, price);
+    } catch (error) {
+      console.error('[notify] stop-move report failed:', error.message);
+    }
   }
 
   get symbol() {
@@ -96,6 +125,60 @@ export class PositionManager {
     if (!finitePositive(entryPrice)) throw new Error('entryPrice must be positive');
     if (!finitePositive(atr)) throw new Error('ATR is required for dynamic TP/SL; refusing a static fallback');
     return Number(atr);
+  }
+
+  resetTpslCache() {
+    this.tpslCache = null;
+    this.tpslCacheInFlight = null;
+  }
+
+  // The pending TP/SL list is the only place a live take-profit and stop are
+  // visible: PositionPendingResp carries no slPrice/tpPrice (see
+// docs/api-parity.md discrepancy 7), so a stop read off the position object is
+  // always null. Every "is this position already protected / how far is the
+  // stop" question has to be answered from here, once per tick.
+  async loadPendingTPSL() {
+    if (this.tpslCache) return this.tpslCache;
+    if (this.tpslCacheInFlight) return this.tpslCacheInFlight;
+    if (typeof this.client.getPendingTPSL !== 'function') return [];
+    this.tpslCacheInFlight = (async () => {
+      const pending = await this.client.getPendingTPSL(this.symbol);
+      if (!Array.isArray(pending)) throw new Error('pending TP/SL response must be an array');
+      return pending;
+    })();
+    try {
+      this.tpslCache = await this.tpslCacheInFlight;
+      return this.tpslCache;
+    } finally {
+      this.tpslCacheInFlight = null;
+    }
+  }
+
+  // The position-level TP/SL row for a position, i.e. the all-in/all-out pair
+  // placeTPSL/modifyTPSL own. Partial (method 2) legs are order-level rows
+  // carrying tpQty/slQty and are deliberately not matched here: they are moved
+  // through modifyTPSLOrder keyed by their own id, never by positionId.
+  async positionTPSL(positionId) {
+    const key = String(positionId);
+    const pending = await this.loadPendingTPSL();
+    return pending.find(item => (
+      String(item.positionId) === key
+      && item.tpQty === undefined && item.slQty === undefined
+    )) || null;
+  }
+
+  // Write a just-moved stop back into the tick cache. Without this, a second
+  // check in the same tick (break-even, then trailing) would still read the
+  // pre-move stop and send a modify that moves the stop backwards.
+  recordStopMove(positionId, params) {
+    if (!this.tpslCache || !finitePositive(Number(params?.slPrice))) return;
+    const key = String(positionId);
+    const index = this.tpslCache.findIndex(item => (
+      String(item.positionId) === key
+      && item.tpQty === undefined && item.slQty === undefined
+    ));
+    if (index < 0) return;
+    this.tpslCache[index] = { ...this.tpslCache[index], slPrice: params.slPrice, slStopType: params.slStopType };
   }
 
   // The pair's quotePrecision, needed to emit TP/SL prices the exchange will
@@ -272,14 +355,22 @@ export class PositionManager {
     return ((mark - entry) / entry) * 100 * direction * leverage;
   }
 
-  currentStop(position) {
+  // Resolves the position's live stop price, falling back to the pending TP/SL
+  // list because the position payload itself never carries slPrice. Returns
+  // null when the exchange has no stop armed for the position.
+  async currentStop(position) {
     const value = position.slPrice ?? position.stopPrice ?? position.stopLossPrice;
     const stop = Number(value);
-    return finitePositive(stop) ? stop : null;
+    if (finitePositive(stop)) return stop;
+    const tpsl = await this.positionTPSL(position.positionId);
+    const pendingStop = Number(tpsl?.slPrice ?? tpsl?.stopPrice);
+    return finitePositive(pendingStop) ? pendingStop : null;
   }
 
-  shouldTighten(position, candidate) {
-    const current = this.currentStop(position);
+  // `current` is passed in rather than defaulted to currentStop(position),
+  // because currentStop is async — a default parameter would compare against a
+  // Promise (always truthy) instead of the real stop price.
+  shouldTighten(position, candidate, current = null) {
     if (!current) return true;
     return position.side === 'BUY' ? candidate > current : candidate < current;
   }
@@ -288,10 +379,11 @@ export class PositionManager {
     const entry = Number(position.avgPrice);
     if (!finitePositive(entry)) throw new Error('position entry price must be positive');
     if (this.favorableRoiPct(position) >= Number(this.settings.breakeven_threshold_pct)) {
-      const current = this.currentStop(position);
+      const current = await this.currentStop(position);
       if (current && position.side === 'BUY' && entry <= current) return { skipped: 'stop already favorable' };
       if (current && position.side === 'SELL' && entry >= current) return { skipped: 'stop already favorable' };
       const result = await this.moveSLToEntry(position.positionId, entry);
+      this.reportStopMove?.(position, 'breakeven', entry);
       return { ...result, slPrice: formatPrice(entry) };
     }
     return { skipped: 'threshold not reached' };
@@ -303,12 +395,29 @@ export class PositionManager {
     // trigger prices and their stop types — the trigger's order type is not a
     // parameter here, so it is not sent.
     // https://www.bitunix.com/api-docs/futures/tp_sl/modify_position_tp_sl_order.html
-    return this.client.modifyTPSL({
+    //
+    // IMPORTANT: this endpoint takes the SAME request shape as place_order
+    // (PlacePositionTpslOrderRequest, per docs/api-parity.md). It replaces the
+    // whole pair, so an omitted tpPrice DELETES the live take-profit — which is
+    // what made break-even silently wipe the TP, and kept wiping it on every
+    // tick because the stop read came from a field the position payload does
+    // not have. The existing take-profit is therefore read back and resent
+    // alongside the new stop, so only the stop moves.
+    const existing = await this.positionTPSL(positionId);
+    const params = {
       symbol: this.symbol,
       positionId,
       slPrice: formatPrice(entryPrice, quotePrecision),
       slStopType: 'MARK_PRICE',
-    });
+    };
+    if (existing && finitePositive(Number(existing.tpPrice))) {
+      params.tpPrice = String(existing.tpPrice);
+      if (existing.tpStopType) params.tpStopType = existing.tpStopType;
+      if (existing.tpOrderType) params.tpOrderType = existing.tpOrderType;
+    }
+    const result = await this.client.modifyTPSL(params);
+    this.recordStopMove(positionId, params);
+    return result;
   }
 
   async checkTrailing(position) {
@@ -319,8 +428,10 @@ export class PositionManager {
       const strength = Math.max(0, Math.min(100, Number(position.signalConfidence ?? this.settings.min_confidence))) / 100;
       const trailDistance = atr * (1.25 - strength * 0.25);
       const newSL = position.side === 'BUY' ? mark - trailDistance : mark + trailDistance;
-      if (!finitePositive(newSL) || !this.shouldTighten(position, newSL)) return { skipped: 'trailing would loosen stop' };
+      const current = await this.currentStop(position);
+      if (!finitePositive(newSL) || !this.shouldTighten(position, newSL, current)) return { skipped: 'trailing would loosen stop' };
       const result = await this.updateTrailingSL(position.positionId, newSL);
+      this.reportStopMove?.(position, 'trailing', newSL);
       return { ...result, slPrice: formatPrice(newSL, await this.getQuotePrecision()) };
     }
     return { skipped: 'threshold not reached' };
@@ -329,12 +440,24 @@ export class PositionManager {
   async updateTrailingSL(positionId, newSL) {
     // See moveSLToEntry: no slOrderType — it is not a documented parameter of
     // /tpsl/position/modify_order.
-    return this.client.modifyTPSL({
+    // The existing take-profit is carried forward for the same reason as in
+    // moveSLToEntry: this endpoint replaces the pair, so omitting tpPrice would
+    // delete the live take-profit on every trailing step.
+    const existing = await this.positionTPSL(positionId);
+    const params = {
       symbol: this.symbol,
       positionId,
       slPrice: formatPrice(newSL, await this.getQuotePrecision()),
       slStopType: 'MARK_PRICE',
-    });
+    };
+    if (existing && finitePositive(Number(existing.tpPrice))) {
+      params.tpPrice = String(existing.tpPrice);
+      if (existing.tpStopType) params.tpStopType = existing.tpStopType;
+      if (existing.tpOrderType) params.tpOrderType = existing.tpOrderType;
+    }
+    const result = await this.client.modifyTPSL(params);
+    this.recordStopMove(positionId, params);
+    return result;
   }
 
   // Method 3 (trailing). The exchange has no server-side "peak minus a
@@ -365,6 +488,7 @@ export class PositionManager {
     this.trailingState.delete(key);
     this.state.cooldownUntil = Date.now() + Number(this.settings.cooldown_minutes) * 60000;
     this.closedThisCycle.add(key);
+    this.noteClose(key, 'trailing_callback');
     const result = await this.client.closePosition(this.symbol, position.positionId, position);
     return { ...outcome, closed: true, result };
   }
@@ -384,6 +508,11 @@ export class PositionManager {
     if (!triggered) return { skipped: 'account thresholds not reached', roi, totalPnl, totalMargin };
     this.accountGuardFiredAt = Date.now();
     this.state.cooldownUntil = Date.now() + Number(this.settings.cooldown_minutes) * 60000;
+    // Label every position the account guard is about to close, so the exit
+    // notifications distinguish an account-level exit from a per-position one.
+    for (const position of this.state.positions) {
+      this.noteClose(position.positionId, triggered === 'tp' ? 'account_tp' : 'account_sl');
+    }
     await this.client.closeAllPosition(this.symbol);
     // The peaks belonged to positions that no longer exist.
     this.trailingState.clear();
@@ -402,13 +531,14 @@ export class PositionManager {
     // `closed: true` lets midManage stop working this position. Without it the
     // trailing callback below would close the same positionId again in the same
     // tick, and Bitunix answers the repeat with 30042 Client ID duplicate.
+    this.noteClose(position.positionId, 'liquidation_guard');
     const result = await this.client.closePosition(this.symbol, position.positionId, position);
     this.closedThisCycle.add(String(position.positionId));
     return { closed: true, trigger: 'liquidation_guard', result };
   }
 
   async ensureProtection(position) {
-    if (this.currentStop(position)) return { skipped: 'protection already present' };
+    if (await this.currentStop(position)) return { skipped: 'protection already present' };
     const key = String(position.positionId);
     const lastAttempt = this.protectionAttempts.get(key) || 0;
     if (Date.now() - lastAttempt < 60000) return { skipped: 'protection retry pending' };
@@ -416,8 +546,7 @@ export class PositionManager {
     const direction = position.side === 'BUY' ? 'bullish' : position.side === 'SELL' ? 'bearish' : null;
     if (!direction) throw new Error(`position ${key} has an invalid side for TP/SL`);
     try {
-      const pending = await this.client.getPendingTPSL(this.symbol);
-      if (!Array.isArray(pending)) throw new Error('pending TP/SL response must be an array');
+      const pending = await this.loadPendingTPSL();
       const existing = pending.find(item => String(item.positionId) === key && finitePositive(item.slPrice ?? item.stopPrice));
       if (existing) return { verified: true, result: existing };
       const atr = await this.getAtrForPosition(position);
@@ -442,6 +571,7 @@ export class PositionManager {
       return { placed: true, result };
     } catch (error) {
       if (this.settings.on_tpsl_failure === 'close') {
+        this.noteClose(position.positionId, 'tpsl_failure');
         const closeResult = await this.client.closePosition(this.symbol, position.positionId, position);
         return { closed: true, result: closeResult, error: error.message };
       }
@@ -455,6 +585,10 @@ export class PositionManager {
     // The set is per-tick: a position closed now is gone on the next fetch, and
     // the same positionId must be allowed to close again if it is ever reopened.
     this.closedThisCycle.clear();
+    // One TP/SL view per tick. Every stop move this tick reads the same rows it
+    // will write against, so a take-profit set by hand mid-tick is not clobbered
+    // by a stale cache and the list is not re-fetched per position.
+    this.resetTpslCache();
     // Method 4 runs once per cycle, before the per-position work: when it
     // closes everything there is nothing left to protect this tick.
     try {

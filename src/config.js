@@ -29,15 +29,18 @@ export const CONFIG = {
   AI_PROVIDER: E('auto', 'AI_PROVIDER', 'MODEL_PROVIDER'),
   AI_BASE_URL: E('', 'AI_BASE_URL', 'OPENAI_COMPATIBLE_URL', 'OPENAI_BASE_URL', 'BASE_URL'),
   AI_API_KEY: E('', 'AI_API_KEY', 'OPENAI_COMPATIBLE_KEY', 'OPENAI_API_KEY'),
-  AI_MODEL: E('AUTO', 'AI_MODEL', 'OPENAI_COMPATIBLE_MODEL', 'OPENAI_MODEL', 'MODEL_AUTO_SET_BY_KEY'),
+  AI_MODEL: E('AUTO', 'AI_MODEL', 'OPENAI_COMPATIBLE_MODEL', 'OPENAI_MODEL'),
   ANTHROPIC_API_KEY: S('ANTHROPIC_API_KEY', ''),
   ANTHROPIC_BASE_URL: E('', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_URL'),
-  ANTHROPIC_MODEL: E('AUTO', 'ANTHROPIC_MODEL', 'MODEL_AUTO_SET_BY_KEY'),
+  ANTHROPIC_MODEL: E('AUTO', 'ANTHROPIC_MODEL'),
   GEMINI_API_KEY: E('', 'GEMINI_API_KEY', 'GEMINI_GOOGLE_KEY'),
   GEMINI_BASE_URL: E('', 'GEMINI_BASE_URL', 'GEMINI_GOOGLE_URL'),
-  GEMINI_MODEL: E('AUTO', 'GEMINI_MODEL', 'MODEL_AUTO_SET_BY_KEY'),
+  GEMINI_MODEL: E('AUTO', 'GEMINI_MODEL'),
   AI_AUTO_REFRESH: B(S('AI_AUTO_REFRESH', '1'), true, 'AI_AUTO_REFRESH'),
   AI_MODEL_TTL: Number(S('AI_MODEL_TTL', 600000)),
+  // Comma-separated models to try when AUTO cannot discover any. Put the model
+  // your key is known to work with here.
+  AI_MODEL_FALLBACKS: S('AI_MODEL_FALLBACKS', ''),
   AGENT_AUTO_COMPACT: B(S('AGENT_AUTO_COMPACT', '1'), true, 'AGENT_AUTO_COMPACT'),
   // Empty means "pick per model": reasoning/thinking endpoints reject a non-default
   // temperature outright, so it is only sent when explicitly asked for.
@@ -102,6 +105,10 @@ export const CONFIG = {
   account_sl_roi_pct: Number(S('account_sl_roi_pct', 0)),
   position_sizing_margin_pct: Number(S('position_sizing_margin_pct', 2)),
   auto_trade: B(S('AUTO_TRADE', '0'), false, 'AUTO_TRADE'),
+  // Telegram position-lifecycle notifications.
+  notify_open: B(S('notify_open', '1'), true, 'notify_open'),
+  notify_close: B(S('notify_close', '1'), true, 'notify_close'),
+  notify_tpsl: B(S('notify_tpsl', '0'), false, 'notify_tpsl'),
   // Trading authority is deliberately NOT persisted (getPersistentSettings drops
   // it), so auto_trade is always off after a restart. That is the safe default,
   // but it means /autotrade on silently reverts on every redeploy. Set
@@ -119,6 +126,7 @@ const FILE_TRADER_KEYS = new Set([
   'report_interval_sec', 'mid_manage_interval_sec', 'order_unit', 'position_sizing_margin_pct',
   'tpsl_method', 'partial_tp_fractions', 'partial_tp_roi_steps', 'trailing_callback_pct',
   'account_tp_roi_pct', 'account_sl_roi_pct',
+  'notify_open', 'notify_close', 'notify_tpsl',
 ]);
 
 function isPlainObject(value) {

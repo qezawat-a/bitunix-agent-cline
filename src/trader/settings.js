@@ -41,6 +41,13 @@ export const DEFAULTS = {
   account_sl_roi_pct: 0,
   position_sizing_margin_pct: 2,
   auto_trade: false,
+  // Telegram notifications. The position lifecycle was silent: the bot only
+  // reported signals, so an entry or an exit happened with no message at all.
+  notify_open: true,
+  notify_close: true,
+  // Stop / take-profit moves (break-even, trailing) are chatty on a fast
+  // market, so they are off unless asked for.
+  notify_tpsl: false,
 };
 
 // Bitunix exposes three order units (help centre "Explanation of the Order Units
@@ -92,7 +99,7 @@ const NUMBER_KEYS = new Set([
 // Arrays that must hold finite numbers. Declared separately from timeframes,
 // which are validated as a set of unique interval strings.
 const NUMERIC_ARRAY_KEYS = new Set(['partial_tp_fractions', 'partial_tp_roi_steps']);
-const BOOLEAN_KEYS = new Set(['auto_trade', 'reversal_enabled']);
+const BOOLEAN_KEYS = new Set(['auto_trade', 'reversal_enabled', 'notify_open', 'notify_close', 'notify_tpsl']);
 const ENUMS = {
   position_type: ['crossed', 'isolated'],
   position_mode: ['hedge', 'one-way'],

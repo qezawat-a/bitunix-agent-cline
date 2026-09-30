@@ -9,6 +9,7 @@ import { setTraderInstances, setPositionManager } from './trader/agent-tools.js'
 import { setBitunixClient } from './bitunix/futures-tools.js';
 import { createTraderCommands } from './telegram-trader.js';
 import { sendMessage, isOwner, setCommands, esc } from './telegram-bot.js';
+import { PositionNotifier } from './trader/notifier.js';
 import { createAgent } from './agent/loop.js';
 import { buildSystemPrompt } from './prompt.js';
 import { basicTools, setBasicMemory } from './agent/basic-tools.js';
@@ -70,6 +71,13 @@ async function main() {
   setPositionManager(trader.positionManager);
   setBitunixClient(client);
 
+  // Position-lifecycle notifications. Without this the bot reported signals
+  // only, so entries and exits were completely silent. The notifier diffs the
+  // exchange's position list each tick, so it catches every exit — including
+  // ones the operator performs directly in the Bitunix app.
+  const notifier = new PositionNotifier({ client, settings: CONFIG, send: sendMessage });
+  trader.positionManager.notifier = notifier;
+
   const memory = new Memory();
   await memory.load();
   const skills = await listSkills();
@@ -90,6 +98,7 @@ async function main() {
     saveSession,
     deleteSession,
     persistSettings,
+    notifier,
   });
 
   if (CONFIG.BITUNIX_API_KEY) {
@@ -166,6 +175,9 @@ async function main() {
     try {
       if (scanState.scanOn) {
         const signal = await trader.scanCycle();
+        // Diff the position list before acting on a new signal, so an entry is
+        // reported as soon as it appears on the exchange.
+        await notifier.sync().catch(() => {});
         if (signal) {
           // scanCycle() only *produces* a signal. Turning it into a live order is
           // a separate step, and it has to happen here: without this call the
@@ -185,6 +197,9 @@ async function main() {
         }
       } else {
         await Promise.allSettled([trader.guard(), trader.midManage(), trader.report()]);
+        // Exits still need reporting when scanning is off, e.g. a stop or a
+        // liquidation guard closing a position.
+        await notifier.sync().catch(() => {});
       }
     } catch (error) {
       console.error('loop error:', error.message);

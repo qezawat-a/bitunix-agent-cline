@@ -1,6 +1,8 @@
 import { describe, it, afterEach, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Pool } from 'pg';
 import { ema, rsi, bollinger, atr, macd, superTrend, atrBreakout, computeSignal } from '../src/bitunix/indicators.js';
 import {
@@ -15,6 +17,7 @@ import {
 import { parseThinkingLevel } from '../src/agent/thinking.js';
 import { CONFIG, parseBoolean, applySettingsFile } from '../src/config.js';
 import { createTraderCommands } from '../src/telegram-trader.js';
+import { PositionNotifier, closeMessage, normalizeSide, positionRoiPct, sideLabel } from '../src/trader/notifier.js';
 import { BitunixClient } from '../src/bitunix/client.js';
 import Scanner from '../src/bitunix/scanner.js';
 import { liqDistanceOk } from '../src/bitunix/risk.js';
@@ -488,7 +491,23 @@ describe('tool safety', () => {
 });
 
 describe('provider and websocket safety', () => {
+  // Every AUTO test writes data/model-cache.json. Point it at a throwaway
+  // directory so one run can never seed the next one (a remembered model from
+  // a previous run would skip the probe the test is asserting on).
+  const withCleanCache = (run) => {
+    const dir = mkdtempSync(join(tmpdir(), 'model-cache-'));
+    const cwd = process.cwd();
+    process.chdir(dir);
+    return Promise.resolve()
+      .then(run)
+      .finally(() => {
+        process.chdir(cwd);
+        rmSync(dir, { recursive: true, force: true });
+      });
+  };
+
   it('auto-selects a discovered model without a hardcoded fallback', async () => {
+    await withCleanCache(async () => {
     Object.assign(CONFIG, { AI_PROVIDER: 'openai', AI_BASE_URL: 'https://auto-provider.test/v1', AI_API_KEY: 'test-key', AI_MODEL: 'AUTO' });
     const requests = [];
     globalThis.fetch = async (url, options) => {
@@ -499,6 +518,108 @@ describe('provider and websocket safety', () => {
     const result = await chat([{ role: 'user', content: 'hello' }], 'openai');
     assert.equal(result.text, 'ok');
     assert.equal(requests[1].body.model, 'standard');
+    });
+  });
+
+  it('treats a 429 as rate limiting rather than "model unavailable"', async () => {
+    await withCleanCache(async () => {
+
+      Object.assign(CONFIG, { AI_PROVIDER: 'openai', AI_BASE_URL: 'https://throttled.test/v1', AI_API_KEY: 'test-key', AI_MODEL: 'AUTO' });
+      const probed = [];
+      globalThis.fetch = async (url, options) => {
+        if (url.endsWith('/models')) return { ok: true, json: async () => ({ data: [{ id: 'good' }, { id: 'bad' }] }) };
+        probed.push(JSON.parse(options.body).model);
+        // Only "good" is throttled; the loop must move past it to "bad" instead
+        // of concluding that the key has no working model.
+        if (JSON.parse(options.body).model === 'good') {
+          return { ok: false, status: 429, text: async () => 'rate limited' };
+        }
+        return { ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) };
+      };
+      const res = await chat([{ role: 'user', content: 'hello' }], 'openai');
+      assert.equal(res.text, 'ok');
+      assert.ok(probed.includes('good') && probed.includes('bad'), 'a 429 on one model must not end the search');    });
+  });
+
+  it('retries a probe that only objects to max_tokens', async () => {
+    await withCleanCache(async () => {
+
+      Object.assign(CONFIG, { AI_PROVIDER: 'openai', AI_BASE_URL: 'https://reasoning.test/v1', AI_API_KEY: 'test-key', AI_MODEL: 'AUTO' });
+      const bodies = [];
+      globalThis.fetch = async (url, options) => {
+        if (url.endsWith('/models')) return { ok: true, json: async () => ({ data: [{ id: 'reasoner' }] }) };
+        const body = JSON.parse(options.body);
+        bodies.push(body);
+        if ('max_tokens' in body && !('max_completion_tokens' in body)) {
+          return { ok: false, status: 400, text: async () => 'unsupported_value: max_tokens is not supported, use max_completion_tokens' };
+        }
+        return { ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) };
+      };
+      const res = await chat([{ role: 'user', content: 'hello' }], 'openai');
+      assert.equal(res.text, 'ok');
+      assert.ok(bodies.length >= 2, 'the probe must be retried with max_completion_tokens');    });
+  });
+
+  it('falls back to AI_MODEL_FALLBACKS when the endpoint hides /models', async () => {
+    await withCleanCache(async () => {
+
+      Object.assign(CONFIG, {
+        AI_PROVIDER: 'openai', AI_BASE_URL: 'https://nolist.test/v1', AI_API_KEY: 'test-key',
+        AI_MODEL: 'AUTO', AI_MODEL_FALLBACKS: 'my-working-model',
+      });
+      let probed = null;
+      globalThis.fetch = async (url, options) => {
+        if (url.endsWith('/models')) return { ok: false, status: 404, text: async () => 'not found' };
+        probed = JSON.parse(options.body).model;
+        return { ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) };
+      };
+      const res = await chat([{ role: 'user', content: 'hello' }], 'openai');
+      assert.equal(res.text, 'ok');
+      assert.equal(probed, 'my-working-model');    });
+  });
+
+  it('explains what it tried when no model works', async () => {
+    await withCleanCache(async () => {
+
+      Object.assign(CONFIG, { AI_PROVIDER: 'openai', AI_BASE_URL: 'https://dead.test/v1', AI_API_KEY: 'test-key', AI_MODEL: 'AUTO', AI_MODEL_FALLBACKS: '' });
+      globalThis.fetch = async (url) => {
+        if (url.endsWith('/models')) return { ok: true, json: async () => ({ data: [{ id: 'a' }, { id: 'b' }] }) };
+        return { ok: false, status: 400, text: async () => 'model not found' };
+      };
+      await assert.rejects(
+        () => chat([{ role: 'user', content: 'hello' }], 'openai'),
+        /AUTO could not find a working model/,
+      );    });
+  });
+
+  it('reuses a previously working model instead of rediscovering it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'model-cache-'));
+    const cwd = process.cwd();
+    let probes = 0;
+    try {
+      process.chdir(dir);
+      // A remembered model is probed first, so exactly one probe is needed.
+      writeFileSync(join(dir, 'model-cache.json'), JSON.stringify({ 'https://memo.test/v1': 'remembered-model' }));
+      Object.assign(CONFIG, {
+        AI_PROVIDER: 'openai', AI_BASE_URL: 'https://memo.test/v1', AI_API_KEY: 'test-key',
+        AI_MODEL: 'AUTO', AI_MODEL_FALLBACKS: '',
+      });
+      globalThis.fetch = async (url, options) => {
+        if (url.endsWith('/models')) return { ok: true, json: async () => ({ data: [{ id: 'remembered-model' }, { id: 'other' }] }) };
+        probes += 1;
+        return { ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) };
+      };
+      const res = await chat([{ role: 'user', content: 'hello' }], 'openai');
+      assert.equal(res.text, 'ok');
+      // One probe plus the real request; the probe must be the remembered model.
+      assert.equal(probes, 2, 'the remembered model must be tried before the rest of the list');
+      // And the winner is written back so the next process starts here too.
+      const saved = JSON.parse(readFileSync(join(dir, 'model-cache.json'), 'utf8'));
+      assert.equal(saved['https://memo.test/v1'], 'remembered-model');
+    } finally {
+      process.chdir(cwd);
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('lists models from an OpenAI-compatible endpoint', async () => {
@@ -900,4 +1021,171 @@ describe('store ssl contract', () => {
   });
 });
 
+});
+
+// ---------------------------------------------------------------------------
+// Position lifecycle notifications.
+//
+// The bot used to report signals only: an entry filling, a stop hitting or the
+// liquidation guard closing a position produced no message at all. The notifier
+// diffs the exchange's position list, so it catches every exit regardless of
+// which code path caused it.
+// ---------------------------------------------------------------------------
+describe('position lifecycle notifications', () => {
+  function harness(initial = []) {
+    let positions = initial;
+    const sent = [];
+    const client = {
+      getPendingPositions: async () => positions,
+      getHistoryPositions: async () => [{
+        positionId: 'p1', symbol: 'BTCUSDT', side: 'LONG', qty: '1',
+        entryPrice: '100', closePrice: '110', realizedPNL: '10', leverage: 10,
+      }],
+      getPendingTPSL: async () => [{ positionId: 'p1', tpPrice: '120', slPrice: '95' }],
+    };
+    const notifier = new PositionNotifier({
+      client,
+      settings: { ...CONFIG, notify_open: true, notify_close: true, notify_tpsl: false },
+      send: async (chatId, text) => { sent.push({ chatId, text }); },
+      chatId: '42',
+    });
+    return {
+      notifier,
+      sent,
+      set(next) { positions = next; },
+    };
+  }
+
+  const open = { positionId: 'p1', symbol: 'BTCUSDT', side: 'LONG', qty: '1', avgPrice: '100', leverage: 10 };
+
+  it('stays silent on the first pass so pre-existing positions are not announced', async () => {
+    const h = harness([open]);
+    await h.notifier.sync();
+    assert.equal(h.sent.length, 0);
+  });
+
+  it('announces a position that appears after the baseline', async () => {
+    const h = harness([]);
+    await h.notifier.sync();
+    h.set([open]);
+    const events = await h.notifier.sync();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'opened');
+    assert.match(h.sent[0].text, /POSITION OPENED/);
+    assert.match(h.sent[0].text, /LONG/);
+    // The armed TP/SL is read from the pending list, not the position payload.
+    assert.match(h.sent[0].text, /120/);
+    assert.match(h.sent[0].text, /95/);
+  });
+
+  it('announces a close with the realized PnL and ROI', async () => {
+    const h = harness([open]);
+    await h.notifier.sync();
+    h.set([]);
+    const events = await h.notifier.sync();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'closed');
+    assert.match(h.sent[0].text, /POSITION CLOSED/);
+    assert.match(h.sent[0].text, /\$10\.00/);
+    // +10% price move at 10x leverage is +100% ROI.
+    assert.match(h.sent[0].text, /\+100\.00%/);
+  });
+
+  it('labels the close with a reason recorded by the caller', async () => {
+    const h = harness([open]);
+    await h.notifier.sync();
+    h.notifier.noteClose('p1', 'liquidation_guard');
+    h.set([]);
+    const events = await h.notifier.sync();
+    assert.equal(events[0].reason, 'liquidation_guard');
+    assert.match(h.sent[0].text, /Liquidation guard/);
+  });
+
+  it('honours notify_open and notify_close', async () => {
+    const h = harness([]);
+    h.notifier.settings.notify_open = false;
+    await h.notifier.sync();
+    h.set([open]);
+    await h.notifier.sync();
+    assert.equal(h.sent.length, 0);
+
+    h.notifier.settings.notify_close = false;
+    h.notifier.noteClose('p1', 'manual');
+    h.set([]);
+    await h.notifier.sync();
+    assert.equal(h.sent.length, 0);
+  });
+
+  it('never lets a send failure break the loop', async () => {
+    const h = harness([open]);
+    h.notifier.send = async () => { throw new Error('telegram down'); };
+    await h.notifier.sync();
+    h.set([]);
+    await assert.doesNotReject(() => h.notifier.sync());
+  });
+
+  it('does not re-announce a position it is already tracking', async () => {
+    const h = harness([]);
+    await h.notifier.sync();
+    h.set([open]);
+    await h.notifier.sync();
+    await h.notifier.sync();
+    assert.equal(h.sent.length, 1);
+  });
+
+  it('normalizes both side casings Bitunix uses', () => {
+    assert.equal(normalizeSide('LONG'), 'BUY');
+    assert.equal(normalizeSide('SHORT'), 'SELL');
+    assert.equal(sideLabel('BUY'), 'LONG');
+    assert.equal(sideLabel('SELL'), 'SHORT');
+  });
+
+  it('mirrors ROI for shorts', () => {
+    const long = positionRoiPct({ entryPrice: 100, closePrice: 110, side: 'BUY', leverage: 10 });
+    const short = positionRoiPct({ entryPrice: 100, closePrice: 110, side: 'SELL', leverage: 10 });
+    assert.equal(long, 100);
+    assert.equal(short, -100);
+  });
+
+  it('reports the exit price and PnL without them when the history is missing', () => {
+    const withData = closeMessage({
+      position: { positionId: 'p1', symbol: 'BTCUSDT', side: 'BUY', entryPrice: '100', closePrice: '101', qty: '1', leverage: 10, realizedPNL: '1' },
+      reason: 'take_profit',
+    });
+    assert.match(withData, /Take-profit/);
+    assert.match(withData, /101/);
+    const bare = closeMessage({ position: { positionId: 'p2', side: 'BUY', entryPrice: '100' }, reason: 'unknown' });
+    assert.match(bare, /Closed on the exchange/);
+  });
+
+  it('labels the reason the PositionManager records on each close path', async () => {
+    const reasons = [];
+    const client = {
+      getPendingPositions: async () => [fakePosition({ markPrice: '100', liqPrice: '99.5' })],
+      closePosition: async () => ({}),
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', {
+      ...getTraderSettings(CONFIG), sl_liquidation_safety: 90, tpsl_method: 'position',
+    });
+    pm.notifier = { noteClose: (_id, reason) => reasons.push(reason) };
+    await pm.checkLiquidationGuard(fakePosition({ markPrice: '100', liqPrice: '99.5' }));
+    assert.deepEqual(reasons, ['liquidation_guard']);
+  });
+
+  it('reports the account guard close against every open position', async () => {
+    const reasons = [];
+    const client = {
+      getPendingPositions: async () => [],
+      closeAllPosition: async () => ({}),
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', {
+      ...getTraderSettings(CONFIG),
+      tpsl_method: 'account', account_tp_roi_pct: 5, account_sl_roi_pct: 0,
+    });
+    pm.notifier = { noteClose: (_id, reason) => reasons.push(reason) };
+    pm.state.positions = [{ positionId: 'p1', side: 'BUY', qty: '1', avgPrice: '100', markPrice: '110', unrealizedPNL: '50', margin: '100' }];
+    const result = await pm.checkAccountGuard();
+    assert.equal(result.triggered, 'tp');
+    assert.deepEqual(reasons, ['account_tp']);
+  });
 });

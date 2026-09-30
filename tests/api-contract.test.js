@@ -1159,3 +1159,114 @@ describe('a position is closed at most once per manage cycle', () => {
       'every close targets the reopened position');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Regression: break-even / trailing deleted the take-profit.
+//
+// /tpsl/position/modify_order takes the same request shape as place_order, so
+// it REPLACES the whole pair. Sending only slPrice therefore deleted the live
+// take-profit. Because PositionPendingResp carries no slPrice, the "is the
+// stop already at entry?" check also always read null, so the modify re-fired
+// every tick and wiped any take-profit the operator had just added by hand.
+// ---------------------------------------------------------------------------
+
+describe('moving the stop never deletes the take-profit', () => {
+  const settings = (over = {}) => ({
+    symbol: 'BTCUSDT', leverage: 10, min_confidence: 80,
+    tpsl_method: 'position', breakeven_threshold_pct: 20, trailing_trigger_roi_pct: 25,
+    trailing_callback_pct: 5, sl_liquidation_safety: 10, cooldown_minutes: 1,
+    on_tpsl_failure: 'close', max_positions: 3,
+    account_tp_roi_pct: 0, account_sl_roi_pct: 0,
+    partial_tp_fractions: [0.3, 0.4, 0.3], partial_tp_roi_steps: [1, 2, 3],
+    ...over,
+  });
+
+  // A long armed with a take-profit at 120 and a stop still below entry. Both
+  // live on the pending TP/SL row, not on the position payload.
+  const live = {
+    positionId: 'p1', symbol: 'BTCUSDT', side: 'BUY', qty: '1',
+    avgPrice: '100', markPrice: '110', liqPrice: '50',
+  };
+  const pendingWithTP = [{
+    id: 'tp-1', positionId: 'p1', tpPrice: '120', tpOrderType: 'MARKET',
+    tpStopType: 'MARK_PRICE', slPrice: '95', slStopType: 'MARK_PRICE',
+  }];
+
+  it('resends the live take-profit when break-even moves the stop', async () => {
+    const modifies = [];
+    const client = {
+      getPendingTPSL: async () => pendingWithTP,
+      modifyTPSL: async (params) => { modifies.push(params); return { orderId: 'tp-1' }; },
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings({ breakeven_threshold_pct: 5 }));
+    await pm.checkBreakeven({ ...live, markPrice: '101' });
+    assert.equal(modifies.length, 1);
+    assert.equal(modifies[0].slPrice, '100');
+    // The take-profit must survive the stop move, or break-even deletes it.
+    assert.equal(modifies[0].tpPrice, '120');
+    assert.equal(modifies[0].tpStopType, 'MARK_PRICE');
+    assert.equal(modifies[0].tpOrderType, 'MARKET');
+  });
+
+  it('preserves the take-profit across a trailing stop move too', async () => {
+    const modifies = [];
+    const client = {
+      getPendingTPSL: async () => [{ ...pendingWithTP[0], slPrice: '95' }],
+      modifyTPSL: async (params) => { modifies.push(params); return { orderId: 'tp-1' }; },
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings());
+    await pm.checkTrailing({ ...live, atr: 2 });
+    assert.equal(modifies.length, 1);
+    assert.equal(modifies[0].tpPrice, '120');
+  });
+
+  it('does not re-issue the move once the stop is already at break-even', async () => {
+    let modifies = 0;
+    const client = {
+      // The stop is already at entry, exactly as it is after the first tick
+      // applied break-even.
+      getPendingTPSL: async () => [{ ...pendingWithTP[0], slPrice: '100' }],
+      modifyTPSL: async () => { modifies += 1; return { orderId: 'tp-1' }; },
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings({ breakeven_threshold_pct: 5 }));
+    const result = await pm.checkBreakeven({ ...live, markPrice: '101' });
+    assert.equal(result.skipped, 'stop already favorable');
+    assert.equal(modifies, 0, 'a satisfied break-even must not touch the exchange');
+  });
+
+  it('omits tp fields when the position genuinely has no take-profit', async () => {
+    const modifies = [];
+    const client = {
+      // A stop-only row (the trailing/account methods place one of these).
+      getPendingTPSL: async () => [{ id: 'tp-1', positionId: 'p1', slPrice: '95', slStopType: 'MARK_PRICE' }],
+      modifyTPSL: async (params) => { modifies.push(params); return { orderId: 'tp-1' }; },
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings({ breakeven_threshold_pct: 5 }));
+    await pm.checkBreakeven({ ...live, markPrice: '101' });
+    assert.equal(modifies.length, 1);
+    assert.equal(modifies[0].slPrice, '100');
+    assert.equal('tpPrice' in modifies[0], false, 'no take-profit exists, so none may be invented');
+  });
+
+  it('ignores partial order-level legs when reading the position TP/SL', async () => {
+    const client = {
+      // Method 2 rows carry tpQty/slQty; they are addressed by order id, never
+      // by positionId, so they must not be mistaken for the position-level pair.
+      getPendingTPSL: async () => [
+        { id: 'leg-1', positionId: 'p1', tpPrice: '105', slPrice: '90', tpQty: '0.3', slQty: '0.3' },
+      ],
+      modifyTPSL: async () => { throw new Error('must not send a position-level modify'); },
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings({ tpsl_method: 'partial', breakeven_threshold_pct: 5 }));
+    // The legs carry stops, so the position is already protected: nothing is
+    // placed, and no position-level modify is ever sent.
+    const result = await pm.ensureProtection(live);
+    assert.equal(result.verified, true);
+  });
+});

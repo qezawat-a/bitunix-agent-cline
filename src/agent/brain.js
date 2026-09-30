@@ -1,4 +1,5 @@
 import { CONFIG } from '../config.js';
+import { loadModelCache, saveModelCache, shouldAdvanceModel } from './auto-model.js';
 
 export async function chat(messages, provider = 'openai', tools = [], options = {}) {
   const key = provider === 'openai'
@@ -38,7 +39,11 @@ export async function listOpenAiModels(signal) {
   return models.map(model => typeof model === 'string' ? model : model?.id).filter(Boolean);
 }
 
-let autoModelState = { key: null, model: null };
+// The model that last worked, kept in memory and mirrored to
+// data/model-cache.json. Restarting the process must not throw away a model
+// that is known to answer with this key — rediscovering it by probing can take
+// dozens of requests and is exactly what used to fail.
+let autoModelState = { key: null, model: null, checkedAt: 0 };
 
 function rankDiscoveredModels(models) {
   const blocked = /embed|whisper|tts|audio|dall|image|moderation|rerank|realtime|omni|fine-tune|guard/i;
@@ -54,52 +59,152 @@ function rankDiscoveredModels(models) {
   ];
 }
 
+// The disk cache is keyed by endpoint, but older files were keyed by the raw
+// "url|key-present" string, so both are accepted when reading.
+function cacheKey(key) {
+  return key.split('|')[0].replace(/\/chat\/completions$/i, '');
+}
+
+// An explicit AI_MODEL_FALLBACKS list is the operator's own answer to "which
+// model does this key speak to", so it is tried after the discovered models.
+function configuredFallbackModels() {
+  const raw = String(CONFIG.AI_MODEL_FALLBACKS || '').trim();
+  if (!raw) return [];
+  return raw.split(',').map(item => item.trim()).filter(Boolean);
+}
+
+// Drop the auto-selected model (in memory and on disk) once the provider says
+// it cannot serve it, so the next request rediscovers instead of repeating the
+// same dead model on every message.
+function forgetAutoModel(model) {
+  if (autoModelState.model !== model) return;
+  autoModelState = { key: null, model: null, checkedAt: 0 };
+  loadModelCache().then(async (cached) => {
+    if (!cached || typeof cached !== 'object') return;
+    const next = { ...cached };
+    for (const key of Object.keys(next)) {
+      if (next[key] === model) delete next[key];
+    }
+    await saveModelCache(next);
+  }).catch(() => {});
+}
+
+// A probe body that works on the widest set of OpenAI-compatible gateways.
+// `max_tokens` is the widely accepted name, but reasoning endpoints reject it
+// in favour of `max_completion_tokens`, so a 400 carrying that complaint is
+// retried once with the modern spelling rather than being counted as "model
+// unavailable". The same goes for a 400 that only objects to `temperature`.
+function probeBodies(model) {
+  const base = { model, messages: [{ role: 'user', content: 'ping' }] };
+  return [
+    { ...base, max_tokens: 16 },
+    { ...base, max_completion_tokens: 16 },
+    { ...base, max_tokens: 16, temperature: 1 },
+  ];
+}
+
+function isRetryableProbeBody(status, body) {
+  if (status !== 400) return false;
+  const text = String(body || '').toLowerCase();
+  return /max_tokens|max_completion_tokens|temperature|unsupported_value|unsupported parameter/.test(text);
+}
+
 async function probeOpenAiModel(model, signal) {
-  const res = await fetch(resolveOpenAiUrl(), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${CONFIG.AI_API_KEY}` },
-    // A tiny budget only looks available: reasoning models spend it entirely on
-    // thinking and either 400 or answer with no visible content at all.
-    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 128 }),
-    signal,
-  });
-  // A 2xx is the availability signal. Requiring visible text here rejected every
-  // thinking model, which is what produced "No discovered model passed the probe".
-  if (!res.ok) return false;
-  const data = await res.json().catch(() => ({}));
-  return Boolean(data?.choices?.length);
+  for (const body of probeBodies(model)) {
+    let res;
+    try {
+      res = await fetch(resolveOpenAiUrl(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${CONFIG.AI_API_KEY}` },
+        // A tiny budget only has to look available: reasoning models spend it
+        // entirely on thinking and answer with no visible content at all.
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch {
+      return false;
+    }
+    if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      // A 2xx is the availability signal. Requiring visible text here rejected
+      // every thinking model, which produced "No discovered model passed the
+      // probe" for providers that were working fine.
+      if (data?.choices?.length) return true;
+      continue;
+    }
+    const detail = await res.text().catch(() => '');
+    // 429 means "asked too often", not "this model is unavailable": counting it
+    // as a failure is what made a burst of concurrent probes reject every model
+    // and AUTO give up.
+    if (res.status === 429 || res.status >= 500) return null;
+    if (isRetryableProbeBody(res.status, detail)) continue;
+    return false;
+  }
+  return false;
 }
 
 async function resolveOpenAiModel(signal) {
   const configured = String(CONFIG.AI_MODEL || '').trim();
   if (configured && configured.toUpperCase() !== 'AUTO') return configured;
   const key = `${resolveOpenAiUrl()}|${CONFIG.AI_API_KEY ? 'configured' : 'missing'}`;
-  if (autoModelState.key === key && autoModelState.model) return autoModelState.model;
-  const models = rankDiscoveredModels(await listOpenAiModels(signal));
-  // Probing only the first few candidates meant AUTO gave up while perfectly
-  // good models further down the list were never tested. Probe the whole ranked
-  // list, a few at a time, and keep the ranked order when reporting a winner.
-  const concurrency = 6;
-  const verdicts = new Map();
-  let next = 0;
-  const worker = async () => {
-    while (next < models.length) {
-      const index = next++;
-      try {
-        verdicts.set(index, await probeOpenAiModel(models[index], signal));
-      } catch {
-        verdicts.set(index, false);
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(concurrency, models.length) }, worker));
-  for (let index = 0; index < models.length; index += 1) {
-    if (verdicts.get(index)) {
-      autoModelState = { key, model: models[index] };
-      return models[index];
+  if (autoModelState.key === key && autoModelState.model) {
+    if (!CONFIG.AI_AUTO_REFRESH) return autoModelState.model;
+    if (Date.now() - autoModelState.checkedAt < (Number(CONFIG.AI_MODEL_TTL) || 600000)) {
+      return autoModelState.model;
     }
   }
-  throw new Error(`None of the ${models.length} discovered models passed the availability probe; set AI_MODEL explicitly (see /models)`);
+
+  let discovered = [];
+  try {
+    discovered = rankDiscoveredModels(await listOpenAiModels(signal));
+  } catch (error) {
+    // A gateway that hides /models is common. Fall back to the operator's own
+    // list, then to the built-in candidates, instead of failing outright.
+    console.error('[ai] model discovery failed:', error.message);
+  }
+
+  const candidates = [
+    // Only carry the in-memory pick over when it belongs to THIS endpoint;
+    // otherwise a model that worked for a previous base URL is probed against
+    // an unrelated gateway and can even rate-limit the real candidates.
+    ...(autoModelState.key === key && autoModelState.model ? [autoModelState.model] : []),
+    ...discovered,
+    ...configuredFallbackModels(),
+  ].filter((model, index, list) => model && list.indexOf(model) === index);
+
+  // Try the models this key is known to work with first: a restart should not
+  // spend dozens of probes rediscovering a model that already answered.
+  const persisted = await loadModelCache();
+  const remembered = persisted?.[cacheKey(key)] ?? persisted?.[key];
+  const ordered = remembered && candidates.includes(remembered)
+    ? [remembered, ...candidates.filter(model => model !== remembered)]
+    : candidates;
+
+  const rejected = [];
+  for (const model of ordered) {
+    const verdict = await probeOpenAiModel(model, signal);
+    // null is "rate limited", which is not a verdict on the model: skip it and
+    // keep looking. Probing is sequential, so this is one request at a time and
+    // will not burst the gateway the way the old 6-way fan-out did.
+    if (verdict === null) {
+      rejected.push(`${model} (rate limited)`);
+      continue;
+    }
+    if (verdict) {
+      autoModelState = { key, model, checkedAt: Date.now() };
+      // Drop any entry stored under the older, suffixed spelling of this
+      // endpoint so a stale model can never be preferred later.
+      const next = { ...persisted };
+      delete next[key];
+      next[cacheKey(key)] = model;
+      await saveModelCache(next);
+      console.error(`[ai] auto-selected model: ${model}`);
+      return model;
+    }
+    rejected.push(model);
+  }
+  const detail = rejected.length ? `tried: ${rejected.slice(0, 12).join(', ')}` : 'no models were discovered';
+  throw new Error(`AUTO could not find a working model for this key (${detail}). Set AI_MODEL explicitly, or check /models.`);
 }
 
 // Reasoning and thinking endpoints commonly reject a non-default temperature with
@@ -239,21 +344,42 @@ async function chatOpenAI(messages, key, tools, options) {
     body.tools = definitions;
     body.tool_choice = 'auto';
   }
-  debugLog('openai request', body);
-  const res = await fetch(url, {
+  const send = payload => fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
     signal: options.signal,
   });
+  debugLog('openai request', body);
+  let res = await send(body);
+  // Reasoning models (o1/o3/gpt-5) reject `max_tokens` outright. The probe
+  // already learned this and still picked the model, so the real request has to
+  // make the same accommodation or the agent stays silent on a model that is
+  // otherwise perfectly usable.
+  if (!res.ok && res.status === 400) {
+    const detail = await res.text().catch(() => '');
+    if (/max_tokens|use max_completion_tokens|unsupported_value/i.test(detail) && 'max_tokens' in body) {
+      const retryBody = { ...body };
+      delete retryBody.max_tokens;
+      retryBody.max_completion_tokens = body.max_tokens;
+      debugLog('openai retry with max_completion_tokens', retryBody);
+      res = await send(retryBody);
+    }
+  }
   if (!res.ok) {
     let endpoint = url;
     try {
       const parsed = new URL(url);
       endpoint = `${parsed.origin}${parsed.pathname}`;
     } catch {}
-    const detail = await res.text();
+    const detail = await res.text().catch(() => '');
     debugLog('openai rejected', detail);
+    // The model is unusable (gone, revoked, or not served by this key). Forget
+    // it so the next request re-discovers, otherwise AUTO would keep retrying
+    // this one model forever and the agent would stay silent.
+    if (String(CONFIG.AI_MODEL || '').trim().toUpperCase() === 'AUTO' && shouldAdvanceModel(detail)) {
+      forgetAutoModel(model);
+    }
     throw new Error(`openai ${res.status} at ${endpoint} (model=${model}): ${detail.slice(0, 300)}`);
   }
   const data = await res.json();

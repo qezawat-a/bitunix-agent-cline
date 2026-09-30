@@ -14,7 +14,7 @@ function markCooldown(trader) {
   if (trader?.state) trader.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
 }
 
-export function createTraderCommands({ client, scanner, trader, agent, tools = [], loadSession = null, saveSession = null, deleteSession = null, persistSettings = null }) {
+export function createTraderCommands({ client, scanner, trader, agent, tools = [], loadSession = null, saveSession = null, deleteSession = null, persistSettings = null, notifier = null }) {
   const scanState = { scanOn: true };
   const reportState = { reportOn: true };
   // Settings live in CONFIG in memory; without an explicit write after every
@@ -113,14 +113,25 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           const res = await client.closePosition(symbol.toUpperCase(), positionId);
           markCooldown(trader);
           await sendMessage(chatId, `Closed position: <code>${esc(JSON.stringify(res))}</code>`);
+          // Label the exit as manual so the lifecycle notification does not
+          // report it as an unexplained exchange-side close.
+          notifier?.noteClose(positionId, 'manual');
+          await notifier?.sync().catch(() => {});
           return true;
         }
         case 'close_all': {
           const [symbol, confirmation] = rest;
           if (!symbol || confirmation?.toLowerCase() !== 'confirm') return usage(chatId, 'Usage: /close_all SYMBOL confirm');
+          // Label every open position before the close-all so each exit message
+          // carries a reason.
+          const open = await client.getPendingPositions(symbol.toUpperCase()).catch(() => []);
+          for (const position of Array.isArray(open) ? open : []) {
+            notifier?.noteClose(position.positionId, 'manual');
+          }
           const res = await client.closeAllPosition(symbol.toUpperCase());
           markCooldown(trader);
           await sendMessage(chatId, `Closed all positions: <code>${esc(JSON.stringify(res))}</code>`);
+          await notifier?.sync().catch(() => {});
           return true;
         }
         case 'autotrade': {
