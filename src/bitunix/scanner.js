@@ -72,11 +72,18 @@ class Scanner {
       ? 0
       : eligible.filter(result => result.direction === direction).length;
     const timeframeQuorum = Math.max(1, Math.ceil(eligible.length / 2));
-    const timeframesAgree = alignedTimeframes >= timeframeQuorum;
     // A single qualifying timeframe used to be enough on its own, because the
     // strategy quorum then degenerated to ceil(1/2) = 1. Requiring two keeps the
     // "multi-timeframe" gate honest.
     const enoughTimeframes = eligible.length >= Math.max(1, Number(CONFIG.min_eligible_timeframes) || 1);
+    // With one eligible timeframe the majority *is* that timeframe, so the
+    // majority gate above is vacuously true and a single lone reading carries
+    // the entire signal: three timeframes silent, 5m bullish 93%, rawDirection
+    // bullish, timeframesAgree true. Agreement across timeframes means nothing
+    // below the quorum, so it is reported false rather than passing on a
+    // technicality. The count gate already blocks the trade; this also stops
+    // the report from claiming the timeframes agreed when only one spoke.
+    const timeframesAgree = enoughTimeframes && alignedTimeframes >= timeframeQuorum;
 
     const strategyAgreement = {};
     if (direction !== 'neutral') {

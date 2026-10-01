@@ -167,7 +167,24 @@ export function formatSignalReport(res) {
   if ((res.agreeingStrategies || 0) < CONFIG.min_agreeing_strategies) {
     reasons.push(`${esc(String(res.agreeingStrategies))} strategies, min_agreeing_strategies is ${esc(String(CONFIG.min_agreeing_strategies))}`);
   }
-  const gate = reasons.length ? `\n<i>HOLD because: ${reasons.join('; ')}</i>` : '\n<i>All gates passed.</i>';
+  // The timeframe-count gate is the one that decides a hold most of the time
+  // and it was missing here, so the report printed "All gates passed" next to
+  // "Direction: hold" — the only gate that had actually failed was the one
+  // nobody was shown. It is derived from the same fields the header prints, so
+  // no new field is needed to explain the hold.
+  const minTimeframes = Math.max(1, Number(CONFIG.min_eligible_timeframes) || 1);
+  if ((res.eligibleTimeframes || 0) < minTimeframes) {
+    reasons.push(`only ${esc(String(res.eligibleTimeframes))} of ${esc(String(Object.keys(res.tfSignals || {}).length))} timeframes cleared tf_min_confidence, min_eligible_timeframes is ${esc(String(minTimeframes))}`);
+  }
+  // The gate text is what the operator reads when nothing trades, so it has to
+  // agree with the direction printed above it. Deriving the verdict the same way
+  // the scanner derives it means the two cannot drift apart again.
+  const passed = res.signal === 'bullish' || res.signal === 'bearish';
+  const gate = passed
+    ? '\n<i>Tradeable.</i>'
+    : reasons.length
+      ? `\n<i>HOLD because: ${reasons.join('; ')}</i>`
+      : '\n<i>HOLD.</i>';
   return `<b>SIGNAL ${esc(res.symbol)}</b>\nDirection: <b>${esc(res.signal)}</b>`
     + ` | raw <b>${esc(String(res.rawDirection))}</b> <b>${esc(String(res.rawConfidence))}</b>%`
     + ` | tf ${esc(String(res.eligibleTimeframes))}/${esc(String(Object.keys(res.tfSignals || {}).length))}`

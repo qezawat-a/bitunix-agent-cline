@@ -1781,3 +1781,91 @@ describe('every message the bot sends is valid Telegram HTML', () => {
     for (const [i, chunk] of chunks.entries()) assertValid(chunk, `splitHtml chunk ${i}`);
   });
 });
+
+describe('the signal report explains every hold', () => {
+  // The gate that decides a hold most often — the number of timeframes that
+  // cleared tf_min_confidence — was missing from the report, so /signal printed
+  // "All gates passed" directly under "Direction: hold". A HOLD line with no
+  // reason is the one output the operator cannot act on.
+  const oneEligible = {
+    symbol: 'MOVRUSDT', signal: 'hold', rawDirection: 'bullish', rawConfidence: 93,
+    eligibleTimeframes: 1, timeframesAgree: true, alignedTimeframes: 1,
+    agreeingStrategies: 5, lastPrice: 2.4092,
+    tfSignals: {
+      '1m': { direction: 'bearish', confidence: 0, alignedWeight: 0, activeWeight: 70, strategyDirections: {} },
+      '3m': { direction: 'bearish', confidence: 18, alignedWeight: 18, activeWeight: 98, strategyDirections: {} },
+      '5m': { direction: 'bullish', confidence: 93, alignedWeight: 82, activeWeight: 88, strategyDirections: {} },
+      '15m': { direction: 'bearish', confidence: 18, alignedWeight: 18, activeWeight: 102, strategyDirections: {} },
+    },
+  };
+
+  it('names the timeframe-count gate when only one timeframe qualified', () => {
+    const html = formatSignalReport(oneEligible);
+    assert.match(html, /HOLD because/);
+    assert.match(html, /only 1 of 4 timeframes/);
+    assert.match(html, /min_eligible_timeframes is 2/);
+    assert.doesNotMatch(html, /All gates passed/, 'a hold is never "all gates passed"');
+  });
+
+  it('never claims all gates passed while the direction is hold', () => {
+    for (const over of [
+      {}, // every gate but the missing one
+      { signal: 'bearish' },
+      { signal: 'neutral' },
+    ]) {
+      const html = formatSignalReport({ ...oneEligible, ...over });
+      if (html.includes('All gates passed')) assert.notEqual(html.includes('hold'), true, JSON.stringify(over));
+    }
+  });
+
+  it('says Tradeable when the signal is a real direction', () => {
+    const html = formatSignalReport({ ...oneEligible, signal: 'bullish', tfSignals: {} });
+    assert.match(html, /Tradeable/);
+    assert.doesNotMatch(html, /HOLD because/);
+  });
+
+  it('prints every gate that actually failed', () => {
+    const html = formatSignalReport({
+      ...oneEligible,
+      rawDirection: 'neutral', rawConfidence: 40, agreeingStrategies: 0, timeframesAgree: false,
+    });
+    for (const expected of ['weighted vote is neutral', 'timeframes split', 'confidence 40 below', 'strategies', 'timeframes cleared tf_min_confidence']) {
+      assert.match(html, new RegExp(expected), `missing reason: ${expected}`);
+    }
+  });
+});
+
+describe('one lone timeframe cannot carry the whole signal', () => {
+  // ceil(1/2) === 1, so with a single eligible timeframe the majority is that
+  // timeframe: timeframesAgree came out true and rawDirection followed the one
+  // reading. Three silent timeframes, one bullish at 93%.
+  const net = (list) => list.reduce((sum, r) => sum + r.score * (r.confidence / 100), 0);
+  const quorumFor = (eligibleCount) => Math.max(1, Math.ceil(eligibleCount / 2));
+  const aligned = (list, direction) => list.filter(r => r.direction === direction).length;
+
+  it('makes the majority gate vacuous at one timeframe', () => {
+    const eligible = [{ direction: 'bullish', score: 82, confidence: 93 }];
+    const direction = net(eligible) > 0 ? 'bullish' : 'bearish';
+    assert.equal(aligned(eligible, direction) >= quorumFor(1), true,
+      'this is exactly the vacuous pass the scanner was reporting as agreement');
+  });
+
+  it('reports no agreement once the quorum is required first', () => {
+    const enoughTimeframes = (n, min = 2) => n >= Math.max(1, min);
+    const eligible = [{ direction: 'bullish', score: 82, confidence: 93 }];
+    const direction = net(eligible) > 0 ? 'bullish' : 'bearish';
+    const agrees = enoughTimeframes(eligible.length) && aligned(eligible, direction) >= quorumFor(1);
+    assert.equal(agrees, false, 'one qualifying timeframe is not multi-timeframe agreement');
+  });
+
+  it('still passes agreement at two qualifying timeframes', () => {
+    const enoughTimeframes = (n, min = 2) => n >= Math.max(1, min);
+    const eligible = [
+      { direction: 'bullish', score: 82, confidence: 93 },
+      { direction: 'bullish', score: 40, confidence: 70 },
+    ];
+    const direction = net(eligible) > 0 ? 'bullish' : 'bearish';
+    const agrees = enoughTimeframes(eligible.length) && aligned(eligible, direction) >= quorumFor(2);
+    assert.equal(agrees, true);
+  });
+});
