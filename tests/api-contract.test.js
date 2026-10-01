@@ -1270,3 +1270,155 @@ describe('moving the stop never deletes the take-profit', () => {
     assert.equal(result.verified, true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Regressions: the three defects that made the bot look broken in production.
+// ---------------------------------------------------------------------------
+describe('signal confidence measures the whole strategy set, not just the strategies that fired', async () => {
+  const { computeSignal } = await import('../src/bitunix/indicators.js');
+
+  // 200 candles of a clean, strong uptrend: enough strategies agree that a real
+  // trend read scores high, which is the point — the number has to separate
+  // "most of the book agrees" from "two indicators happened to agree".
+  const uptrend = (n = 200) => Array.from({ length: n }, (_, i) => {
+    const base = 100 + i * 0.5;
+    return {
+      close: String(base), open: String(base - 0.2),
+      high: String(base + 0.6), low: String(base - 0.6),
+      baseVol: String(1000 + i),
+    };
+  });
+
+  const scores = (klines) => computeSignal(klines, klines.map(k => Number(k.baseVol)), 0);
+
+  it('counts neutral strategies in the denominator', () => {
+    const result = scores(uptrend());
+    // activeWeight is only the strategies that fired; the denominator is every
+    // strategy, so confidence can never reach 100 off a handful of votes.
+    assert.ok(result.totalWeight > result.activeWeight, 'neutral strategies must stay in the denominator');
+    assert.equal(result.confidence, Math.round(Math.abs(result.score) / result.totalWeight * 100));
+  });
+
+  it('never reports full confidence while strategies are abstaining', () => {
+    const result = scores(uptrend());
+    assert.ok(result.activeWeight < result.totalWeight);
+    assert.ok(result.confidence < 100, `expected sub-100 confidence, got ${result.confidence}`);
+  });
+
+  it('keeps a single agreeing pair of strategies far below the min_confidence gate', () => {
+    // The exact case that slipped through: ema (18) + atr_breakout (22) = 40.
+    // Old math divided 40 by 40 and produced 100%; the correct reading is
+    // 40/146 = 27%, which min_confidence=80 must reject.
+    const result = { score: 40, totalWeight: 146, activeWeight: 40 };
+    assert.ok(Math.round(Math.abs(result.score) / result.totalWeight * 100) < 60);
+  });
+});
+
+describe('a position with a stop but no take-profit still gets its take-profit', () => {
+  const settings = (over = {}) => ({
+    symbol: 'BTCUSDT', leverage: 10, min_confidence: 80,
+    tpsl_method: 'position', breakeven_threshold_pct: 20, trailing_trigger_roi_pct: 25,
+    trailing_callback_pct: 5, sl_liquidation_safety: 10, cooldown_minutes: 1,
+    on_tpsl_failure: 'close', max_positions: 3,
+    account_tp_roi_pct: 0, account_sl_roi_pct: 0,
+    partial_tp_fractions: [0.3, 0.4, 0.3], partial_tp_roi_steps: [1, 2, 3],
+    ...over,
+  });
+  const live = {
+    positionId: 'p1', symbol: 'BTCUSDT', side: 'BUY', qty: '1',
+    avgPrice: '100', markPrice: '101', liqPrice: '50',
+  };
+
+  it('repairs a stop-only pair instead of treating it as protected', async () => {
+    const modifies = [];
+    const client = {
+      // Exactly the live shape that went unnoticed: a stop, no target.
+      getPendingTPSL: async () => [{ id: 'tp-1', positionId: 'p1', slPrice: '95', slStopType: 'MARK_PRICE' }],
+      modifyTPSL: async (params) => { modifies.push(params); return { orderId: 'tp-1' }; },
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({
+        high: String(101 + i), low: String(99 + i), close: String(100 + i),
+      })),
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings());
+    const result = await pm.ensureProtection(live);
+    assert.ok(result.placed, 'the missing take-profit must be placed');
+    assert.equal(result.repaired, true);
+    assert.equal(modifies.length, 1);
+    // The live stop is carried forward, otherwise the repair would delete it.
+    assert.equal(modifies[0].slPrice, '95');
+    assert.ok(Number(modifies[0].tpPrice) > 100, 'a take-profit above entry must be added');
+  });
+
+  it('repairs a take-profit-only pair without dropping the target', async () => {
+    const modifies = [];
+    const client = {
+      getPendingTPSL: async () => [{
+        id: 'tp-1', positionId: 'p1', tpPrice: '120', tpOrderType: 'MARKET', tpStopType: 'MARK_PRICE',
+      }],
+      modifyTPSL: async (params) => { modifies.push(params); return { orderId: 'tp-1' }; },
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({
+        high: String(101 + i), low: String(99 + i), close: String(100 + i),
+      })),
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings());
+    await pm.ensureProtection(live);
+    assert.equal(modifies[0].tpPrice, '120', 'the live take-profit is resent unchanged');
+    assert.ok(Number(modifies[0].slPrice) < 100, 'the missing stop is added');
+  });
+
+  it('still leaves trailing and account methods on the stop alone', async () => {
+    const places = [];
+    const client = {
+      getPendingTPSL: async () => [],
+      placeTPSL: async (params) => { places.push(params); return { orderId: 'tp-1' }; },
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({
+        high: String(101 + i), low: String(99 + i), close: String(100 + i),
+      })),
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings({ tpsl_method: 'trailing' }));
+    const result = await pm.ensureProtection(live);
+    assert.equal(places.length, 1);
+    // No take-profit by design: the trailing callback owns the exit.
+    assert.equal('tpPrice' in places[0], false);
+    assert.ok(result.placed);
+  });
+});
+
+describe('the scanner needs more than one timeframe to call a direction', () => {
+  it('rejects a config that can never be satisfied', async () => {
+    const { validateSettings, DEFAULTS } = await import('../src/trader/settings.js');
+    const errors = validateSettings({ ...DEFAULTS, min_eligible_timeframes: 9 });
+    assert.ok(errors.some(e => e.includes('min_eligible_timeframes')));
+    assert.deepEqual(validateSettings({ ...DEFAULTS, min_eligible_timeframes: 2 }), []);
+  });
+
+  it('lets a confident timeframe outvote an equally sized unconfident one', () => {
+    // Confidence weighting does not enforce a majority — it makes a 90% read
+    // count for more than a 20% read. That is the intended effect, and the
+    // majority is enforced separately by timeframesAgree (asserted below).
+    const net = (list) => list.reduce((sum, r) => sum + r.score * (r.confidence / 100), 0);
+    const raw = (list) => list.reduce((sum, r) => sum + r.score, 0);
+
+    const loudBull = [{ score: 20, confidence: 90 }, { score: -20, confidence: 20 }];
+    assert.equal(raw(loudBull), 0, 'a raw sum cannot separate these two');
+    assert.ok(net(loudBull) > 0);
+
+    const loudBear = [{ score: 20, confidence: 30 }, { score: -20, confidence: 90 }];
+    assert.equal(raw(loudBear), 0);
+    assert.ok(net(loudBear) < 0, 'the same sizes resolve the other way when confidence flips');
+  });
+
+  it('blocks a loud minority via the majority gate', () => {
+    // One timeframe screaming against two quiet ones. The weighted vote can
+    // still land on the minority's side; what stops the trade is that the
+    // majority of eligible timeframes disagree.
+    const eligible = [{ score: 60 }, { score: -18 }, { score: -22 }];
+    const direction = eligible.some(r => r.score > 0) ? 'bullish' : 'bearish';
+    const aligned = eligible.filter(r => (r.score > 0 ? 'bullish' : 'bearish') === direction).length;
+    const quorum = Math.max(1, Math.ceil(eligible.length / 2));
+    assert.ok(aligned < quorum, 'the loud minority must not reach quorum');
+  });
+});

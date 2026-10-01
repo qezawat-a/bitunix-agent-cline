@@ -16,6 +16,7 @@
     "min_confidence": 80,
     "tf_min_confidence": 60,
     "min_agreeing_strategies": 2,
+    "min_eligible_timeframes": 2,
     "signal_confirm_scans": 1,
     "cooldown_minutes": 5,
     "scan_interval_sec": 15,

@@ -23,7 +23,11 @@ explicitly switch with `/dryrun 0` and enable `/autotrade on` in Telegram.
 - 10 strategies: EMA trend, RSI momentum, MACD cross, volume confirmation,
   price momentum, ADX strength, Bollinger, funding-rate, Super Trend, ATR breakout
 - Multi-timeframe signal gate (`1m`, `3m`, `5m`, `15m`, `1h`): min confidence, tf confidence, agreement,
-  confirm scans, cooldown
+  minimum qualifying timeframes (`min_eligible_timeframes`), majority agreement across timeframes,
+  confirm scans, cooldown. Confidence is scored against the **whole** strategy set, so abstaining
+  strategies lower it instead of being excluded from the denominator.
+- Marketable entries: the autonomous path sends `MARKET` priced off the live mark, not a `LIMIT`
+  resting at the scanner's last price, so a position (and therefore its TP/SL) exists immediately
 - Dynamic ATR-based TP/SL, breakeven, trailing, liquidation-distance guard
 - All four Bitunix TP/SL methods via `tpsl_method`: `position` (all-in/all-out),
   `partial` (staged closes at `partial_tp_fractions` / `partial_tp_roi_steps`),

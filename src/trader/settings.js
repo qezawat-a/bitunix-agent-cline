@@ -10,6 +10,7 @@ export const DEFAULTS = {
   min_confidence: 80,
   tf_min_confidence: 60,
   min_agreeing_strategies: 2,
+  min_eligible_timeframes: 2,
   signal_confirm_scans: 1,
   cooldown_minutes: 5,
   max_positions: 3,
@@ -74,6 +75,7 @@ const SETTING_KEY_SET = new Set(SETTING_KEYS);
 const INTEGER_KEYS = new Set([
   'leverage',
   'min_agreeing_strategies',
+  'min_eligible_timeframes',
   'signal_confirm_scans',
   'cooldown_minutes',
   'max_positions',
@@ -182,6 +184,7 @@ export function validateSettings(s) {
   addRangeError(errors, 'min_confidence', s.min_confidence, 0, 100);
   addRangeError(errors, 'tf_min_confidence', s.tf_min_confidence, 0, 100);
   addRangeError(errors, 'min_agreeing_strategies', s.min_agreeing_strategies, 1, 100, true);
+  addRangeError(errors, 'min_eligible_timeframes', s.min_eligible_timeframes, 1, 20, true);
   addRangeError(errors, 'signal_confirm_scans', s.signal_confirm_scans, 1, 100, true);
   addRangeError(errors, 'cooldown_minutes', s.cooldown_minutes, 0, 1440, true);
   addRangeError(errors, 'max_positions', s.max_positions, 1, 100, true);
@@ -242,6 +245,11 @@ export function validateSettings(s) {
     // min_agreeing_strategies counts strategies, not timeframes. Ten strategies are implemented.
     if (validNumber(s.min_agreeing_strategies) && s.min_agreeing_strategies > 10) {
       errors.push('min_agreeing_strategies cannot exceed 10');
+    }
+    // Asking for more qualifying timeframes than are configured can never be
+    // satisfied, which looks exactly like "the scanner stopped working".
+    if (Number.isInteger(s.min_eligible_timeframes) && s.min_eligible_timeframes > s.timeframes.length) {
+      errors.push(`min_eligible_timeframes (${s.min_eligible_timeframes}) cannot exceed the number of timeframes (${s.timeframes.length})`);
     }
   } else {
     errors.push('timeframes must be a non-empty array');

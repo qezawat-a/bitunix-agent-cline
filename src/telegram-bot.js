@@ -130,9 +130,17 @@ export async function setCommands() {
 
 export function formatSignalReport(res) {
   const tfRows = Object.entries(res.tfSignals || {})
-    .map(([tf, s]) => `${esc(tf)}: ${esc(s.direction)} <code>${esc(String(s.confidence))}</code>`)
+    .map(([tf, s]) => `${esc(tf)}: ${esc(s.direction)} <code>${esc(String(s.confidence))}</code>% <code>${esc(String(s.score))}</code> <code>${esc(String(s.activeWeight))}/${esc(String(s.totalWeight))}</code>w`)
     .join('\n');
-  return `<b>SIGNAL ${esc(res.symbol)}</b>\nDirection: <b>${esc(res.signal)}</b> | Confidence: <b>${esc(String(res.confidence))}</b>\nPrice: <code>${esc(String(res.lastPrice ?? '-'))}</code>\n${tfRows}`;
+  // The gates that rejected the signal are printed on purpose: "hold" with no
+  // reason is indistinguishable from a broken scanner.
+  const reasons = [];
+  if (res.rawDirection === 'neutral') reasons.push('weighted vote is neutral');
+  if (!res.timeframesAgree) reasons.push(`timeframes disagree ${esc(String(res.alignedTimeframes))}/${esc(String(res.eligibleTimeframes))}`);
+  if ((res.confidence || 0) < 1 && res.rawConfidence) reasons.push(`confidence ${esc(String(res.rawConfidence))} below min`);
+  if ((res.agreeingStrategies || 0) < 2) reasons.push(`only ${esc(String(res.agreeingStrategies))} strategy/strategies agree`);
+  const gate = reasons.length ? `\nHOLD because: ${reasons.join('; ')}` : '';
+  return `<b>SIGNAL ${esc(res.symbol)}</b>\nDirection: <b>${esc(res.signal)}</b> | Confidence: <b>${esc(String(res.confidence))}</b>\nPrice: <code>${esc(String(res.lastPrice ?? '-'))}</code>\n${tfRows}${gate}`;
 }
 
 export { esc };

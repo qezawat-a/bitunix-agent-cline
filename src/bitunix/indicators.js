@@ -296,7 +296,18 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
   add('atr_breakout', atrBreakout(highs, lows, closes, 20, 14, 0.5));
 
   const score = Object.values(contributions).reduce((sum, value) => sum + value, 0);
-  const totalWeight = Object.values(contributions).reduce((sum, value) => sum + Math.abs(value), 0);
+  // Confidence is measured against the weight of the WHOLE strategy set, never
+  // against the weight of the strategies that happened to fire. The old
+  // denominator was sum(|contributions|), i.e. only the non-neutral strategies,
+  // so any two agreeing strategies divided by themselves and reported 100%
+  // confidence: ema (18) + atr_breakout (22) scored 40 out of 40 — a real
+  // agreement of 27% of the 146 available points. That made min_confidence and
+  // tf_min_confidence inert, fed strength=1 into atrMultiples (tightest stop,
+  // furthest target on the weakest signal) and made reversal_confidence
+  // unreachable. The neutral strategies are the abstentions that make the
+  // number meaningful, so they stay in the denominator.
+  const totalWeight = Object.values(weights).reduce((sum, value) => sum + value, 0);
+  const activeWeight = Object.values(contributions).reduce((sum, value) => sum + Math.abs(value), 0);
   const direction = score > 0 ? 'bullish' : score < 0 ? 'bearish' : 'neutral';
   const confidence = direction === 'neutral' || totalWeight === 0 ? 0 : Math.min(100, Math.round(Math.abs(score) / totalWeight * 100));
   return {
@@ -307,6 +318,10 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
     agreeingStrategies: Object.values(strategyDirections).filter(value => value === direction).length,
     signals: strategyDirections,
     score,
+    // Exposed so the scanner report can show how much of the strategy set
+    // actually voted, instead of a confidence number that hides the abstentions.
+    activeWeight,
+    totalWeight,
     atr: atr(highs, lows, closes, 14),
     last,
     rsi: rsiValue,

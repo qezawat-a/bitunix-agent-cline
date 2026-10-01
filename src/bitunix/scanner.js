@@ -58,8 +58,26 @@ class Scanner {
       if (result.confidence >= CONFIG.tf_min_confidence && result.direction !== 'neutral') eligible.push(result);
     }
 
-    const net = eligible.reduce((sum, result) => sum + result.score, 0);
+    // Weight each timeframe by its own confidence instead of summing raw scores.
+    // A raw sum let one loud timeframe outvote two quieter ones pointing the
+    // other way, and it treated "60% sure" and "95% sure" as equally loud.
+    const net = eligible.reduce((sum, result) => sum + result.score * (result.confidence / 100), 0);
     const direction = net > 0 ? 'bullish' : net < 0 ? 'bearish' : 'neutral';
+
+    // A weighted vote still lets a minority of timeframes win, so the direction
+    // additionally has to be the majority of the eligible timeframes. Previously
+    // directionCounts was computed and then never read, so one timeframe
+    // screaming against three quiet ones was indistinguishable from agreement.
+    const alignedTimeframes = direction === 'neutral'
+      ? 0
+      : eligible.filter(result => result.direction === direction).length;
+    const timeframeQuorum = Math.max(1, Math.ceil(eligible.length / 2));
+    const timeframesAgree = alignedTimeframes >= timeframeQuorum;
+    // A single qualifying timeframe used to be enough on its own, because the
+    // strategy quorum then degenerated to ceil(1/2) = 1. Requiring two keeps the
+    // "multi-timeframe" gate honest.
+    const enoughTimeframes = eligible.length >= Math.max(1, Number(CONFIG.min_eligible_timeframes) || 1);
+
     const strategyAgreement = {};
     if (direction !== 'neutral') {
       for (const name of Object.keys(eligible[0]?.strategyDirections || {})) {
@@ -79,6 +97,8 @@ class Scanner {
       ? eligible.reduce((sum, result) => sum + result.confidence, 0) / eligible.length
       : 0;
     const passes = direction !== 'neutral'
+      && timeframesAgree
+      && enoughTimeframes
       && averageConfidence >= CONFIG.min_confidence
       && agreeingStrategies >= CONFIG.min_agreeing_strategies;
 
@@ -103,6 +123,8 @@ class Scanner {
       rawConfidence: Math.round(averageConfidence),
       agreeingStrategies,
       strategyAgreement,
+      timeframesAgree,
+      alignedTimeframes,
       lastPrice,
       tfSignals,
       directionCounts,
