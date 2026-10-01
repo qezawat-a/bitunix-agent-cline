@@ -10,6 +10,25 @@ import {
   normalizeMethod,
 } from './tpsl.js';
 
+function finiteNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+// The size a pending TP/SL row will close: the take-profit side if it has one,
+// otherwise the stop side. Returns null when the row carries no quantity at all,
+// which is what a position-level pair looks like.
+function legQuantity(row) {
+  for (const value of [row?.tpQty, row?.slQty]) {
+    const number = finiteNumber(value);
+    if (number !== null && number > 0) return number;
+  }
+  return null;
+}
+
+const positionQtyOf = (position) => position?.qty ?? position?.size ?? null;
+
 export class PositionManager {
   client;
   settings;
@@ -157,30 +176,42 @@ export class PositionManager {
   // True for an order-level row that only closes part of the position, i.e. one
   // of the legs placeTPSLOrder created (method 2).
   //
-  // The test is deliberately "carries a positive quantity" rather than "tpQty
-  // is absent". TpslPendingOrderResp always serialises tpQty/slQty, and the
-  // exchange sends `null` — and sometimes `"0"` — for a position-level pair
-  // instead of omitting the key. Comparing against `undefined` therefore
-  // classified EVERY row as a partial leg, so the position-level pair was never
-  // found: the live take-profit and the live stop both read as absent. The
-  // visible result was a break-even that re-fired on every tick, reported
-  // "Break-even stop" each time, and deleted the take-profit it could not see
-  // (modify_order replaces the whole pair). A positive quantity is the only
-  // reliable marker of a ladder leg.
-  isPartialLeg(row) {
-    return finitePositive(row?.tpQty) || finitePositive(row?.slQty);
+  // Both kinds of row come back from the SAME pending endpoint, so a carried
+  // quantity cannot be read as "this is a leg" on its own: a position-level
+  // pair carries tpQty/slQty too, set to the whole position it will close. A
+  // live long (qty 5.86, take-profit and stop at the entry) was therefore
+  // classified as a ladder leg, positionTPSL() matched nothing and returned
+  // null, and currentStop() saw no stop at all. The "already at break-even"
+  // check could never match, so break-even re-fired on every manage tick and
+  // re-sent the same "Break-even stop SL -> entry" the position had reached
+  // minutes earlier.
+  //
+  // Size is what separates them: a leg closes less than the position, a
+  // position-level row covers all of it. A row carrying no quantity at all is
+  // position-level, since placePositionTPSL has no quantity parameter.
+  isPartialLeg(row, positionQty = null) {
+    const leg = legQuantity(row);
+    if (leg === null) return false;
+    const total = finiteNumber(positionQty);
+    // With no position size to compare against there is nothing to go on, so
+    // keep the conservative reading and treat a quantity as a ladder leg.
+    if (total === null || total <= 0) return true;
+    // The tolerance covers the exchange rounding the quantity to its own
+    // precision: the position-level row and the position are the same number
+    // written at different precisions, not two different closes.
+    return leg < total * 0.999;
   }
 
   // The position-level TP/SL row for a position, i.e. the all-in/all-out pair
   // placeTPSL/modifyTPSL own. Partial (method 2) legs are order-level rows
   // carrying tpQty/slQty and are deliberately not matched here: they are moved
   // through modifyTPSLOrder keyed by their own id, never by positionId.
-  async positionTPSL(positionId) {
+  async positionTPSL(positionId, positionQty = null) {
     const key = String(positionId);
     const pending = await this.loadPendingTPSL();
     return pending.find(item => (
       String(item.positionId) === key
-      && !this.isPartialLeg(item)
+      && !this.isPartialLeg(item, positionQty)
     )) || null;
   }
 
@@ -202,7 +233,7 @@ export class PositionManager {
     return {
       tp: finitePositive(positionTp) || rows.some(item => finitePositive(item.tpPrice)),
       sl: finitePositive(positionSl) || rows.some(item => finitePositive(item.slPrice ?? item.stopPrice)),
-      row: rows.find(item => !this.isPartialLeg(item)) || null,
+      row: rows.find(item => !this.isPartialLeg(item, positionQtyOf(position))) || null,
       rows,
     };
   }
@@ -210,12 +241,12 @@ export class PositionManager {
   // Write a just-moved stop back into the tick cache. Without this, a second
   // check in the same tick (break-even, then trailing) would still read the
   // pre-move stop and send a modify that moves the stop backwards.
-  recordStopMove(positionId, params) {
+  recordStopMove(positionId, params, positionQty = null) {
     if (!this.tpslCache || !finitePositive(Number(params?.slPrice))) return;
     const key = String(positionId);
     const index = this.tpslCache.findIndex(item => (
       String(item.positionId) === key
-      && !this.isPartialLeg(item)
+      && !this.isPartialLeg(item, positionQty)
     ));
     if (index < 0) return;
     this.tpslCache[index] = { ...this.tpslCache[index], slPrice: params.slPrice, slStopType: params.slStopType };
@@ -428,7 +459,7 @@ export class PositionManager {
     const value = position.slPrice ?? position.stopPrice ?? position.stopLossPrice;
     const stop = Number(value);
     if (finitePositive(stop)) return stop;
-    const tpsl = await this.positionTPSL(position.positionId);
+    const tpsl = await this.positionTPSL(position.positionId, positionQtyOf(position));
     const pendingStop = Number(tpsl?.slPrice ?? tpsl?.stopPrice);
     return finitePositive(pendingStop) ? pendingStop : null;
   }
@@ -448,14 +479,14 @@ export class PositionManager {
       const current = await this.currentStop(position);
       if (current && position.side === 'BUY' && entry <= current) return { skipped: 'stop already favorable' };
       if (current && position.side === 'SELL' && entry >= current) return { skipped: 'stop already favorable' };
-      const result = await this.moveSLToEntry(position.positionId, entry);
+      const result = await this.moveSLToEntry(position.positionId, entry, positionQtyOf(position));
       this.reportStopMove?.(position, 'breakeven', entry);
       return { ...result, slPrice: formatPrice(entry) };
     }
     return { skipped: 'threshold not reached' };
   }
 
-  async moveSLToEntry(positionId, entryPrice) {
+  async moveSLToEntry(positionId, entryPrice, positionQty = null) {
     const quotePrecision = await this.getQuotePrecision();
     // /tpsl/position/modify_order takes only symbol, positionId, the tp*/sl*
     // trigger prices and their stop types — the trigger's order type is not a
@@ -469,7 +500,7 @@ export class PositionManager {
     // tick because the stop read came from a field the position payload does
     // not have. The existing take-profit is therefore read back and resent
     // alongside the new stop, so only the stop moves.
-    const existing = await this.positionTPSL(positionId);
+    const existing = await this.positionTPSL(positionId, positionQty);
     const params = {
       symbol: this.symbol,
       positionId,
@@ -482,7 +513,7 @@ export class PositionManager {
       if (existing.tpOrderType) params.tpOrderType = existing.tpOrderType;
     }
     const result = await this.client.modifyTPSL(params);
-    this.recordStopMove(positionId, params);
+    this.recordStopMove(positionId, params, positionQty);
     return result;
   }
 
@@ -496,20 +527,20 @@ export class PositionManager {
       const newSL = position.side === 'BUY' ? mark - trailDistance : mark + trailDistance;
       const current = await this.currentStop(position);
       if (!finitePositive(newSL) || !this.shouldTighten(position, newSL, current)) return { skipped: 'trailing would loosen stop' };
-      const result = await this.updateTrailingSL(position.positionId, newSL);
+      const result = await this.updateTrailingSL(position.positionId, newSL, positionQtyOf(position));
       this.reportStopMove?.(position, 'trailing', newSL);
       return { ...result, slPrice: formatPrice(newSL, await this.getQuotePrecision()) };
     }
     return { skipped: 'threshold not reached' };
   }
 
-  async updateTrailingSL(positionId, newSL) {
+  async updateTrailingSL(positionId, newSL, positionQty = null) {
     // See moveSLToEntry: no slOrderType — it is not a documented parameter of
     // /tpsl/position/modify_order.
     // The existing take-profit is carried forward for the same reason as in
     // moveSLToEntry: this endpoint replaces the pair, so omitting tpPrice would
     // delete the live take-profit on every trailing step.
-    const existing = await this.positionTPSL(positionId);
+    const existing = await this.positionTPSL(positionId, positionQty);
     const params = {
       symbol: this.symbol,
       positionId,
@@ -522,7 +553,7 @@ export class PositionManager {
       if (existing.tpOrderType) params.tpOrderType = existing.tpOrderType;
     }
     const result = await this.client.modifyTPSL(params);
-    this.recordStopMove(positionId, params);
+    this.recordStopMove(positionId, params, positionQty);
     return result;
   }
 

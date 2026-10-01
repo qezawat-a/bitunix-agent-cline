@@ -1264,6 +1264,63 @@ describe('moving the stop never deletes the take-profit', () => {
   // every row look like a ladder leg, so positionTPSL() matched nothing: the
   // live take-profit and the live stop both read as absent, break-even re-fired
   // on every tick, and each modify deleted the take-profit it could not see.
+  // A position-level pair is NOT identified by an absent tpQty/slQty. Both kinds
+  // of row come back from the same pending endpoint and the position-level row
+  // carries the FULL position quantity in tpQty/slQty. A live long (qty 5.86,
+  // stop already parked at the entry) therefore matched nothing, currentStop()
+  // saw no stop, and break-even re-fired on every tick forever — reported as
+  // "Break-even stop SL -> 2.2685" dozens of times for one position.
+  it('treats a row whose tpQty/slQty equal the position as the position-level pair', async () => {
+    const modifies = [];
+    const client = {
+      // slPrice 100 == the entry: the stop is already at break-even.
+      getPendingTPSL: async () => [{ ...pendingWithTP[0], tpQty: '1', slQty: '1', slPrice: '100' }],
+      modifyTPSL: async (params) => { modifies.push(params); return { orderId: 'tp-1' }; },
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings({ breakeven_threshold_pct: 5 }));
+    const result = await pm.checkBreakeven({ ...live, markPrice: '101' });
+    assert.equal(result.skipped, 'stop already favorable', 'must read the live stop, not re-send the move');
+    assert.equal(modifies.length, 0, 'a satisfied break-even must not touch the exchange');
+  });
+
+  it('still recognises a genuine ladder leg as partial when it covers less than the position', async () => {
+    const modifies = [];
+    const client = {
+      // slQty 0.3 < qty 1: a real partial leg, so the position-level row below
+      // is the one that must be found and its stop read.
+      getPendingTPSL: async () => [
+        { id: 'leg-1', positionId: 'p1', tpPrice: '105', slPrice: '90', tpQty: '0.3', slQty: '0.3' },
+        { ...pendingWithTP[0], tpQty: '1', slQty: '1', slPrice: '100' },
+      ],
+      modifyTPSL: async (params) => { modifies.push(params); return { orderId: 'tp-1' }; },
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings({ breakeven_threshold_pct: 5 }));
+    const result = await pm.checkBreakeven({ ...live, markPrice: '101' });
+    assert.equal(result.skipped, 'stop already favorable', 'the position-level row, not the leg, carries the stop');
+    assert.equal(modifies.length, 0);
+  });
+
+  it('never sends a take-profit from a ladder leg onto the position-level pair', async () => {
+    const modifies = [];
+    const client = {
+      getPendingTPSL: async () => [
+        // Only a partial leg exists, and its take-profit is much closer than the
+        // ladder's real target. Reading it here would rewrite the position's
+        // take-profit 20% closer on the next stop move.
+        { id: 'leg-1', positionId: 'p1', tpPrice: '105', slPrice: '90', tpQty: '0.3', slQty: '0.3' },
+        { ...pendingWithTP[0], tpQty: '1', slQty: '1', slPrice: '95' },
+      ],
+      modifyTPSL: async (params) => { modifies.push(params); return { orderId: 'tp-1' }; },
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings({ breakeven_threshold_pct: 5 }));
+    await pm.checkBreakeven({ ...live, markPrice: '101' });
+    assert.equal(modifies.length, 1);
+    assert.equal(modifies[0].tpPrice, '120', 'the position-level take-profit, not the leg at 105');
+  });
+
   for (const empty of [null, '0', '', undefined]) {
     it(`treats tpQty/slQty ${JSON.stringify(empty)} as a position-level pair, not a ladder leg`, async () => {
       const modifies = [];
