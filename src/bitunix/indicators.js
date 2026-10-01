@@ -2,6 +2,14 @@ function validSeries(values) {
   return Array.isArray(values) && values.every(value => Number.isFinite(value));
 }
 
+// How much of the strategy set must express a view before its agreement is
+// taken at face value. Below this, agreement is scaled down proportionally:
+// two strategies that happen to agree are 100% of themselves but only a
+// fraction of the book, and must not read as a high-confidence signal.
+// 0.4 of 146 is ~58 points — ema + atr_breakout (40) falls short, while any
+// five strategies clear it.
+const STRATEGY_BREADTH_FLOOR = 0.4;
+
 function alignedEma(values, period) {
   if (!validSeries(values) || period < 1 || values.length < period) return [];
   const output = new Array(values.length).fill(null);
@@ -295,10 +303,36 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
   add('supertrend', superTrend(highs, lows, closes, 10, 3) || 'neutral');
   add('atr_breakout', atrBreakout(highs, lows, closes, 20, 14, 0.5));
 
-  const score = Object.values(contributions).reduce((sum, value) => sum + value, 0);
-  const totalWeight = Object.values(contributions).reduce((sum, value) => sum + Math.abs(value), 0);
+  const contributions_ = Object.values(contributions);
+  const alignedWeight = contributions_.reduce((sum, value) => sum + (value > 0 ? value : 0), 0);
+  const opposedWeight = contributions_.reduce((sum, value) => sum + (value < 0 ? -value : 0), 0);
+  const score = alignedWeight - opposedWeight;
+  // Confidence answers two different questions that used to be collapsed into
+  // one number, and collapsing them is what broke the gate twice.
+  //
+  //   agreement — of the strategies that expressed a view, how many back the
+  //               winning direction? (alignedWeight / activeWeight)
+  //   breadth   — how much of the strategy set spoke at all? (activeWeight /
+  //               totalWeight)
+  //
+  // Dividing by activeWeight alone is why two strategies used to report 100%
+  // confidence, and dividing by totalWeight alone is why the scanner went
+  // permanently silent: funding almost never fires, adx is muted below 25,
+  // bollinger needs a band pierce and volume needs a 15% spike, so the honest
+  // ceiling of a strong trend is roughly 82/146 = 56% — which a
+  // min_confidence of 80 can never reach, at any leverage, on any pair.
+  //
+  // So agreement is the headline number, and breadth scales it down until
+  // enough of the book has actually voted. A lone pair of strategies can no
+  // longer buy a high score, and a broad consensus reads as the 100% it is.
+  const totalWeight = Object.values(weights).reduce((sum, value) => sum + value, 0);
+  const activeWeight = alignedWeight + opposedWeight;
   const direction = score > 0 ? 'bullish' : score < 0 ? 'bearish' : 'neutral';
-  const confidence = direction === 'neutral' || totalWeight === 0 ? 0 : Math.min(100, Math.round(Math.abs(score) / totalWeight * 100));
+  const agreement = direction === 'neutral' || activeWeight === 0 ? 0 : alignedWeight / activeWeight;
+  const breadth = totalWeight === 0 ? 0 : activeWeight / totalWeight;
+  const confidence = direction === 'neutral' || totalWeight === 0
+    ? 0
+    : Math.min(100, Math.round(agreement * Math.min(1, breadth / STRATEGY_BREADTH_FLOOR) * 100));
   return {
     confidence,
     direction,
@@ -307,6 +341,14 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
     agreeingStrategies: Object.values(strategyDirections).filter(value => value === direction).length,
     signals: strategyDirections,
     score,
+    alignedWeight,
+    opposedWeight,
+    agreement: Math.round(agreement * 100),
+    breadth: Math.round(breadth * 100),
+    // Exposed so the scanner report can show how much of the strategy set
+    // actually voted, instead of a confidence number that hides the abstentions.
+    activeWeight,
+    totalWeight,
     atr: atr(highs, lows, closes, 14),
     last,
     rsi: rsiValue,

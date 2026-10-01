@@ -84,7 +84,10 @@ export async function sendMessage(chatId, html) {
 
 export function isOwner(msg) {
   const id = msg?.from?.id ?? msg?.chat?.id;
-  return String(id) === String(CONFIG.ALLOWED_USER_ID);
+  // Both sides are trimmed: ALLOWED_USER_ID is often pasted into a host's env
+  // dashboard, where a trailing space survives into process.env and turns every
+  // message from the real owner into a silent non-match.
+  return String(id).trim() === String(CONFIG.ALLOWED_USER_ID ?? '').trim();
 }
 
 export async function setCommands() {
@@ -130,9 +133,29 @@ export async function setCommands() {
 
 export function formatSignalReport(res) {
   const tfRows = Object.entries(res.tfSignals || {})
-    .map(([tf, s]) => `${esc(tf)}: ${esc(s.direction)} <code>${esc(String(s.confidence))}</code>`)
+    .map(([tf, s]) => `${esc(tf)}: ${esc(s.direction)} <code>${esc(String(s.confidence))}</code>% `
+      + `<code>${esc(String(s.alignedWeight))}</code>/<code>${esc(String(s.activeWeight))}</code>w `
+      + `(${[...(s.strategyDirections || {})].filter(d => d === s.direction).length}/10)`)
     .join('\n');
-  return `<b>SIGNAL ${esc(res.symbol)}</b>\nDirection: <b>${esc(res.signal)}</b> | Confidence: <b>${esc(String(res.confidence))}</b>\nPrice: <code>${esc(String(res.lastPrice ?? '-'))}</code>\n${tfRows}`;
+  // The gates that rejected the signal are printed on purpose: "hold" with no
+  // reason is indistinguishable from a broken scanner.
+  const reasons = [];
+  if (res.rawDirection === 'neutral') reasons.push('weighted vote is neutral');
+  if (!res.timeframesAgree) reasons.push(`timeframes split ${esc(String(res.alignedTimeframes))}/${esc(String(res.eligibleTimeframes))}`);
+  // res.confidence is 0 for a rejected signal, so the raw reading is what has
+  // to be compared against the gate — reporting the 0 is what made a healthy
+  // scanner look dead.
+  if ((res.rawConfidence || 0) < CONFIG.min_confidence) {
+    reasons.push(`confidence ${esc(String(res.rawConfidence))} < min_confidence ${esc(String(CONFIG.min_confidence))}`);
+  }
+  if ((res.agreeingStrategies || 0) < CONFIG.min_agreeing_strategies) {
+    reasons.push(`${esc(String(res.agreeingStrategies))} strategies < min_agreeing_strategies ${esc(String(CONFIG.min_agreeing_strategies))}`);
+  }
+  const gate = reasons.length ? `\n<i>HOLD because: ${reasons.join('; ')}</i>` : '\n<i>All gates passed.</i>';
+  return `<b>SIGNAL ${esc(res.symbol)}</b>\nDirection: <b>${esc(res.signal)}</b>`
+    + ` | raw <b>${esc(String(res.rawDirection))}</b> <b>${esc(String(res.rawConfidence))}</b>%`
+    + ` | tf ${esc(String(res.eligibleTimeframes))}/${esc(String(Object.keys(res.tfSignals || {}).length))}`
+    + ` | strategies <b>${esc(String(res.agreeingStrategies))}</b>\nPrice: <code>${esc(String(res.lastPrice ?? '-'))}</code>\n${tfRows}${gate}`;
 }
 
 export { esc };

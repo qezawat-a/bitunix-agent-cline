@@ -82,6 +82,10 @@ export const CONFIG = {
   min_confidence: Number(S('min_confidence', 80)),
   tf_min_confidence: Number(S('tf_min_confidence', 60)),
   min_agreeing_strategies: Number(S('min_agreeing_strategies', 2)),
+  // How many timeframes must independently clear tf_min_confidence before a
+  // direction is tradeable. Without it a single qualifying timeframe carried
+  // the whole signal on its own.
+  min_eligible_timeframes: Number(S('min_eligible_timeframes', 2)),
   signal_confirm_scans: Number(S('signal_confirm_scans', 1)),
   cooldown_minutes: Number(S('cooldown_minutes', 5)),
   max_positions: Number(S('max_positions', 3)),
@@ -120,7 +124,7 @@ export const CONFIG = {
 
 const FILE_TRADER_KEYS = new Set([
   'symbol', 'leverage', 'position_type', 'timeframes', 'margin_amount_pct', 'margin_risk_pct',
-  'min_confidence', 'tf_min_confidence', 'min_agreeing_strategies', 'signal_confirm_scans',
+  'min_confidence', 'tf_min_confidence', 'min_agreeing_strategies', 'min_eligible_timeframes', 'signal_confirm_scans',
   'cooldown_minutes', 'max_positions', 'position_mode', 'scan_interval_sec', 'guard_interval_sec',
   'breakeven_threshold_pct', 'trailing_trigger_roi_pct', 'sl_liquidation_safety', 'on_tpsl_failure', 'reversal_enabled', 'reversal_confidence',
   'report_interval_sec', 'mid_manage_interval_sec', 'order_unit', 'position_sizing_margin_pct',

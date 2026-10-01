@@ -124,46 +124,105 @@ async function main() {
 
   await setCommands().catch(() => {});
 
+  // Telegram answers getUpdates with 409 "can't use getUpdates method while
+  // webhook is active" whenever a webhook is registered for this bot — which is
+  // what a second integration, or an earlier deploy of one, leaves behind.
+  // sendMessage is unaffected by a webhook, so in that state the bot carries on
+  // pushing notifications while ignoring every command and message: exactly the
+  // "the agent never answers" symptom, with nothing in the chat to explain it.
+  // Clearing the webhook at boot makes long polling the single source of truth.
+  async function clearWebhook() {
+    if (!CONFIG.TELEGRAM_BOT_TOKEN) return;
+    try {
+      const res = await fetch(`https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/deleteWebhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // Keep the backlog: a command sent while the bot was redeploying should
+        // still be answered rather than silently dropped.
+        body: JSON.stringify({ drop_pending_updates: false }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const data = await res.json().catch(() => null);
+      if (data?.ok === false) console.error('[telegram] deleteWebhook refused:', data.description || 'unknown error');
+      else console.log('[telegram] webhook cleared; polling getUpdates');
+    } catch (error) {
+      console.error('[telegram] deleteWebhook failed:', error.message);
+    }
+  }
+  await clearWebhook();
+
   let offset = 0;
   let pollTimer = null;
+  // A poll failure used to be a console.error nobody could see, so the bot
+  // stayed deaf while looking perfectly healthy from Telegram. Report it to the
+  // owner — at most once per distinct error every five minutes — so "the bot
+  // does not answer" is diagnosable from the chat itself.
+  let lastPollNoticeAt = 0;
+  let lastPollNoticeText = '';
+  async function reportPollFailure(message) {
+    if (!CONFIG.ALLOWED_USER_ID) return;
+    const now = Date.now();
+    if (message === lastPollNoticeText && now - lastPollNoticeAt < 300000) return;
+    lastPollNoticeAt = now;
+    lastPollNoticeText = message;
+    await sendMessage(CONFIG.ALLOWED_USER_ID, `⚠️ <b>Telegram polling failed</b>\n<code>${esc(message)}</code>\nMessages and commands will not reach the bot until this clears.`).catch(() => {});
+  }
+
   async function persistAgentSession(chatId) {
     try { await saveSession(String(chatId), { history: agent.history }); } catch (error) { console.error('session save error:', error.message); }
   }
+
+  // One answered message. agent.say() is wrapped because a thrown turn used to
+  // vanish into the console — the sender saw nothing at all, which is
+  // indistinguishable from a bot that is offline.
+  async function answer(chatId, text) {
+    try {
+      const reply = await agent.say(text);
+      await sendMessage(chatId, esc(reply?.content || 'ok'));
+    } catch (error) {
+      console.error('agent turn error:', error.message);
+      await sendMessage(chatId, `⚠️ Agent error: <code>${esc(error.message || String(error))}</code>`).catch(() => {});
+    }
+    await persistAgentSession(chatId);
+  }
+
   async function poll() {
     if (!CONFIG.TELEGRAM_BOT_TOKEN) return;
     try {
       const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/getUpdates?timeout=30&offset=${offset}`;
       const res = await fetch(url, { signal: AbortSignal.timeout(35000) });
-      if (!res.ok) throw new Error(`Telegram poll ${res.status}`);
+      if (!res.ok) throw new Error(`Telegram poll ${res.status}: ${(await res.text()).slice(0, 200)}`);
       const data = await res.json();
       for (const upd of data.result || []) {
         const msg = upd.message;
         try {
           if (msg?.text) {
             const text = msg.text.trim();
-            if (isOwner(msg)) {
-              if (text.startsWith('/')) {
-                const handled = await handleCommand(msg, text);
-                if (!handled) {
-                  const reply = await agent.say(text);
-                  await sendMessage(msg.chat.id, esc(reply?.content || 'ok'));
-                  await persistAgentSession(msg.chat.id);
-                }
-              } else {
-                const reply = await agent.say(text);
-                await sendMessage(msg.chat.id, esc(reply?.content || 'ok'));
-                await persistAgentSession(msg.chat.id);
-              }
+            if (!isOwner(msg)) {
+              // Silence here is indistinguishable from a broken bot. Echoing the
+              // sender's own numeric id back turns a wrong ALLOWED_USER_ID into a
+              // one-message fix instead of a mystery.
+              const senderId = msg.from?.id ?? msg.chat.id;
+              await sendMessage(msg.chat.id, `Not authorized.\nYour Telegram id: <code>${esc(String(senderId))}</code>\nSet ALLOWED_USER_ID to this id to control the bot.`).catch(() => {});
+            } else if (text.startsWith('/')) {
+              const handled = await handleCommand(msg, text);
+              // handleCommand reports its own errors; only the fall-through to
+              // the agent chat needs the wrapper.
+              if (!handled) await answer(msg.chat.id, text);
+            } else {
+              await answer(msg.chat.id, text);
             }
           }
         } catch (error) {
           console.error('telegram update error:', error.message);
+          await sendMessage(msg?.chat?.id || CONFIG.ALLOWED_USER_ID, `⚠️ ${esc(error.message || String(error))}`).catch(() => {});
         } finally {
           offset = Math.max(offset, upd.update_id + 1);
         }
       }
     } catch (error) {
       console.error('poll error:', error.message);
+      await reportPollFailure(error.message || String(error));
     }
     if (!stopping) pollTimer = setTimeout(poll, 1000);
   }

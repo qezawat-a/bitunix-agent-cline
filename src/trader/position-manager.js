@@ -154,6 +154,23 @@ export class PositionManager {
     }
   }
 
+  // True for an order-level row that only closes part of the position, i.e. one
+  // of the legs placeTPSLOrder created (method 2).
+  //
+  // The test is deliberately "carries a positive quantity" rather than "tpQty
+  // is absent". TpslPendingOrderResp always serialises tpQty/slQty, and the
+  // exchange sends `null` — and sometimes `"0"` — for a position-level pair
+  // instead of omitting the key. Comparing against `undefined` therefore
+  // classified EVERY row as a partial leg, so the position-level pair was never
+  // found: the live take-profit and the live stop both read as absent. The
+  // visible result was a break-even that re-fired on every tick, reported
+  // "Break-even stop" each time, and deleted the take-profit it could not see
+  // (modify_order replaces the whole pair). A positive quantity is the only
+  // reliable marker of a ladder leg.
+  isPartialLeg(row) {
+    return finitePositive(row?.tpQty) || finitePositive(row?.slQty);
+  }
+
   // The position-level TP/SL row for a position, i.e. the all-in/all-out pair
   // placeTPSL/modifyTPSL own. Partial (method 2) legs are order-level rows
   // carrying tpQty/slQty and are deliberately not matched here: they are moved
@@ -163,8 +180,31 @@ export class PositionManager {
     const pending = await this.loadPendingTPSL();
     return pending.find(item => (
       String(item.positionId) === key
-      && item.tpQty === undefined && item.slQty === undefined
+      && !this.isPartialLeg(item)
     )) || null;
+  }
+
+  // What the exchange has actually armed for a position, reported as two
+  // independent facts.
+  //
+  // They have to stay separate. ensureProtection() used to ask "is there a
+  // stop?" and treat that as "this position is protected", so a position that
+  // carried a stop-loss but no take-profit was skipped on every manage tick and
+  // never got a target — it simply had no exit that earned money, only one that
+  // capped the loss. `row` is the position-level pair (what modifyTPSL owns);
+  // `rows` also includes the order-level rows a partial ladder is made of.
+  async protectionLevels(position) {
+    const key = String(position.positionId);
+    const pending = await this.loadPendingTPSL();
+    const rows = pending.filter(item => String(item?.positionId) === key);
+    const positionTp = Number(position.tpPrice ?? position.takeProfitPrice);
+    const positionSl = Number(position.slPrice ?? position.stopPrice ?? position.stopLossPrice);
+    return {
+      tp: finitePositive(positionTp) || rows.some(item => finitePositive(item.tpPrice)),
+      sl: finitePositive(positionSl) || rows.some(item => finitePositive(item.slPrice ?? item.stopPrice)),
+      row: rows.find(item => !this.isPartialLeg(item)) || null,
+      rows,
+    };
   }
 
   // Write a just-moved stop back into the tick cache. Without this, a second
@@ -175,7 +215,7 @@ export class PositionManager {
     const key = String(positionId);
     const index = this.tpslCache.findIndex(item => (
       String(item.positionId) === key
-      && item.tpQty === undefined && item.slQty === undefined
+      && !this.isPartialLeg(item)
     ));
     if (index < 0) return;
     this.tpslCache[index] = { ...this.tpslCache[index], slPrice: params.slPrice, slStopType: params.slStopType };
@@ -343,6 +383,32 @@ export class PositionManager {
       slPrice,
       slStopType,
     });
+  }
+
+  // One half of the TP/SL pair is live and the other is missing. modifyTPSL
+  // replaces the whole pair, so the live half is read back and resent with it —
+  // otherwise adding the take-profit would delete the stop, which is the same
+  // class of bug that made break-even wipe the TP on every tick.
+  async repairProtection(position, entryPrice, direction, atr, confidence, armed) {
+    const quotePrecision = await this.getQuotePrecision();
+    const levels = this.computeTPSL(entryPrice, direction, atr, confidence, quotePrecision);
+    const existing = armed.row;
+    // Both halves are always sent: the live one verbatim, the missing one
+    // computed. modifyTPSL takes no delta — it replaces the pair — so sending
+    // only the missing half is the same bug as sending none.
+    const params = {
+      symbol: this.symbol,
+      positionId: position.positionId,
+      tpPrice: armed.tp && existing && finitePositive(existing.tpPrice) ? String(existing.tpPrice) : levels.tpPrice,
+      tpStopType: (existing && existing.tpStopType) || levels.tpStopType,
+      slPrice: armed.sl && existing && finitePositive(existing.slPrice) ? String(existing.slPrice) : levels.slPrice,
+      slStopType: (existing && existing.slStopType) || levels.slStopType,
+    };
+    if (existing?.tpOrderType) params.tpOrderType = existing.tpOrderType;
+    const result = await this.client.modifyTPSL(params);
+    // The tick cache still describes the half-armed pair we just replaced.
+    this.resetTpslCache();
+    return result;
   }
 
   favorableRoiPct(position) {
@@ -538,7 +604,16 @@ export class PositionManager {
   }
 
   async ensureProtection(position) {
-    if (await this.currentStop(position)) return { skipped: 'protection already present' };
+    const method = this.activeMethod();
+    // Method dispatch comes first because it decides what "protected" means:
+    // 'position' needs a take-profit AND a stop, 'partial' needs at least one
+    // armed target plus a stop, and 'trailing'/'account' deliberately run on the
+    // stop alone since the callback / account guard owns the exit.
+    const armed = await this.protectionLevels(position);
+    const needsTakeProfit = method === 'position' || method === 'partial';
+    if (armed.sl && (!needsTakeProfit || armed.tp)) {
+      return { skipped: 'protection already present', verified: true, armed };
+    }
     const key = String(position.positionId);
     const lastAttempt = this.protectionAttempts.get(key) || 0;
     if (Date.now() - lastAttempt < 60000) return { skipped: 'protection retry pending' };
@@ -546,9 +621,6 @@ export class PositionManager {
     const direction = position.side === 'BUY' ? 'bullish' : position.side === 'SELL' ? 'bearish' : null;
     if (!direction) throw new Error(`position ${key} has an invalid side for TP/SL`);
     try {
-      const pending = await this.loadPendingTPSL();
-      const existing = pending.find(item => String(item.positionId) === key && finitePositive(item.slPrice ?? item.stopPrice));
-      if (existing) return { verified: true, result: existing };
       const atr = await this.getAtrForPosition(position);
       const confidence = position.signalConfidence ?? this.settings.min_confidence;
       const entryPrice = Number(position.avgPrice);
@@ -557,17 +629,26 @@ export class PositionManager {
       // pair because that is the only pair that exits the whole position at
       // once, but they take the stop alone and leave the exit to the callback
       // or the account guard. 'position' keeps today's fixed TP + SL.
-      const method = this.activeMethod();
       if (method === 'partial') {
         const ladder = await this.placePartialTPSL(position, entryPrice, direction, atr, confidence);
         if (ladder.error) throw new Error(ladder.error);
+        this.resetTpslCache();
         return { placed: true, result: ladder };
       }
       if (method === 'trailing' || method === 'account') {
         const result = await this.placeTPSLStop(position.positionId, entryPrice, direction, atr, confidence);
+        this.resetTpslCache();
         return { placed: true, result, method };
       }
+      // A half-armed pair is repaired rather than duplicated: place_order on an
+      // already-protected position is at best a no-op and at worst a second
+      // competing target, while modifyTPSL is the endpoint that owns the pair.
+      if (armed.tp !== armed.sl) {
+        const result = await this.repairProtection(position, entryPrice, direction, atr, confidence, armed);
+        return { placed: true, result, repaired: true };
+      }
       const result = await this.placeTPSL(position.positionId, entryPrice, direction, atr, confidence);
+      this.resetTpslCache();
       return { placed: true, result };
     } catch (error) {
       if (this.settings.on_tpsl_failure === 'close') {

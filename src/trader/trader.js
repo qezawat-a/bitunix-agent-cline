@@ -196,8 +196,16 @@ export class Trader {
     try {
       await this.reconcilePositions();
       if (this.state.positions.length >= CONFIG.max_positions) return { executed: false, reason: 'max_positions' };
-      const entryPrice = Number(signal.lastPrice);
-      if (!validPositive(entryPrice)) throw new Error('scanner returned an invalid entry price');
+      if (!validPositive(Number(signal.lastPrice))) throw new Error('scanner returned an invalid entry price');
+      let entryPrice = Number(signal.lastPrice);
+      // A market entry is protected against the live mark rather than the
+      // scanner's last trade, so the ATR levels sit where the fill will land.
+      try {
+        entryPrice = await this.fetchMarkPrice(symbol);
+      } catch {
+        // Keep the scanner price. The entry is still marketable and the manage
+        // pass re-derives protection from the real fill price.
+      }
       const atr = signal.tfSignals?.[CONFIG.timeframes[0]]?.atr ?? null;
       const order = await this.openPosition(symbol, entryPrice, signal.signal, atr, signal.confidence);
       return { ...signal, executed: true, order, price: entryPrice };
@@ -231,19 +239,26 @@ export class Trader {
     this.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
     this.state.confirmations.delete(symbol);
 
-    const { qty, pair } = await this.computePositionSize(entryPrice, 'LIMIT');
+    const { qty, pair } = await this.computePositionSize(entryPrice, 'MARKET');
     const clientId = `jrock-open-${symbol}-${Date.now()}`;
-    // The order price is snapped to the pair's quotePrecision BEFORE the TP/SL
-    // is derived, so the limit price and its stop levels all sit on ticks the
-    // exchange will actually accept. Bitunix answers a price carrying more
-    // decimals than quotePrecision with "10002 Parameter error", and the raw
-    // scanner price (e.g. 116543.2187 at 1dp) is exactly that shape.
+    // The reference price is snapped to the pair's quotePrecision BEFORE the
+    // TP/SL is derived, so the levels all sit on ticks the exchange will
+    // actually accept. Bitunix answers a price carrying more decimals than
+    // quotePrecision with "10002 Parameter error", and the raw scanner price
+    // (e.g. 116543.2187 at 1dp) is exactly that shape.
+    //
+    // MARKET, not LIMIT at the scanner's last price: a limit resting at the
+    // current price is not an entry. It sits in the book unfilled, so no
+    // position exists and therefore no take-profit and no stop exist either —
+    // the bot looked like it had gone quiet — and the fill that eventually
+    // arrived minutes later relied entirely on the manage pass to re-derive
+    // protection for a position nothing was watching.
     const { body } = this.buildProtectedOrderBody({
       symbol,
       side: direction === 'bullish' ? 'BUY' : 'SELL',
       qty,
       price: entryPrice,
-      orderType: 'LIMIT',
+      orderType: 'MARKET',
       pair,
       atr: atr ?? await this.computeAtr(symbol),
       confidence: signalConfidence,
