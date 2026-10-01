@@ -96,7 +96,10 @@ export function openMessage(position, tpsl = null) {
   const lines = [
     `${EMOJI.open} <b>POSITION OPENED</b>`,
     `${directionEmoji(side)} <b>${sideLabel(side)}</b> <code>${escHtml(position.symbol || CONFIG.symbol)}</code>  <code>${escHtml(position.positionId)}</code>`,
-    `Entry: <code>${fmt(position.avgPrice ?? position.entryPrice)}</code>   Qty: <code>${fmt(position.qty ?? position.size)}</code>   Leverage: <code>${leverage}x</code>`,
+    // Bitunix pending positions carry the entry as avgOpenPrice, not avgPrice
+    // — reading only the latter printed "Entry: -" on a position that was
+    // perfectly known, while the close notification minutes later showed it.
+    `Entry: <code>${fmt(position.avgPrice ?? position.avgOpenPrice ?? position.entryPrice)}</code>   Qty: <code>${fmt(position.qty ?? position.size)}</code>   Leverage: <code>${leverage}x</code>`,
   ];
   const tp = tpsl?.tpPrice ?? position.tpPrice;
   const sl = tpsl?.slPrice ?? position.slPrice;

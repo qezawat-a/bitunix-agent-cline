@@ -72,7 +72,7 @@ export const bitunixTools = [
   },
   {
     name: 'bitunix_place_order',
-    description: 'Place a live Bitunix futures order. orderType defaults to MARKET; tradeSide defaults to OPEN. Hedge CLOSE requires positionId.',
+    description: 'Place a live Bitunix futures order that REDUCES or CLOSES existing exposure only. This tool cannot open a new position: an order sent here gets no automatic take-profit, so a naked entry can lose the whole margin. To open, use trader_open_position (manual, always sends TP+SL) or trader_execute_signal (autonomous, full risk gates). tradeSide must be CLOSE; hedge mode requires positionId.',
     parameters: {
       type: 'object',
       properties: {
@@ -81,14 +81,31 @@ export const bitunixTools = [
         qty: { type: 'string' },
         price: { type: 'string', description: 'Required when orderType is LIMIT' },
         orderType: { type: 'string', enum: ['LIMIT', 'MARKET'] },
-        tradeSide: { type: 'string', enum: ['OPEN', 'CLOSE'] },
+        tradeSide: { type: 'string', enum: ['CLOSE'], description: 'Only CLOSE is accepted. Opening through this tool is rejected.' },
         positionId: { type: 'string', description: 'Required when tradeSide is CLOSE (hedge mode)' },
         reduceOnly: { type: 'boolean' },
       },
-      required: ['symbol', 'side', 'qty'],
+      required: ['symbol', 'side', 'qty', 'tradeSide'],
     },
     async handler(params) {
-      return requireClient().placeOrder(params);
+      // SAFETY: this tool used to pass its arguments straight to place_order,
+      // which let an OPEN order through with no take-profit and no stop — the
+      // position then had no defined exit and could only be closed by hand
+      // (a real -38% ROI trade on 25x came out of exactly this path). Only
+      // position-reducing orders are allowed here; every entry goes through a
+      // path that computes and attaches TP+SL before submitting.
+      const tradeSide = String(params?.tradeSide || '').toUpperCase();
+      if (tradeSide !== 'CLOSE') {
+        throw new Error(
+          'bitunix_place_order cannot open a position: tradeSide must be CLOSE. '
+          + 'Use trader_open_position (manual entry, sends take-profit + stop-loss with the order) '
+          + 'or trader_execute_signal (autonomous entry) instead.',
+        );
+      }
+      if (params?.reduceOnly === false) {
+        throw new Error('reduceOnly: false is not allowed on a CLOSE order; it would increase exposure instead of reducing it');
+      }
+      return requireClient().placeOrder({ ...params, tradeSide: 'CLOSE', reduceOnly: true });
     },
   },
   {

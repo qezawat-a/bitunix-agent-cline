@@ -90,7 +90,7 @@ export const traderTools = [
   },
   {
     name: 'trader_open_position',
-    description: 'Manually open a position after explicit live-mode approval',
+    description: 'Manually open a position after explicit live-mode approval. The take-profit and stop-loss are computed from live ATR and attached to the order itself, so the position is never left without an exit. Only the configured symbol is allowed.',
     parameters: {
       type: 'object',
       properties: {
@@ -102,21 +102,18 @@ export const traderTools = [
       required: ['symbol', 'side', 'qty'],
     },
     async handler({ symbol, side, qty, price }) {
-      const client = requireClient();
-      const params = {
+      if (!sharedTrader) throw new Error('Trader not ready');
+      // Routed through Trader so the order cannot be built here without TP/SL.
+      // This handler used to call placeOrder directly, which is how a real
+      // position ended up live with "TP: -" and only a stop added later.
+      const result = await sharedTrader.openManualPosition({
         symbol: String(symbol).toUpperCase(),
-        side,
+        side: String(side).toUpperCase(),
         qty: String(qty),
-        price: price ? String(price) : '',
-        orderType: price ? 'LIMIT' : 'MARKET',
-        effect: 'GTC',
-        tradeSide: 'OPEN',
-        reduceOnly: false,
-      };
-      const order = await client.placeOrder(params);
+        price: price ? Number(price) : null,
+      });
       markCooldown();
-      if (sharedTrader?.reconcilePositions) await sharedTrader.reconcilePositions();
-      return { order };
+      return result;
     },
   },
   {

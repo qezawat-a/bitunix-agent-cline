@@ -1,4 +1,5 @@
 import Scanner from '../bitunix/scanner.js';
+import { atr as calculateAtr } from '../bitunix/indicators.js';
 import { positionSizeFromUnit, roundPrice } from '../bitunix/order-units.js';
 import { PositionManager } from './position-manager.js';
 import { CONFIG } from '../config.js';
@@ -232,31 +233,22 @@ export class Trader {
 
     const { qty, pair } = await this.computePositionSize(entryPrice, 'LIMIT');
     const clientId = `jrock-open-${symbol}-${Date.now()}`;
-    // Snap the order price to the pair's quotePrecision BEFORE deriving the
-    // TP/SL, so the limit price and its stop levels all sit on ticks the
+    // The order price is snapped to the pair's quotePrecision BEFORE the TP/SL
+    // is derived, so the limit price and its stop levels all sit on ticks the
     // exchange will actually accept. Bitunix answers a price carrying more
     // decimals than quotePrecision with "10002 Parameter error", and the raw
     // scanner price (e.g. 116543.2187 at 1dp) is exactly that shape.
-    const price = roundPrice(entryPrice, pair);
-    if (!(price > 0)) throw new Error(`order price ${entryPrice} rounds to zero at quotePrecision ${pair.quotePrecision}`);
-    const levels = this.positionManager.computeTPSL(price, direction, atr, signalConfidence ?? CONFIG.min_confidence, Number(pair.quotePrecision) || 8);
-    const body = {
+    const { body } = this.buildProtectedOrderBody({
       symbol,
       side: direction === 'bullish' ? 'BUY' : 'SELL',
-      price: String(price),
-      qty: String(qty),
+      qty,
+      price: entryPrice,
       orderType: 'LIMIT',
-      // A LIMIT order without an effect is a parameter error on Bitunix, and
-      // GTC is the documented default the docs also spell out explicitly.
-      effect: 'GTC',
-      ...levels,
-      tpOrderType: 'MARKET',
-      slOrderType: 'MARKET',
-      reduceOnly: false,
-      tradeSide: 'OPEN',
+      pair,
+      atr: atr ?? await this.computeAtr(symbol),
+      confidence: signalConfidence,
       clientId,
-    };
-    assertOrderMatchesPair(body, pair);
+    });
 
     if (!CONFIG.auto_trade) throw new Error('auto_trade was disabled before order submission');
     if (CONFIG.symbol !== symbol) throw new Error('symbol changed before order submission');
@@ -279,6 +271,157 @@ export class Trader {
       throw error;
     }
     return order;
+  }
+
+  // The only place an OPEN order is assembled. Both entry paths — autonomous
+  // openPosition() and the agent's manual tool — go through it, so a position
+  // can never reach the exchange without a take-profit and a stop-loss riding
+  // along on the very same order. That matters because protection is otherwise
+  // attached a moment later, and a position filled in that gap has no defined
+  // exit: it only closes when a human notices.
+  buildProtectedOrderBody({ symbol, side, qty, price, orderType, pair, atr, confidence, clientId = null }) {
+    // Snap to quotePrecision first, then derive the levels from the snapped
+    // price, so limit price and stops all land on ticks Bitunix accepts.
+    const entryPrice = roundPrice(price, pair);
+    if (!(entryPrice > 0)) throw new Error(`order price ${price} rounds to zero at quotePrecision ${pair.quotePrecision}`);
+    const quotePrecision = Number.isInteger(Number(pair.quotePrecision)) ? Number(pair.quotePrecision) : 8;
+    const direction = side === 'BUY' ? 'bullish' : side === 'SELL' ? 'bearish' : null;
+    if (!direction) throw new Error('order side must be BUY or SELL');
+    // computeTPSL throws when ATR is missing rather than falling back to a
+    // fixed percentage: an entry without a real stop distance is not tradable.
+    const levels = this.positionManager.computeTPSL(entryPrice, direction, atr, confidence ?? CONFIG.min_confidence, quotePrecision);
+    const body = {
+      symbol,
+      side,
+      qty: String(qty),
+      orderType,
+      // A LIMIT order without an effect is a parameter error on Bitunix, and
+      // GTC is the documented default the docs also spell out explicitly.
+      effect: 'GTC',
+      ...levels,
+      tpOrderType: 'MARKET',
+      slOrderType: 'MARKET',
+      reduceOnly: false,
+      tradeSide: 'OPEN',
+      ...(clientId ? { clientId } : {}),
+    };
+    if (orderType === 'LIMIT') body.price = String(entryPrice);
+    assertOrderMatchesPair(body, pair);
+    return { body, entryPrice, tpPrice: levels.tpPrice, slPrice: levels.slPrice };
+  }
+
+  // The tickers endpoint answers with every symbol it was asked about, so the
+  // row has to be matched by symbol. Reading data[0] instead prices one coin's
+  // order off a completely different coin.
+  async fetchMarkPrice(symbol) {
+    const data = await this.client.getTickers(symbol);
+    const list = Array.isArray(data) ? data : [data];
+    const ticker = list.find(item => String(item?.symbol || '').toUpperCase() === String(symbol).toUpperCase());
+    if (!ticker) throw new Error(`no ticker returned for ${symbol}`);
+    const value = Number(ticker.markPrice ?? ticker.lastPrice ?? ticker.price);
+    if (!validPositive(value)) throw new Error(`ticker for ${symbol} carries no usable price`);
+    return value;
+  }
+
+  async getPairMetadata(symbol) {
+    const pairs = await this.client.getTradingPairs(symbol);
+    const pair = (Array.isArray(pairs) ? pairs : [])
+      .find(item => String(item?.symbol || '').toUpperCase() === String(symbol).toUpperCase());
+    if (!pair) throw new Error(`trading pair metadata missing for ${symbol}`);
+    return pair;
+  }
+
+  async computeAtr(symbol) {
+    const klines = await this.client.getKlines(symbol, '15m', 60);
+    if (!Array.isArray(klines) || klines.length < 2) throw new Error(`no 15m klines available for ${symbol} to size a stop`);
+    const value = calculateAtr(
+      klines.map(k => Number(k.high)),
+      klines.map(k => Number(k.low)),
+      klines.map(k => Number(k.close)),
+      14,
+    );
+    if (!validPositive(value)) throw new Error(`ATR is unavailable for ${symbol}; refusing to open an unprotected position`);
+    return value;
+  }
+
+  // Manual entry, called by the trader_open_position agent tool. Unlike the
+  // autonomous path this does not need auto_trade — the user explicitly asked
+  // for the trade — but every other guarantee still applies: real market price,
+  // pair-checked size, ATR-derived take-profit and stop on the order itself,
+  // and a reconcile-and-protect pass immediately after it fills.
+  async openManualPosition({ symbol, side, qty, price = null, confidence = null }) {
+    const normalizedSymbol = String(symbol || '').toUpperCase();
+    if (!normalizedSymbol) throw new Error('symbol is required');
+    // The whole risk engine — TP/SL manager, liquidation guard, max_positions,
+    // break-even/trailing and the notifier — tracks CONFIG.symbol only. A
+    // position on any other pair would be invisible to all of it.
+    if (normalizedSymbol !== String(CONFIG.symbol).toUpperCase()) {
+      throw new Error(`manual entries are limited to the configured symbol ${CONFIG.symbol}; change the symbol setting first`);
+    }
+    const orderSide = String(side || '').toUpperCase();
+    if (!['BUY', 'SELL'].includes(orderSide)) throw new Error('side must be BUY or SELL');
+    if (!validPositive(qty)) throw new Error('qty must be positive');
+    if (price !== null && price !== undefined && price !== '' && !validPositive(price)) {
+      throw new Error('price must be positive when supplied');
+    }
+
+    const pair = await this.getPairMetadata(normalizedSymbol);
+    const open = await this.reconcilePositions();
+    if (open.length >= Number(CONFIG.max_positions)) {
+      throw new Error(`already holding ${open.length} position(s); max_positions is ${CONFIG.max_positions}`);
+    }
+    this.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
+    this.state.confirmations.delete(normalizedSymbol);
+
+    // A MARKET entry has no price of its own, so the levels are derived from
+    // the live mark for this exact symbol. A LIMIT entry is protected against
+    // its own limit price, which is the price it will actually fill at.
+    const limitPrice = price === null || price === undefined || price === '' ? null : Number(price);
+    const orderType = limitPrice ? 'LIMIT' : 'MARKET';
+    const referencePrice = limitPrice || await this.fetchMarkPrice(normalizedSymbol);
+    const atr = await this.computeAtr(normalizedSymbol);
+    const { body, entryPrice, tpPrice, slPrice } = this.buildProtectedOrderBody({
+      symbol: normalizedSymbol,
+      side: orderSide,
+      qty,
+      price: referencePrice,
+      orderType,
+      pair,
+      atr,
+      confidence,
+    });
+
+    let order;
+    try {
+      order = await this.client.placeOrder(body);
+    } catch (error) {
+      // A write failure is ambiguous: the order may already be live on the
+      // exchange. Block further entries until that has settled, exactly as the
+      // autonomous path does.
+      this.state.orderUnknownUntil = Date.now() + Math.max(Number(CONFIG.cooldown_minutes) * 60000, 300000);
+      throw error;
+    }
+
+    const positions = await this.reconcilePositions();
+    // Belt and braces: the TP/SL is already armed on the order above, so this
+    // only verifies the exchange really has it. ensureProtection() applies the
+    // configured on_tpsl_failure behaviour (close) if the check fails.
+    const protection = [];
+    for (const position of positions) {
+      protection.push(await this.positionManager.ensureProtection(position));
+    }
+    return {
+      order,
+      symbol: normalizedSymbol,
+      side: orderSide,
+      qty: String(qty),
+      orderType,
+      entryPrice,
+      tpPrice,
+      slPrice,
+      protection,
+      positions: positions.length,
+    };
   }
 
   // `orderType` must match the order actually placed, because the exchange caps

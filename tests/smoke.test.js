@@ -17,7 +17,7 @@ import {
 import { parseThinkingLevel } from '../src/agent/thinking.js';
 import { CONFIG, parseBoolean, applySettingsFile } from '../src/config.js';
 import { createTraderCommands } from '../src/telegram-trader.js';
-import { PositionNotifier, closeMessage, normalizeSide, positionRoiPct, sideLabel } from '../src/trader/notifier.js';
+import { PositionNotifier, closeMessage, normalizeSide, openMessage, positionRoiPct, sideLabel } from '../src/trader/notifier.js';
 import { BitunixClient } from '../src/bitunix/client.js';
 import Scanner from '../src/bitunix/scanner.js';
 import { liqDistanceOk } from '../src/bitunix/risk.js';
@@ -486,6 +486,157 @@ describe('tool safety', () => {
   it('validates tool arguments and serializes undefined results', () => {
     assert.throws(() => validateToolArguments({ type: 'object', required: ['symbol'] }, {}), /missing required/);
     assert.equal(stringifyToolResult(undefined), '{"ok":true}');
+  });
+
+});
+
+describe('every entry carries a take-profit and a stop-loss', () => {
+  // A real 25x trade was closed at -38% ROI with "TP: -" in the open
+  // notification: the position was opened through a tool that called
+  // placeOrder directly, so no exit existed until a human closed it. These
+  // tests lock down every remaining path that can send an OPEN order.
+  const pair = { symbol: 'BTCUSDT', basePrecision: 3, quotePrecision: 2, minTradeVolume: '0.001', maxMarketOrderVolume: '1000', maxLimitOrderVolume: '1000' };
+  const klines = Array.from({ length: 60 }, (_, index) => ({
+    high: String(101 + index), low: String(99 + index), close: String(100 + index), baseVol: '10',
+  }));
+
+  function manualClient(overrides = {}) {
+    const calls = { orders: [], tpsl: [], closed: [] };
+    const client = {
+      calls,
+      getAccount: async () => ({ available: '100' }),
+      getTradingPairs: async () => [pair],
+      getKlines: async () => klines,
+      // Deliberately returns several symbols: the price must be matched by
+      // symbol, not read off the first row.
+      getTickers: async () => [
+        { symbol: 'ETHUSDT', markPrice: '4000' },
+        { symbol: 'BTCUSDT', markPrice: '100', lastPrice: '101' },
+      ],
+      getPendingPositions: async () => [],
+      getPendingTPSL: async () => calls.tpsl,
+      placeTPSL: async (body) => { calls.tpsl.push({ ...body, positionId: 'p1' }); return { orderId: 't1' }; },
+      closePosition: async (...args) => { calls.closed.push(args); return {}; },
+      placeOrder: async (body) => { calls.orders.push(body); return { orderId: 'o1' }; },
+      ...overrides,
+    };
+    return client;
+  }
+
+  const withSettings = (values) => Object.assign(CONFIG, { auto_trade: false, leverage: 10, cooldown_minutes: 0, max_positions: 3, min_confidence: 50, tpsl_method: 'position', on_tpsl_failure: 'close' }, values);
+
+  it('rejects a naked open through the raw place_order tool', async () => {
+    const submitted = [];
+    setBitunixClient({ placeOrder: async (body) => { submitted.push(body); return { orderId: 'o1' }; } });
+    const tool = bitunixTools.find(item => item.name === 'bitunix_place_order');
+    // The exact shape that opened the unprotected position: no tradeSide at all.
+    await assert.rejects(
+      () => tool.handler({ symbol: 'BTCUSDT', side: 'SELL', qty: '5.77', orderType: 'MARKET' }),
+      /cannot open a position/,
+    );
+    await assert.rejects(
+      () => tool.handler({ symbol: 'BTCUSDT', side: 'SELL', qty: '5.77', tradeSide: 'OPEN' }),
+      /cannot open a position/,
+    );
+    assert.equal(submitted.length, 0);
+  });
+
+  it('still allows reduce-only closes through the raw place_order tool', async () => {
+    const submitted = [];
+    setBitunixClient({ placeOrder: async (body) => { submitted.push(body); return { orderId: 'o1' }; } });
+    const tool = bitunixTools.find(item => item.name === 'bitunix_place_order');
+    await tool.handler({ symbol: 'BTCUSDT', side: 'BUY', qty: '1', tradeSide: 'CLOSE', positionId: 'p1' });
+    assert.equal(submitted[0].tradeSide, 'CLOSE');
+    assert.equal(submitted[0].reduceOnly, true);
+    await assert.rejects(
+      () => tool.handler({ symbol: 'BTCUSDT', side: 'BUY', qty: '1', tradeSide: 'CLOSE', reduceOnly: false }),
+      /reduceOnly/,
+    );
+  });
+
+  it('attaches both levels to a manual market entry and prices it from its own symbol', async () => {
+    withSettings({ symbol: 'BTCUSDT' });
+    const client = manualClient();
+    const trader = new Trader(client);
+    const result = await trader.openManualPosition({ symbol: 'BTCUSDT', side: 'SELL', qty: '1' });
+    const body = client.calls.orders[0];
+    assert.equal(body.tradeSide, 'OPEN');
+    assert.equal(body.orderType, 'MARKET');
+    // 100 is BTCUSDT's mark price; 4000 is the ETHUSDT row that comes first.
+    // ATR 2, target 2.4x below entry and stop 1.325x above it for a short.
+    assert.equal(body.tpPrice, '95.2');
+    assert.equal(body.slPrice, '102.65');
+    assert.equal(body.tpStopType, 'MARK_PRICE');
+    assert.equal(body.slStopType, 'MARK_PRICE');
+    assert.ok(Number(body.tpPrice) < 100, 'a short take-profit must sit below entry');
+    assert.ok(Number(body.slPrice) > 100, 'a short stop must sit above entry');
+    assert.equal(result.tpPrice, body.tpPrice);
+    assert.equal(result.slPrice, body.slPrice);
+  });
+
+  it('routes the agent tool through the protected path', async () => {
+    withSettings({ symbol: 'BTCUSDT' });
+    const client = manualClient();
+    setTraderInstances(new Trader(client), client);
+    const tool = traderTools.find(item => item.name === 'trader_open_position');
+    const result = await tool.handler({ symbol: 'btcusdt', side: 'SELL', qty: '1' });
+    const body = client.calls.orders[0];
+    assert.ok(body.tpPrice && body.slPrice);
+    assert.equal(result.tpPrice, body.tpPrice);
+    setTraderInstances(null, null);
+  });
+
+  it('refuses to open when no stop distance can be computed', async () => {
+    withSettings({ symbol: 'BTCUSDT' });
+    const client = manualClient({ getKlines: async () => [] });
+    const trader = new Trader(client);
+    await assert.rejects(
+      () => trader.openManualPosition({ symbol: 'BTCUSDT', side: 'BUY', qty: '1' }),
+      /klines/,
+    );
+    assert.equal(client.calls.orders.length, 0);
+  });
+
+  it('refuses a manual entry on a symbol the risk engine does not track', async () => {
+    withSettings({ symbol: 'BTCUSDT' });
+    const client = manualClient();
+    const trader = new Trader(client);
+    await assert.rejects(
+      () => trader.openManualPosition({ symbol: 'ETHUSDT', side: 'BUY', qty: '1' }),
+      /configured symbol/,
+    );
+    assert.equal(client.calls.orders.length, 0);
+  });
+
+  it('closes the position when protection cannot be armed (on_tpsl_failure: close)', async () => {
+    withSettings({ symbol: 'BTCUSDT', on_tpsl_failure: 'close' });
+    const open = { positionId: 'p1', symbol: 'BTCUSDT', side: 'SELL', qty: '1', avgOpenPrice: '100', markPrice: '100' };
+    // The entry needs ATR to build its levels; the post-fill verification pass
+    // then hits a dead kline feed and cannot arm anything.
+    let klineCalls = 0;
+    const client = manualClient({
+      getPendingPositions: async () => [open],
+      getPendingTPSL: async () => [],
+      getKlines: async () => {
+        klineCalls++;
+        if (klineCalls > 1) throw new Error('kline feed down');
+        return klines;
+      },
+    });
+    const trader = new Trader(client);
+    const result = await trader.openManualPosition({ symbol: 'BTCUSDT', side: 'SELL', qty: '1' });
+    assert.equal(client.calls.orders.length, 1);
+    assert.equal(result.protection[0].closed, true);
+    assert.equal(client.calls.closed.length, 1);
+  });
+
+  it('renders the entry from avgOpenPrice in the open notification', async () => {
+    // Bitunix pending positions expose the entry as avgOpenPrice; reading only
+    // avgPrice printed "Entry: -" for a position that was fully known.
+    const text = openMessage({ positionId: 'p1', symbol: 'BTCUSDT', side: 'SHORT', qty: '5.77', avgOpenPrice: '2.2437', leverage: 25 });
+    assert.match(text, /POSITION OPENED/);
+    assert.match(text, /2\.2437/);
+    assert.doesNotMatch(text, /Entry: <code>-<\/code>/);
   });
 
 });
