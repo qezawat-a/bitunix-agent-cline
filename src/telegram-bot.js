@@ -155,11 +155,17 @@ export function formatSignalReport(res) {
   // res.confidence is 0 for a rejected signal, so the raw reading is what has
   // to be compared against the gate — reporting the 0 is what made a healthy
   // scanner look dead.
+  // "<" and ">" are HTML, not punctuation. Emitting them raw inside the <i>
+  // block made Telegram parse "< min_confidence 80</i>" as an unknown start
+  // tag and reject the whole message ("can't parse entities"), so /signal
+  // never arrived at all — the report that was supposed to explain a hold was
+  // the thing that broke. Spell the comparison with words instead of angle
+  // brackets so the gate text cannot collide with the markup around it.
   if ((res.rawConfidence || 0) < CONFIG.min_confidence) {
-    reasons.push(`confidence ${esc(String(res.rawConfidence))} < min_confidence ${esc(String(CONFIG.min_confidence))}`);
+    reasons.push(`confidence ${esc(String(res.rawConfidence))} below min_confidence ${esc(String(CONFIG.min_confidence))}`);
   }
   if ((res.agreeingStrategies || 0) < CONFIG.min_agreeing_strategies) {
-    reasons.push(`${esc(String(res.agreeingStrategies))} strategies < min_agreeing_strategies ${esc(String(CONFIG.min_agreeing_strategies))}`);
+    reasons.push(`${esc(String(res.agreeingStrategies))} strategies, min_agreeing_strategies is ${esc(String(CONFIG.min_agreeing_strategies))}`);
   }
   const gate = reasons.length ? `\n<i>HOLD because: ${reasons.join('; ')}</i>` : '\n<i>All gates passed.</i>';
   return `<b>SIGNAL ${esc(res.symbol)}</b>\nDirection: <b>${esc(res.signal)}</b>`

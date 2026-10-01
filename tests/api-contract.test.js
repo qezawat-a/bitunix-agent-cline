@@ -25,7 +25,7 @@ import {
   validateLadder,
 } from '../src/trader/tpsl.js';
 import { PositionManager } from '../src/trader/position-manager.js';
-import { formatSignalReport } from '../src/telegram-bot.js';
+import { formatSignalReport, splitHtml } from '../src/telegram-bot.js';
 import { formatPositions, positionStatus } from '../src/trader/notifier.js';
 
 // computeTPSL is an instance method but is pure, so it is exercised through a
@@ -1692,5 +1692,92 @@ describe('margin sizing has exactly one live setting', async () => {
   it('rejects an impossible margin instead of clamping it silently', () => {
     assert.throws(() => applySettings({ ...DEFAULTS }, { position_sizing_margin_pct: 250 }), /position_sizing_margin_pct/);
     assert.throws(() => applySettings({ ...DEFAULTS }, { position_sizing_margin_pct: 0 }), /position_sizing_margin_pct/);
+  });
+});
+
+describe('every message the bot sends is valid Telegram HTML', () => {
+  // Telegram rejects the whole message with "can't parse entities" when any
+  // bare < or > survives, and a rejected message is never delivered — so the
+  // gate that was being printed ("confidence 62 < min_confidence 80") took
+  // /signal down with it. Every template must escape its own literals too, not
+  // only its interpolated values.
+  const assertValid = (html, what) => {
+    for (const m of html.matchAll(/<[^>]*>/g)) {
+      assert.ok(
+        /^<\/?[A-Za-z][\w-]*\s*\/?>$/.test(m[0]),
+        `${what} emitted a malformed tag ${JSON.stringify(m[0])} at offset ${m.index}`,
+      );
+    }
+    // Nothing outside a well-formed tag may be a bare < or >, because Telegram
+    // reads those as the start of a tag and rejects the whole message.
+    // Escaped entities (&lt; / &gt;) are fine and must not be flagged.
+    assert.doesNotMatch(html.replace(/<[^>]*>/g, ''), /[<>]/, `${what} left a bare angle bracket`);
+    // Tags must balance, or splitHtml re-opens a tag the next chunk never closes.
+    const stack = [];
+    for (const m of html.matchAll(/<(\/?)([A-Za-z][\w-]*)\b[^>]*>/g)) {
+      if (m[1]) {
+        assert.equal(stack.pop(), m[2], `${what} closed an unopened tag ${m[2]}`);
+      } else stack.push(m[2]);
+    }
+    assert.deepEqual(stack, [], `${what} left tags unclosed`);
+  };
+
+  const scan = (over = {}) => ({
+    symbol: 'MOVRUSDT', signal: 'HOLD', rawDirection: 'bullish', rawConfidence: 62,
+    eligibleTimeframes: 1, timeframesAgree: false, alignedTimeframes: 1,
+    agreeingStrategies: 3, lastPrice: 2.3205,
+    tfSignals: {
+      '15m': { direction: 'bullish', confidence: 62, alignedWeight: 3, activeWeight: 5,
+        strategyDirections: { macd: 'bullish', ema: 'bullish', rsi: 'bearish', vwap: 'bullish', atr: 'neutral' } },
+    },
+    ...over,
+  });
+
+  it('escapes the gate text /signal prints', () => {
+    // This is the message that failed: "confidence 62 < min_confidence 80".
+    const html = formatSignalReport(scan());
+    assert.ok(html.includes('below min_confidence'), 'the gate reason must still be readable');
+    assert.doesNotMatch(html, /\d\s*<\s*min_/, 'the comparison must not be spelled with angle brackets');
+    assertValid(html, 'formatSignalReport');
+  });
+
+  it('stays valid for every gate combination', () => {
+    const neutral = scan({ rawDirection: 'neutral' });
+    const weak = scan({ agreeingStrategies: 0, timeframesAgree: true });
+    const all = scan({ timeframesAgree: true, rawConfidence: 95, agreeingStrategies: 4 });
+    for (const [name, res] of [['neutral', neutral], ['too few strategies', weak], ['all gates pass', all]]) {
+      assertValid(formatSignalReport(res), `formatSignalReport (${name})`);
+    }
+  });
+
+  it('stays valid when a symbol or direction carries angle brackets', () => {
+    const hostile = scan({
+      symbol: '<script>', rawDirection: '<b>', lastPrice: '<999>',
+      tfSignals: { '15m': { direction: '<i>', confidence: 1, alignedWeight: 0, activeWeight: 0, strategyDirections: {} } },
+    });
+    assertValid(formatSignalReport(hostile), 'formatSignalReport (hostile input)');
+  });
+
+  it('stays valid for the position block in the periodic report', () => {
+    const positions = [{ positionId: '2444<p>', symbol: 'MOV<R>', side: 'BUY',
+      avgOpenPrice: '2.2685', qty: '5.86', leverage: '25', margin: '0.54',
+      unrealizedPNL: '0.30', liqPrice: '1.9455' }];
+    const tpsl = [{ id: 't1', positionId: '2444<p>', tpPrice: '2.517', slPrice: '2.2685' }];
+    assertValid(formatPositions(positions, tpsl), 'formatPositions');
+  });
+
+  it('splits a long valid message without producing an invalid chunk', () => {
+    // splitHtml re-opens tags across a cut; a template that is only valid whole
+    // would break the moment it outgrows one message.
+    const many = scan({ tfSignals: Object.fromEntries(
+      Array.from({ length: 90 }, (_, i) => [`t${i}`, {
+        direction: 'bullish', confidence: 90, alignedWeight: 5, activeWeight: 5,
+        strategyDirections: { macd: 'bullish', ema: 'bullish', rsi: 'bullish', vwap: 'bullish', atr: 'bullish' },
+      }]),
+    ) });
+    const html = formatSignalReport(many);
+    const chunks = splitHtml(html);
+    assert.ok(chunks.length > 1, 'the message must actually be long enough to split');
+    for (const [i, chunk] of chunks.entries()) assertValid(chunk, `splitHtml chunk ${i}`);
   });
 });
