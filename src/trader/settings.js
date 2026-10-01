@@ -5,8 +5,6 @@ export const DEFAULTS = {
   leverage: 10,
   position_type: 'crossed',
   timeframes: ['1m', '3m', '5m', '15m', '1h'],
-  margin_amount_pct: 2,
-  margin_risk_pct: 2,
   min_confidence: 80,
   tf_min_confidence: 60,
   min_agreeing_strategies: 2,
@@ -68,6 +66,14 @@ export const ALIASES = {
   tf: 'timeframes',
   timeframes: 'timeframes',
   tf_min: 'tf_min_confidence',
+  // The two older margin names were accepted, validated and confirmed back to
+  // the operator, but nothing ever read them: sizing only reads
+  // position_sizing_margin_pct. Setting `margin_amount_pct 25` was a confirmed
+  // no-op and every position still went in at the 2% default. Both names now
+  // resolve to the key the sizing code actually uses.
+  margin_amount_pct: 'position_sizing_margin_pct',
+  margin_risk_pct: 'position_sizing_margin_pct',
+  margin_pct: 'position_sizing_margin_pct',
 };
 
 export const SETTING_KEYS = Object.freeze(Object.keys(DEFAULTS));
@@ -81,8 +87,6 @@ const INTEGER_KEYS = new Set([
   'max_positions',
 ]);
 const NUMBER_KEYS = new Set([
-  'margin_amount_pct',
-  'margin_risk_pct',
   'min_confidence',
   'tf_min_confidence',
   'scan_interval_sec',
@@ -179,8 +183,6 @@ export function validateSettings(s) {
   }
 
   addRangeError(errors, 'leverage', s.leverage, 1, 125, true);
-  addRangeError(errors, 'margin_amount_pct', s.margin_amount_pct, 0.01, 100);
-  addRangeError(errors, 'margin_risk_pct', s.margin_risk_pct, 0.01, 100);
   addRangeError(errors, 'min_confidence', s.min_confidence, 0, 100);
   addRangeError(errors, 'tf_min_confidence', s.tf_min_confidence, 0, 100);
   addRangeError(errors, 'min_agreeing_strategies', s.min_agreeing_strategies, 1, 100, true);

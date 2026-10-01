@@ -1,6 +1,7 @@
 import { CONFIG, parseBoolean } from './config.js';
 import { sendMessage, isOwner, esc, formatSignalReport } from './telegram-bot.js';
 import { applySettings, getTraderSettings, parseSettingValue, validateSettings } from './trader/settings.js';
+import { formatPositions } from './trader/notifier.js';
 import { parseThinkingLevel } from './agent/thinking.js';
 import { detectProviders } from './agent/config.js';
 import { listOpenAiModels } from './agent/brain.js';
@@ -93,8 +94,11 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           return true;
         }
         case 'positions': {
-          const pos = await client.getPendingPositions(CONFIG.symbol);
-          await sendMessage(chatId, `<b>Positions</b>\n<code>${esc(JSON.stringify(pos, null, 1))}</code>`);
+          const [positions, tpsl] = await Promise.all([
+            client.getPendingPositions(CONFIG.symbol).catch(() => []),
+            client.getPendingTPSL(CONFIG.symbol).catch(() => []),
+          ]);
+          await sendMessage(chatId, `<b>Positions</b>\n${formatPositions(positions, tpsl)}`);
           return true;
         }
         case 'trades': {
@@ -103,8 +107,11 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           return true;
         }
         case 'pnl': {
-          const pos = await client.getPendingPositions(CONFIG.symbol);
-          await sendMessage(chatId, `<b>PnL</b>\n<code>${esc(JSON.stringify(pos, null, 1))}</code>`);
+          const [positions, tpsl] = await Promise.all([
+            client.getPendingPositions(CONFIG.symbol).catch(() => []),
+            client.getPendingTPSL(CONFIG.symbol).catch(() => []),
+          ]);
+          await sendMessage(chatId, `<b>PnL</b>\n${formatPositions(positions, tpsl)}`);
           return true;
         }
         case 'close': {

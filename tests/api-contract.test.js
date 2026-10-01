@@ -26,6 +26,7 @@ import {
 } from '../src/trader/tpsl.js';
 import { PositionManager } from '../src/trader/position-manager.js';
 import { formatSignalReport } from '../src/telegram-bot.js';
+import { formatPositions, positionStatus } from '../src/trader/notifier.js';
 
 // computeTPSL is an instance method but is pure, so it is exercised through a
 // client-less PositionManager rather than a network double.
@@ -1541,5 +1542,98 @@ describe('the /signal report renders a real scan result', () => {
     assert.match(html, /HOLD because/);
     assert.match(html, /min_confidence/, 'raw confidence below the gate must be shown');
     assert.match(html, /timeframes split 1\/1/, 'the timeframe quorum failure must be shown');
+  });
+});
+
+describe('the report renders position PnL, TP/SL and status', () => {
+  const position = (over = {}) => ({
+    positionId: 'p1',
+    symbol: 'BTCUSDT',
+    side: 'BUY',
+    avgOpenPrice: '100000',
+    qty: '0.1',
+    leverage: '10',
+    margin: '120',
+    unrealizedPNL: '25',
+    liqPrice: '95000',
+    ...over,
+  });
+
+  it('labels a position with no protection so it cannot be mistaken for healthy', () => {
+    assert.equal(positionStatus({ entryPrice: 100000, side: 'BUY', slPrice: null, tpPrice: null }), '⚠️ NO TP/SL');
+    assert.equal(positionStatus({ entryPrice: 100000, side: 'BUY', slPrice: 95000, tpPrice: null }), 'running');
+  });
+
+  it('marks a stop already at or past the entry as break-even', () => {
+    assert.equal(positionStatus({ entryPrice: 100000, side: 'BUY', slPrice: 100000, tpPrice: 110000 }), '🧷 break-even');
+    assert.equal(positionStatus({ entryPrice: 100000, side: 'BUY', slPrice: 100500, tpPrice: 110000 }), '🧷 break-even');
+    assert.equal(positionStatus({ entryPrice: 100000, side: 'BUY', slPrice: 99500, tpPrice: 110000 }), 'running');
+    assert.equal(positionStatus({ entryPrice: 100000, side: 'SELL', slPrice: 99500, tpPrice: 90000 }), '🧷 break-even');
+    assert.equal(positionStatus({ entryPrice: 100000, side: 'SELL', slPrice: 100500, tpPrice: 90000 }), 'running');
+  });
+
+  it('takes TP/SL from the pending TPSL rows, which carry them (the position row never does)', () => {
+    const html = formatPositions([position()], [
+      { positionId: 'p1', tpPrice: '110000', slPrice: '98000' },
+    ]);
+    assert.match(html, /TP: <code>110000<\/code>/);
+    assert.match(html, /SL: <code>98000<\/code>/);
+    // 98000 < 100000 entry is still not saved, so the stop has not moved yet.
+    assert.match(html, /<i>running<\/i>/);
+  });
+
+  it('falls back to the position row when no TPSL rows exist', () => {
+    const html = formatPositions([position({ tpPrice: '111000', slPrice: '97000' })], []);
+    assert.match(html, /TP: <code>111000<\/code>/);
+    assert.match(html, /SL: <code>97000<\/code>/);
+  });
+
+  it('renders unrealized PnL in dollars and as a percentage of margin', () => {
+    const html = formatPositions([position({ unrealizedPNL: '25', margin: '120' })], []);
+    assert.match(html, /PnL: ✅ <b>\$25\.00<\/b>  \(\+20\.83% on margin\)/);
+  });
+
+  it('renders a loss with a minus sign and a red marker', () => {
+    const html = formatPositions([position({ unrealizedPNL: '-11.5', margin: '120' })], []);
+    assert.match(html, /PnL: ❌ <b>-\$11\.50<\/b>/);
+  });
+
+  it('says so when nothing is open', () => {
+    assert.equal(formatPositions([], []), 'No open positions.');
+  });
+
+  it('escapes position ids and symbols', () => {
+    const html = formatPositions([position({ symbol: 'BTC&USDT', positionId: '<p1>' })], []);
+    assert.ok(!html.includes('<p1>'), 'a raw id would inject an HTML tag');
+    assert.match(html, /&lt;p1&gt;/);
+    assert.match(html, /BTC&amp;USDT/);
+  });
+});
+
+describe('margin sizing has exactly one live setting', async () => {
+  const { applySettings, SETTING_KEYS, DEFAULTS } = await import('../src/trader/settings.js');
+
+  it('routes the old margin names to the key the sizing code reads', () => {
+    // Sizing reads only position_sizing_margin_pct. The two older names used to
+    // be accepted, validated, echoed back as "set" — and then ignored, so
+    // `margin_amount_pct 25` in chat left every position at the 2% default.
+    const target = { ...DEFAULTS };
+    applySettings(target, { margin_amount_pct: 25 });
+    assert.equal(target.position_sizing_margin_pct, 25);
+    applySettings(target, { margin_risk_pct: 30 });
+    assert.equal(target.position_sizing_margin_pct, 30);
+    applySettings(target, { margin_pct: 12 });
+    assert.equal(target.position_sizing_margin_pct, 12);
+  });
+
+  it('no longer exposes a margin key that nothing reads', () => {
+    assert.ok(!SETTING_KEYS.includes('margin_amount_pct'));
+    assert.ok(!SETTING_KEYS.includes('margin_risk_pct'));
+    assert.ok(SETTING_KEYS.includes('position_sizing_margin_pct'));
+  });
+
+  it('rejects an impossible margin instead of clamping it silently', () => {
+    assert.throws(() => applySettings({ ...DEFAULTS }, { position_sizing_margin_pct: 250 }), /position_sizing_margin_pct/);
+    assert.throws(() => applySettings({ ...DEFAULTS }, { position_sizing_margin_pct: 0 }), /position_sizing_margin_pct/);
   });
 });

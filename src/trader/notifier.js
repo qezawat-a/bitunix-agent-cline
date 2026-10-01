@@ -27,8 +27,20 @@ export function escHtml(value) {
 }
 
 function num(value) {
+  // Number(null) and Number('') are both 0, so a missing price would otherwise
+  // be read as a real zero — the same null-vs-undefined trap that made every
+  // position-level TP/SL row look like a partial leg. Reject the non-numbers
+  // before coercing.
+  if (value === null || value === undefined || value === '') return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+// A price of 0 is never a real protection level, so it reads as "missing"
+// rather than as a stop at the origin.
+function positive(value) {
+  const n = num(value);
+  return n !== null && n > 0 ? n : null;
 }
 
 function fmt(value, digits = 4) {
@@ -131,6 +143,76 @@ export function tpslMessage(position, action, price) {
     `🛡 <b>${escHtml(labels[action] || 'Stop moved')}</b>`,
     `${escHtml(sideLabel(position?.side))} <code>${escHtml(position?.symbol || CONFIG.symbol)}</code>  SL → <code>${fmt(price)}</code>`,
   ].join('\n');
+}
+
+// Same logic closeMessage uses, split out so any code path (report, /positions,
+// /pnl) can render protections without re-reading a position's own row, which
+// PositionPendingResp never carries.
+function firstPrice(rows, key, fallback) {
+  for (const row of rows || []) {
+    const value = positive(row?.[key]);
+    if (value !== null) return value;
+  }
+  return positive(fallback);
+}
+
+// A short label for one open position, derived from the protection the exchange
+// actually holds. "NO TP/SL" is the state that matters most to an autonomous
+// trader: besides being a naked position, it is the one state the exchange
+// report showed as healthy. Break-even means the stop is already at or through
+// the entry, so whatever happens next the trade cannot lose more than a few
+// ticks of slippage.
+export function positionStatus({ entryPrice, side, slPrice, tpPrice }) {
+  const entry = num(entryPrice);
+  const sl = positive(slPrice);
+  const tp = positive(tpPrice);
+  if (tp === null && sl === null) return '⚠️ NO TP/SL';
+  if (sl !== null && entry !== null && entry > 0) {
+    // For a long the stop is above the entry (once saved); for a short below.
+    const direction = normalizeSide(side) === 'SELL' ? -1 : 1;
+    if ((sl - entry) * direction >= 0) return '🧷 break-even';
+  }
+  return 'running';
+}
+
+// Merges the pending TP/SL order rows (getPendingTPSL, one or more per position
+// depending on tpsl_method) into the position list and renders every open
+// position as a Telegram block: side, entry/qty/leverage, TP/SL/liquidation,
+// the unrealized PnL and the protection status.
+//
+// The position row itself carries unrealizedPNL and margin, so this needs no
+// mark price and no second round trip: the numbers shown are the position's own.
+export function formatPositions(positions, tpslRows = []) {
+  const rowsById = new Map();
+  for (const row of Array.isArray(tpslRows) ? tpslRows : []) {
+    const id = String(row?.positionId);
+    if (!rowsById.has(id)) rowsById.set(id, []);
+    rowsById.get(id).push(row);
+  }
+  const lines = [];
+  for (const position of Array.isArray(positions) ? positions : []) {
+    const rows = rowsById.get(String(position.positionId)) || [];
+    const tp = firstPrice(rows, 'tpPrice', position.tpPrice);
+    const sl = firstPrice(rows, 'slPrice', position.slPrice);
+    const side = normalizeSide(position.side);
+    const leverage = num(position.leverage) ?? 1;
+    const entry = num(position.avgPrice ?? position.avgOpenPrice ?? position.entryPrice);
+    const unrealized = num(position.unrealizedPNL ?? position.unrealizedPnl);
+    const margin = num(position.margin);
+    const pnlPct = unrealized !== null && margin !== null && margin > 0 ? (unrealized / margin) * 100 : null;
+    const status = positionStatus({ entryPrice: entry, side, slPrice: sl, tpPrice: tp });
+    lines.push(
+      `${directionEmoji(side)} <b>${sideLabel(side)}</b> <code>${escHtml(position.symbol || CONFIG.symbol)}</code> <code>${escHtml(String(position.positionId))}</code> — <i>${status}</i>`,
+      `Entry: <code>${fmt(entry)}</code>   Qty: <code>${fmt(position.qty ?? position.size)}</code>   Lev: <code>${leverage}x</code>`,
+      `TP: <code>${fmt(tp)}</code>   SL: <code>${fmt(sl)}</code>   Liq: <code>${fmt(position.liqPrice)}</code>`,
+    );
+    if (unrealized !== null) {
+      const sign = unrealized >= 0 ? '✅' : '❌';
+      const pct = pnlPct !== null ? `  (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}% on margin)` : '';
+      lines.push(`PnL: ${sign} <b>${usd(unrealized)}</b>${pct}`);
+    }
+  }
+  return lines.length ? lines.join('\n') : 'No open positions.';
 }
 
 // A minimal view of an open position, kept across ticks so a position can be

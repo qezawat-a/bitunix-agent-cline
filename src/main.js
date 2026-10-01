@@ -9,7 +9,7 @@ import { setTraderInstances, setPositionManager } from './trader/agent-tools.js'
 import { setBitunixClient } from './bitunix/futures-tools.js';
 import { createTraderCommands } from './telegram-trader.js';
 import { sendMessage, isOwner, setCommands, esc } from './telegram-bot.js';
-import { PositionNotifier } from './trader/notifier.js';
+import { PositionNotifier, formatPositions } from './trader/notifier.js';
 import { createAgent } from './agent/loop.js';
 import { buildSystemPrompt } from './prompt.js';
 import { basicTools, setBasicMemory } from './agent/basic-tools.js';
@@ -251,7 +251,21 @@ async function main() {
             }
           }
           if (reportState.reportOn && CONFIG.ALLOWED_USER_ID) {
-            await sendMessage(CONFIG.ALLOWED_USER_ID, `<b>${esc(CONFIG.AGENT_NAME)}</b> signal <b>${esc(signal.signal)}</b> <code>${esc(signal.symbol)}</code> @ <code>${esc(String(signal.price ?? signal.lastPrice ?? '-'))}</code>`);
+            // The report used to be a bare signal line, so "what am I holding
+            // right now" meant a separate /positions. Now every report carries
+            // the open positions with their TP/SL, unrealized PnL and status —
+            // the operator sees PnL and protection without a second command.
+            const headline = `<b>${esc(CONFIG.AGENT_NAME)}</b> signal <b>${esc(signal.signal)}</b> <code>${esc(signal.symbol)}</code> @ <code>${esc(String(signal.price ?? signal.lastPrice ?? '-'))}</code>`;
+            try {
+              const [positions, tpsl] = await Promise.all([
+                client.getPendingPositions(CONFIG.symbol).catch(() => []),
+                client.getPendingTPSL(CONFIG.symbol).catch(() => []),
+              ]);
+              await sendMessage(CONFIG.ALLOWED_USER_ID, `${headline}\n\n<b>Open positions</b>\n${formatPositions(positions, tpsl)}`);
+            } catch (error) {
+              console.error('report positions error:', error.message);
+              await sendMessage(CONFIG.ALLOWED_USER_ID, headline);
+            }
           }
         }
       } else {
