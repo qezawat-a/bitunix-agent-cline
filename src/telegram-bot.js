@@ -132,10 +132,20 @@ export async function setCommands() {
 }
 
 export function formatSignalReport(res) {
+  // strategyDirections is a name -> direction map, not an array, so it has to be
+  // read through Object.values/Object.keys: spreading it threw
+  // "(s.strategyDirections || {}) is not iterable" and took the whole /signal
+  // report down. The denominator is the number of strategies that actually ran
+  // on this timeframe rather than a hardcoded 10, which was wrong whenever a
+  // strategy had no usable series.
   const tfRows = Object.entries(res.tfSignals || {})
-    .map(([tf, s]) => `${esc(tf)}: ${esc(s.direction)} <code>${esc(String(s.confidence))}</code>% `
-      + `<code>${esc(String(s.alignedWeight))}</code>/<code>${esc(String(s.activeWeight))}</code>w `
-      + `(${[...(s.strategyDirections || {})].filter(d => d === s.direction).length}/10)`)
+    .map(([tf, s]) => {
+      const names = Object.keys(s.strategyDirections || {});
+      const agreeing = Object.values(s.strategyDirections || {}).filter(d => d === s.direction).length;
+      return `${esc(tf)}: ${esc(s.direction)} <code>${esc(String(s.confidence))}</code>% `
+        + `<code>${esc(String(s.alignedWeight))}</code>/<code>${esc(String(s.activeWeight))}</code>w `
+        + `(${esc(String(agreeing))}/${esc(String(names.length))})`;
+    })
     .join('\n');
   // The gates that rejected the signal are printed on purpose: "hold" with no
   // reason is indistinguishable from a broken scanner.

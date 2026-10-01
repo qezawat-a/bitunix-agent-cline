@@ -25,6 +25,7 @@ import {
   validateLadder,
 } from '../src/trader/tpsl.js';
 import { PositionManager } from '../src/trader/position-manager.js';
+import { formatSignalReport } from '../src/telegram-bot.js';
 
 // computeTPSL is an instance method but is pure, so it is exercised through a
 // client-less PositionManager rather than a network double.
@@ -1477,5 +1478,68 @@ describe('the scanner needs more than one timeframe to call a direction', () => 
     const aligned = eligible.filter(r => (r.score > 0 ? 'bullish' : 'bearish') === direction).length;
     const quorum = Math.max(1, Math.ceil(eligible.length / 2));
     assert.ok(aligned < quorum, 'the loud minority must not reach quorum');
+  });
+});
+
+describe('the /signal report renders a real scan result', () => {
+  // Built from what the scanner actually returns: strategyDirections is the
+  // name -> direction map from indicators.js, not a list. The report used to
+  // spread it with [...map], which threw "not iterable" and turned every
+  // /signal into "Error: (s.strategyDirections || {}) is not iterable".
+  const scan = (over = {}) => ({
+    symbol: 'BTCUSDT',
+    signal: 'HOLD',
+    rawDirection: 'bullish',
+    rawConfidence: 62,
+    eligibleTimeframes: 1,
+    timeframesAgree: false,
+    alignedTimeframes: 1,
+    agreeingStrategies: 3,
+    lastPrice: 64000.5,
+    tfSignals: {
+      '15m': {
+        direction: 'bullish',
+        confidence: 62,
+        alignedWeight: 3,
+        activeWeight: 5,
+        strategyDirections: { macd: 'bullish', ema: 'bullish', rsi: 'bearish', vwap: 'bullish', atr: 'neutral' },
+      },
+      '1h': {
+        direction: 'bearish',
+        confidence: 41,
+        alignedWeight: 1,
+        activeWeight: 5,
+        strategyDirections: { macd: 'bearish', ema: 'bullish', rsi: 'bearish', vwap: 'neutral', atr: 'neutral' },
+      },
+    },
+    ...over,
+  });
+
+  it('counts agreeing strategies without spreading the direction map', () => {
+    const html = formatSignalReport(scan());
+    assert.match(html, /\(3\/5\)/, 'bullish strategies on 15m, out of the five that ran');
+    assert.match(html, /\(2\/5\)/, 'bearish strategies on 1h');
+  });
+
+  it('counts the strategies that ran rather than assuming ten', () => {
+    // A strategy with no usable series is absent from the map, so a hardcoded
+    // "/10" would report a denominator wider than the ones that produced it.
+    const res = scan({ tfSignals: { '5m': { direction: 'bullish', confidence: 90, alignedWeight: 2, activeWeight: 2, strategyDirections: { macd: 'bullish', ema: 'bullish' } } } });
+    assert.match(formatSignalReport(res), /\(2\/2\)/);
+  });
+
+  it('survives a timeframe with no strategy detail at all', () => {
+    for (const missing of [{}, { strategyDirections: null }, { strategyDirections: undefined }]) {
+      const res = scan({ tfSignals: { '5m': { direction: 'neutral', confidence: 0, alignedWeight: 0, activeWeight: 0, ...missing } } });
+      const html = formatSignalReport(res);
+      assert.match(html, /\(0\/0\)/, JSON.stringify(missing));
+    }
+  });
+
+  it('names the gate that rejected the signal instead of printing a bare hold', () => {
+    const html = formatSignalReport(scan());
+    assert.match(html, /HOLD because/);
+    assert.match(html, /min_confidence/, 'raw confidence below the gate must be shown');
+    assert.match(html, /timeframes split 1\/1/, 'the timeframe quorum failure must be shown');
   });
 });
