@@ -33,6 +33,13 @@ import {
   tierForLeverage,
   tierForValue,
 } from '../src/bitunix/tiers.js';
+import {
+  STRATEGIES,
+  STRATEGY_KEYS,
+  TOTAL_STRATEGY_WEIGHT,
+  computeSignal,
+  describeStrategies,
+} from '../src/bitunix/indicators.js';
 import { formatSignalReport, splitHtml } from '../src/telegram-bot.js';
 import { formatPositions, positionStatus } from '../src/trader/notifier.js';
 
@@ -2262,5 +2269,74 @@ describe('liquidation guards run before any profit-side stop management', () => 
     // ROI is +100% here, far over both the break-even and trailing triggers, so
     // the old ordering sent a stop move before the emergency close.
     assert.deepEqual(calls, ['place', 'close'], 'protection is placed, then the close; no stop move');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The agent claimed the bot had 5 strategies and that the list was hardcoded to
+// them. It was reading prose: soul/SOUL.md and soul/STYLE.md described "5 core
+// targeted indicators (RSI, MOM, MACD, BBB, EMA)", which had never matched the
+// code. computeSignal() scores ten. With no tool that reported the real set, the
+// prompt was the only thing the agent could go on, so it repeated the wrong
+// number back as fact and refused to touch the strategy set.
+//
+// STRATEGIES is now the single source of truth. These tests pin it to what the
+// scanner actually scores, so the two cannot drift apart again.
+// ---------------------------------------------------------------------------
+
+describe('the declared strategy set is the set the scanner scores', () => {
+  function fakeKlines(count = 80) {
+    return Array.from({ length: count }, (_, i) => ({
+      open: String(100 + i), high: String(102 + i), low: String(99 + i), close: String(101 + i),
+      baseVol: String(1000 + i),
+    }));
+  }
+
+  it('declares the ten strategies the scanner actually emits', () => {
+    const klines = fakeKlines();
+    const signal = computeSignal(klines, klines.map(k => Number(k.baseVol)), 0.0001);
+    assert.equal(STRATEGIES.length, 10, 'ten strategies are declared');
+    assert.deepEqual(Object.keys(signal.strategyDirections).sort(), [...STRATEGY_KEYS].sort(),
+      'computeSignal emits exactly the declared keys');
+    assert.deepEqual(Object.keys(signal.contributions).sort(), [...STRATEGY_KEYS].sort(),
+      'every declared strategy carries a weight');
+    assert.equal(TOTAL_STRATEGY_WEIGHT, 146, 'the total weight matches the summed set');
+    assert.equal(
+      Object.values(signal.contributions).reduce((sum, value) => sum + Math.abs(value), 0) <= TOTAL_STRATEGY_WEIGHT,
+      true,
+    );
+  });
+
+  it('never leaves a declared strategy unweighted when it abstains', () => {
+    const klines = fakeKlines();
+    const signal = computeSignal(klines, klines.map(k => Number(k.baseVol)), 0);
+    // A strategy that abstains contributes 0 but must still be reported, so the
+    // scanner's breadth maths can see it existed and did not vote.
+    for (const key of STRATEGY_KEYS) {
+      assert.ok(key in signal.strategyDirections, `${key} is always reported`);
+      assert.ok(['bullish', 'bearish', 'neutral'].includes(signal.strategyDirections[key]));
+    }
+  });
+
+  it('reports ten to the agent, not five', async () => {
+    const described = describeStrategies();
+    assert.equal(described.length, 10);
+    assert.deepEqual(
+      described.map(s => s.name),
+      ['EMA', 'RSI', 'MACD', 'VOLUME', 'MOM', 'ADX', 'BBB', 'FUNDING', 'SUPERTREND', 'ATR_BREAKOUT'],
+    );
+    // The names the agent was told about by name.
+    for (const expected of ['EMA', 'RSI', 'MACD', 'SUPERTREND', 'MOM', 'BBB', 'VOLUME', 'ATR_BREAKOUT', 'FUNDING']) {
+      assert.ok(described.some(s => s.name === expected), `${expected} is in the set`);
+    }
+  });
+
+  it('does not silently contain ICHIMOKU, which was asked for but never implemented', () => {
+    // The user asked to set EMA,RSI,MACD,SUPERTREND,MOMENTUM,ICHIMOKU,BOLLINGER,
+    // VOLUME,ATR_BREAKOUT,FUNDING_RATE. Ichimoku is not implemented; ADX is the
+    // strategy that list missed. The agent must be able to see that from the
+    // tool rather than agreeing that Ichimoku is already active.
+    assert.ok(!STRATEGY_KEYS.includes('ichimoku'));
+    assert.ok(STRATEGY_KEYS.includes('adx'));
   });
 });

@@ -10,6 +10,34 @@ function validSeries(values) {
 // five strategies clear it.
 const STRATEGY_BREADTH_FLOOR = 0.4;
 
+// The strategy set, in one place, so nothing has to restate it and get it wrong.
+//
+// computeSignal() below is the only consumer, and every key listed here is
+// passed to add() exactly once. The agent's system prompt used to describe
+// "5 core strategies (RSI, MOM, MACD, BBB, EMA)" — a list that was never this
+// file's — so the agent confidently answered "the consensus logic is hardcoded
+// to 5 indicators" and refused to touch the strategy set, while the code
+// actually scored ten. Anything that needs to describe or validate the strategy
+// set must read it from here instead of from prose.
+export const STRATEGIES = Object.freeze([
+  { key: 'ema', label: 'EMA', weight: 18, reads: 'EMA 20/50 trend orientation' },
+  { key: 'rsi', label: 'RSI', weight: 14, reads: 'RSI(14) overbought / oversold zones' },
+  { key: 'macd', label: 'MACD', weight: 18, reads: 'MACD 12/26/9 histogram + signal cross' },
+  { key: 'volume', label: 'VOLUME', weight: 10, reads: 'volume expansion confirmed by the candle' },
+  { key: 'momentum', label: 'MOM', weight: 14, reads: 'MOM(10) velocity and velocity shift' },
+  { key: 'adx', label: 'ADX', weight: 14, reads: 'ADX(14) trend strength and +DI/-DI bias' },
+  { key: 'bollinger', label: 'BBB', weight: 12, reads: 'Bollinger(20,2) band pierce / squeeze' },
+  { key: 'funding', label: 'FUNDING', weight: 6, reads: 'funding rate crowding' },
+  { key: 'supertrend', label: 'SUPERTREND', weight: 18, reads: 'SuperTrend(10,3) flip side' },
+  { key: 'atr_breakout', label: 'ATR_BREAKOUT', weight: 22, reads: 'ATR(14) channel breakout' },
+].map(Object.freeze));
+
+export const STRATEGY_KEYS = Object.freeze(STRATEGIES.map(strategy => strategy.key));
+
+// Total weight across the whole book; the confidence formula scales agreement by
+// how much of it actually voted.
+export const TOTAL_STRATEGY_WEIGHT = STRATEGIES.reduce((sum, strategy) => sum + strategy.weight, 0);
+
 function alignedEma(values, period) {
   if (!validSeries(values) || period < 1 || values.length < period) return [];
   const output = new Array(values.length).fill(null);
@@ -268,7 +296,10 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
   if (!validSeries(all) || all.some(value => value <= 0)) throw new Error('kline values must be positive finite numbers');
 
   const last = closes.at(-1);
-  const weights = { ema: 18, rsi: 14, macd: 18, volume: 10, momentum: 14, adx: 14, bollinger: 12, funding: 6, supertrend: 18, atr_breakout: 22 };
+  // Weights come from STRATEGIES so the declared set and the scored set cannot
+  // drift apart; add() is called exactly once per key further down, and an
+  // unknown key would read as undefined here rather than silently scoring 0.
+  const weights = Object.fromEntries(STRATEGIES.map(strategy => [strategy.key, strategy.weight]));
   const strategyDirections = {};
   const contributions = {};
   const add = (name, direction, detail = direction) => {
@@ -356,4 +387,20 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
     momentum,
     volumeRatio: volumeValue,
   };
+}
+
+// The strategy set as the agent sees it, derived from the same constants
+// computeSignal scores with. Exists so "how many strategies do we have" and
+// "which ones" have one truthful answer that cannot fall out of step with the
+// scanner. `strategyDirections` from a real scan can be passed in to see which
+// of them actually spoke on the latest timeframe.
+export function describeStrategies(strategyDirections = null) {
+  const spoken = strategyDirections && typeof strategyDirections === 'object' ? strategyDirections : null;
+  return STRATEGIES.map(strategy => ({
+    key: strategy.key,
+    name: strategy.label,
+    weight: strategy.weight,
+    reads: strategy.reads,
+    lastDirection: spoken ? (spoken[strategy.key] ?? 'not scanned') : undefined,
+  }));
 }

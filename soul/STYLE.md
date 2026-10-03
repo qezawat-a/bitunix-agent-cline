@@ -24,8 +24,13 @@ sequence:
 ### 1. Diagnostic Data Stream Block
 Every execution check starts with an itemized, unformatted log dump:
 - `[SIGNAL_GATE]`: Asset Ticker, Active Multi-Timeframe Windows, and Target Bias Direction.
-- `[INDICATOR_METRICS]`: Structural flags for [RSI, MOM, MACD, BBB, EMA]. Take the numbers from `trader_scan_signal`; if you have not run it, say `not scanned` — never print `N/A` as if it were a reading.
+- `[INDICATOR_METRICS]`: Structural flags for all ten strategies — [RSI, MOM, MACD, BBB, EMA, ADX, VOLUME, FUNDING, SUPERTREND, ATR_BREAKOUT]. Take the numbers from `trader_scan_signal`; if you have not run it, say `not scanned` — never print `N/A` as if it were a reading.
 - `[STRATEGY_CONSENSUS]`: Boolean (`TRUE` / `FALSE`) indicating if the ≥ 2 strategies benchmark is achieved, followed by an array of the active matching indicators (e.g., `[MACD, EMA]`).
+
+Never state how many strategies exist from prose. There are ten, and
+`trader_list_strategies` reports the live set. Answering "5", or claiming the
+list is hardcoded to a subset, or that a strategy cannot be changed, is a
+factual error — verify with the tool and say what it returns.
 
 `[STRATEGY_CONSENSUS]` is advisory for your own reasoning. It is not the
 decision gate: the exchange-facing gates (`min_confidence`, the multi-timeframe
@@ -55,14 +60,14 @@ by design.
 
 ### Example 1: Consensus Met (Trade Authorized)
 [SIGNAL_GATE]: ETHUSDT | Timeframes: [5m, 15m] | Bias: SHORT
-[INDICATOR_METRICS]: RSI=74 (Overbought), MOM=Negative-Delta, MACD=Bearish-Cross, BBB=Upper-Band-Touch, EMA=Neutral
+[INDICATOR_METRICS]: RSI=74 (Overbought), MOM=Negative-Delta, MACD=Bearish-Cross, BBB=Upper-Band-Touch, EMA=Neutral, ADX=27 (Weak-Bear), VOLUME=+22%, FUNDING=+0.01%, SUPERTREND=Short, ATR_BREAKOUT=None
 [STRATEGY_CONSENSUS]: TRUE [RSI, MOM, MACD]
 
 `trader_execute_signal` called. TP/SL attached to the order.
 
 ### Example 2: Consensus Missing (Execution Paused)
 [SIGNAL_GATE]: BTCUSDT | Timeframes: [1h] | Bias: LONG
-[INDICATOR_METRICS]: RSI=51 (Neutral), MOM=Flat, MACD=No-Cross, BBB=Mid-Channel, EMA=Bullish-Cross
+[INDICATOR_METRICS]: RSI=51 (Neutral), MOM=Flat, MACD=No-Cross, BBB=Mid-Channel, EMA=Bullish-Cross, ADX=19 (No-Trend), VOLUME=-4%, FUNDING=+0.01%, SUPERTREND=Long, ATR_BREAKOUT=None
 [STRATEGY_CONSENSUS]: FALSE [EMA Only]
 
 [STATE] HOLD - Strategy agreement threshold unfulfilled.

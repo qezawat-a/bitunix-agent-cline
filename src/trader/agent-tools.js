@@ -1,6 +1,7 @@
 import { CONFIG } from '../config.js';
 import { applySettings, getTraderSettings, resolveSettingKey } from './settings.js';
 import { convert, positionSizeFromUnit } from '../bitunix/order-units.js';
+import { STRATEGIES, TOTAL_STRATEGY_WEIGHT, describeStrategies } from '../bitunix/indicators.js';
 import { describeTpslMethods } from './tpsl.js';
 
 let sharedTrader = null;
@@ -33,6 +34,42 @@ export const traderTools = [
     async handler() {
       if (!sharedTrader) throw new Error('Trader not ready');
       return sharedTrader.scanOnly();
+    },
+  },
+  {
+    name: 'trader_list_strategies',
+    description: 'List the indicator strategies the consensus gate actually scores, with each weight and what it reads, plus the consensus thresholds in force. Call this before answering anything about the strategy set — do not rely on prose.',
+    parameters: {
+      type: 'object',
+      properties: {
+        includeLastScan: { type: 'boolean', description: 'also report each strategy\'s direction on the most recent scan' },
+      },
+    },
+    async handler({ includeLastScan }) {
+      let strategyDirections = null;
+      if (includeLastScan && sharedTrader) {
+        try {
+          const scan = await sharedTrader.scanOnly();
+          const first = CONFIG.timeframes[0];
+          strategyDirections = scan?.tfSignals?.[first]?.strategyDirections ?? null;
+        } catch {
+          // A failed scan must not hide the strategy list; report it unscanned.
+        }
+      }
+      return {
+        count: STRATEGIES.length,
+        strategies: describeStrategies(strategyDirections),
+        totalWeight: TOTAL_STRATEGY_WEIGHT,
+        consensus: {
+          min_agreeing_strategies: CONFIG.min_agreeing_strategies,
+          min_confidence: CONFIG.min_confidence,
+          tf_min_confidence: CONFIG.tf_min_confidence,
+          min_eligible_timeframes: CONFIG.min_eligible_timeframes,
+          timeframes: CONFIG.timeframes,
+        },
+        note: 'The consensus set is fixed in src/bitunix/indicators.js and is not configurable at runtime. '
+          + 'Change STRATEGIES there to add or remove one.',
+      };
     },
   },
   {
