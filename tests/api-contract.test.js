@@ -25,6 +25,14 @@ import {
   validateLadder,
 } from '../src/trader/tpsl.js';
 import { PositionManager } from '../src/trader/position-manager.js';
+import {
+  maintenanceMarginCheck,
+  maxNotionalForLeverage,
+  normalizeTiers,
+  positionNotionalValue,
+  tierForLeverage,
+  tierForValue,
+} from '../src/bitunix/tiers.js';
 import { formatSignalReport, splitHtml } from '../src/telegram-bot.js';
 import { formatPositions, positionStatus } from '../src/trader/notifier.js';
 
@@ -123,6 +131,8 @@ const SDK_PATHS = {
 const EXTRA_PATHS = {
   POSITION_MODE: '/api/v1/futures/account/position_mode',
   GET_FUNDING_RATE_HISTORY: '/api/v1/futures/market/get_funding_rate_history',
+  GET_TRADING_SETTINGS: '/api/v1/futures/account/trading_settings',
+  CP_ASSET_QUERY: '/api/v1/cp/asset/query',
 };
 
 // enums/*.java
@@ -158,6 +168,8 @@ const ENDPOINTS = [
   { name: 'getAccount', sdk: 'GET_ACCOUNT', run: c => c.getAccount('USDT') },
   { name: 'getLeverageAndMarginMode', sdk: 'GET_LEVERAGE_AND_MARGIN_MODE', run: c => c.getLeverageAndMarginMode('BTCUSDT', 'USDT') },
   { name: 'getPositionMode', sdk: null, extra: 'POSITION_MODE', run: c => c.getPositionMode() },
+  { name: 'getTradingSettings', sdk: null, extra: 'GET_TRADING_SETTINGS', run: c => c.getTradingSettings('BTCUSDT') },
+  { name: 'assetQuery', sdk: null, extra: 'CP_ASSET_QUERY', run: c => c.assetQuery() },
   { name: 'getPendingPositions', sdk: 'GET_PENDING_POSITIONS', run: c => c.getPendingPositions('BTCUSDT') },
   { name: 'getHistoryPositions', sdk: 'GET_HISTORY_POSITIONS', run: c => c.getHistoryPositions('BTCUSDT') },
   { name: 'getPendingOrders', sdk: 'GET_PENDING_ORDERS', run: c => c.getPendingOrders('BTCUSDT') },
@@ -230,7 +242,7 @@ const ENDPOINTS = [
 const TPSL_ORDER_ENDPOINTS = [
   {
     name: 'placeTPSLOrder', sdk: 'PLACE_TPSL_ORDER',
-    run: c => c.placeTPSLOrder({ symbol: 'BTCUSDT', tpPrice: '110' }),
+    run: c => c.placeTPSLOrder({ symbol: 'BTCUSDT', positionId: 'p-1', tpPrice: '110' }),
   },
   {
     name: 'modifyTPSLOrder', sdk: 'MODIFY_TPSL_ORDER',
@@ -468,10 +480,10 @@ describe('bitunix REST contract: wire enums (enums/*.java)', () => {
     const c = client();
     stubFetch();
     for (const stopType of SDK_ENUMS.StopTriggerType) {
-      await c.placeTPSLOrder({ symbol: 'BTCUSDT', tpPrice: '110', tpStopType: stopType, slStopType: stopType });
+      await c.placeTPSLOrder({ symbol: 'BTCUSDT', positionId: 'p-1', tpPrice: '110', tpStopType: stopType, slStopType: stopType });
     }
     await assert.rejects(
-      () => c.placeTPSLOrder({ symbol: 'BTCUSDT', tpPrice: '110', tpStopType: 'INDEX_PRICE' }),
+      () => c.placeTPSLOrder({ symbol: 'BTCUSDT', positionId: 'p-1', tpPrice: '110', tpStopType: 'INDEX_PRICE' }),
       /tpStopType must be LAST_PRICE or MARK_PRICE/,
     );
   });
@@ -482,10 +494,10 @@ describe('bitunix REST contract: wire enums (enums/*.java)', () => {
     const c = client();
     stubFetch();
     for (const orderType of SDK_ENUMS.TpslOrderType) {
-      await c.placeTPSLOrder({ symbol: 'BTCUSDT', tpPrice: '110', tpOrderType: orderType });
+      await c.placeTPSLOrder({ symbol: 'BTCUSDT', positionId: 'p-1', tpPrice: '110', tpOrderType: orderType });
     }
     await assert.rejects(
-      () => c.placeTPSLOrder({ symbol: 'BTCUSDT', tpPrice: '110', tpOrderType: 2 }),
+      () => c.placeTPSLOrder({ symbol: 'BTCUSDT', positionId: 'p-1', tpPrice: '110', tpOrderType: 2 }),
       /tpOrderType must be LIMIT or MARKET/,
     );
   });
@@ -582,7 +594,9 @@ const SDK_MODELS = {
   tpslPending: { id: 'tp-1', positionId: 'p-1', symbol: 'BTCUSDT', base: 'BTC', quote: 'USDT', tpPrice: '110', tpStopType: 'LAST_PRICE', slPrice: '90', slStopType: 'MARK_PRICE', tpOrderType: 'LIMIT', tpOrderPrice: '111', slOrderType: 'MARKET', slOrderPrice: '0', tpQty: '0.5', slQty: '0.5' },
   tpslHistory: { id: 'tp-1', positionId: 'p-1', symbol: 'BTCUSDT', base: 'BTC', quote: 'USDT', tpPrice: '110', tpStopType: 'LAST_PRICE', slPrice: '90', slStopType: 'MARK_PRICE', tpOrderType: 'LIMIT', tpOrderPrice: '111', slOrderType: 'MARKET', slOrderPrice: '0', tpQty: '0.5', slQty: '0.5', status: 'FILLED', ctime: 1, triggerTime: 2 },
   tradingPair: { symbol: 'BTCUSDT', base: 'BTC', quote: 'USDT', basePrecision: '0.001', quotePrecision: '0.01', minTradeVolume: '0.001', maxMarketOrderVolume: '100', maxLimitOrderVolume: '100', maxLeverage: 125 },
-  positionTier: { symbol: 'BTCUSDT', minQty: '0', maxQty: '1', marginCoin: 'USDT', minLeverage: 1, maxLeverage: 10, maintenanceMarginRate: '0.005' },
+  // Shape and example values from the get_position_tiers docs:
+  // {symbol, level, startValue, endValue, leverage, maintenanceMarginRate}.
+  positionTier: { symbol: 'BTCUSDT', level: 1, startValue: '0', endValue: '50000', leverage: 125, maintenanceMarginRate: '0.004' },
 };
 
 // ---------------------------------------------------------------------------
@@ -656,7 +670,7 @@ describe('bitunix REST contract: response unwrapping (response/*.java)', () => {
     assert.equal(pairs[0].maxLeverage, 125, 'trading_pairs carries the precision metadata callers need');
     const tiers = await client().getPositionTiers('BTCUSDT');
     assert.equal(tiers.length, 1);
-    assert.equal(tiers[0].maintenanceMarginRate, '0.005');
+    assert.equal(tiers[0].maintenanceMarginRate, '0.004');
   });
 
   it('getAccount picks the requested marginCoin out of the list form', async () => {
@@ -726,7 +740,7 @@ describe('bitunix REST contract: order-level TP/SL endpoints', () => {
 
   it('placeTPSLOrder is the order-level pair, not the position-level one', { skip: missing('placeTPSLOrder') }, async () => {
     const calls = stubFetch();
-    await client().placeTPSLOrder({ symbol: 'BTCUSDT', tpPrice: '110', slPrice: '90', tpOrderType: 'LIMIT', slOrderType: 'MARKET' });
+    await client().placeTPSLOrder({ symbol: 'BTCUSDT', positionId: 'p-1', tpPrice: '110', slPrice: '90', tpOrderType: 'LIMIT', slOrderType: 'MARKET' });
     // FuturesPath has both /tpsl/place_order and /tpsl/position/place_order; the
     // first is the one that carries tpQty/slQty (a partial exit), the second is
     // the whole-position pair. Mixing them up silently trades the wrong size.
@@ -735,19 +749,22 @@ describe('bitunix REST contract: order-level TP/SL endpoints', () => {
     assert.equal(calls[0].body.tpOrderType, 'LIMIT');
   });
 
-  it('placeTPSLOrder requires a symbol and at least one stop price', { skip: missing('placeTPSLOrder') }, async () => {
+  it('placeTPSLOrder requires a symbol, a positionId and at least one stop price', { skip: missing('placeTPSLOrder') }, async () => {
     stubFetch();
     const c = client();
     await assert.rejects(() => c.placeTPSLOrder({ tpPrice: '110' }), /requires a symbol/);
-    await assert.rejects(() => c.placeTPSLOrder({ symbol: 'BTCUSDT' }), /at least one of tpPrice or slPrice/);
+    // The docs mark positionId required for place_tp_sl_order: the pair has to
+    // hang off a position, so a request without one must never reach the wire.
+    await assert.rejects(() => c.placeTPSLOrder({ symbol: 'BTCUSDT', tpPrice: '110' }), /requires positionId/);
+    await assert.rejects(() => c.placeTPSLOrder({ symbol: 'BTCUSDT', positionId: 'p-1' }), /at least one of tpPrice or slPrice/);
   });
 
   it('placeTPSLOrder keeps the partial-exit quantities the SDK models', { skip: missing('placeTPSLOrder') }, async () => {
     const calls = stubFetch();
-    await client().placeTPSLOrder({ symbol: 'BTCUSDT', tpPrice: '110', tpQty: '0.4' });
+    await client().placeTPSLOrder({ symbol: 'BTCUSDT', positionId: 'p-1', tpPrice: '110', tpQty: '0.4' });
     assert.equal(calls[0].body.tpQty, '0.4');
     await assert.rejects(
-      () => client().placeTPSLOrder({ symbol: 'BTCUSDT', tpPrice: '110', tpQty: '-1' }),
+      () => client().placeTPSLOrder({ symbol: 'BTCUSDT', positionId: 'p-1', tpPrice: '110', tpQty: '-1' }),
       /tpQty must be a positive partial quantity/,
     );
   });
@@ -862,7 +879,10 @@ describe('order units (help centre id=170)', () => {
     assert.throws(() => convert({ value: 0, from: 'nominal', to: 'cost', price: PRICE, leverage: LEVERAGE }), /positive/);
     assert.throws(() => convert({ value: 1, from: 'nope', to: 'cost', price: PRICE, leverage: LEVERAGE }), /unknown order unit/);
     assert.throws(() => convert({ value: 1, from: 'nominal', to: 'cost', price: 0, leverage: LEVERAGE }), /price/);
-    assert.throws(() => convert({ value: 1, from: 'nominal', to: 'cost', price: PRICE, leverage: 200 }), /1-125/);
+    // The local bound is the documented example ceiling (trading_pairs shows
+    // BTCUSDT maxLeverage 125); the guard fires above it and the exchange
+    // remains the authority.
+    assert.throws(() => convert({ value: 1, from: 'nominal', to: 'cost', price: PRICE, leverage: 500 }), /1-125/);
     assert.throws(() => convert({ value: 1, from: 'nominal', to: 'cost', price: PRICE, leverage: 2.5 }), /integer/);
   });
 
@@ -1159,6 +1179,136 @@ describe('a position is closed at most once per manage cycle', () => {
       'a still-open position must be closable again on the next tick');
     assert.equal(closes.filter(id => id === 'p1').length, closes.length,
       'every close targets the reopened position');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tiered risk limit — the Bitunix liquidation mechanism.
+//
+// Sources:
+//  - https://support.bitunix.com/hc/en-us/articles/32152530856601-Bitunix-Futures-Liquidation-Mechanism-and-Tiered-Risk-Limit
+//  - https://www.bitunix.com/api-docs/futures/position/get_position_tiers.html
+//
+// The tiers endpoint states the trigger verbatim: "When the margin rate of a
+// position is less than the maintenance margin rate, it will trigger a forced
+// partial liquidation or full liquidation." These tests pin the pure ladder
+// maths and the guard that acts on it.
+// ---------------------------------------------------------------------------
+describe('tiered risk limit (get_position_tiers)', () => {
+  // Synthetic three-tier ladder in the documented shape/ordering, with values
+  // chosen so each tier boundary is exercised. Not a quote of BTCUSDT.
+  const TIERS = [
+    { symbol: 'BTCUSDT', level: 1, startValue: '0', endValue: '100000', leverage: 200, maintenanceMarginRate: '0.003' },
+    { symbol: 'BTCUSDT', level: 2, startValue: '100000', endValue: '400000', leverage: 150, maintenanceMarginRate: '0.004' },
+    { symbol: 'BTCUSDT', level: 3, startValue: '400000', endValue: '1000000', leverage: 100, maintenanceMarginRate: '0.005' },
+  ];
+
+  it('normalises strings to numbers, drops unordered rows and re-sorts by startValue', () => {
+    const rows = normalizeTiers([TIERS[2], TIERS[0], { level: 9, startValue: '5', endValue: '5' }, TIERS[1]]);
+    assert.deepEqual(rows.map(t => t.level), [1, 2, 3], 'sorted ascending, degenerate rows dropped');
+    assert.equal(rows[0].maintenanceMarginRate, 0.003, 'string decimals become numbers');
+  });
+
+  it('measures the tier on |qty| x mark and prefers the live mark over the entry', () => {
+    assert.equal(positionNotionalValue({ qty: '2', markPrice: '110', avgPrice: '100' }), 220);
+    // A short has a negative signed qty; the tier is measured on the value.
+    assert.equal(positionNotionalValue({ qty: '-2', avgPrice: '100' }), 200);
+    assert.equal(positionNotionalValue({ markPrice: '100' }), null, 'no size -> cannot be sized');
+  });
+
+  it('picks the tier whose value range contains the position value', () => {
+    assert.equal(tierForValue(TIERS, 50).level, 1);
+    assert.equal(tierForValue(TIERS, 100000).level, 2, 'startValue is inclusive');
+    assert.equal(tierForValue(TIERS, 99999).level, 1, 'endValue is exclusive');
+    assert.equal(tierForValue(TIERS, 5e6).level, 3, 'past the last tier clamps to the highest');
+  });
+
+  it('picks the governing tier from the leverage the user selects', () => {
+    // 200x only fits tier 1; 150x fits tier 2 (the tightest that admits it).
+    assert.equal(tierForLeverage(TIERS, 200).level, 1);
+    assert.equal(tierForLeverage(TIERS, 150).level, 2);
+    assert.equal(tierForLeverage(TIERS, 120).level, 2);
+    assert.equal(tierForLeverage(TIERS, 100).level, 3);
+    assert.equal(tierForLeverage(TIERS, 250), null, 'no tier admits a leverage above the top');
+    assert.equal(maxNotionalForLeverage(TIERS, 200), 100000);
+  });
+
+  it('flags a position whose margin rate is under the tier maintenance margin rate', () => {
+    const position = { qty: '1', markPrice: '110', marginRate: '0.001' };
+    const check = maintenanceMarginCheck(position, TIERS);
+    assert.equal(check.checked, true);
+    assert.equal(check.tier.level, 1);
+    assert.equal(check.maintenanceMarginRate, 0.003);
+    assert.equal(check.breached, true, '0.1% margin rate is under the 0.3% maintenance margin rate');
+    // At or above the maintenance margin rate the position is not in breach.
+    assert.equal(maintenanceMarginCheck({ ...position, marginRate: '0.003' }, TIERS).breached, false);
+    // Half a field is never "safe": the check reports it cannot decide.
+    assert.equal(maintenanceMarginCheck({ qty: '1', markPrice: '110' }, TIERS).checked, false);
+    assert.equal(maintenanceMarginCheck(position, []).checked, false);
+  });
+});
+
+describe('the maintenance-margin guard exits a position before the exchange force-reduces it', () => {
+  const settings = (over = {}) => ({
+    symbol: 'BTCUSDT', leverage: 10, min_confidence: 80,
+    tpsl_method: 'position', breakeven_threshold_pct: 20, trailing_trigger_roi_pct: 25,
+    trailing_callback_pct: 5, sl_liquidation_safety: 90, cooldown_minutes: 1,
+    on_tpsl_failure: 'close', max_positions: 3,
+    account_tp_roi_pct: 0, account_sl_roi_pct: 0,
+    partial_tp_fractions: [0.3, 0.4, 0.3], partial_tp_roi_steps: [1, 2, 3],
+    ...over,
+  });
+
+  // A liquidation price far from the mark (so the price-distance guard skips),
+  // but a margin rate under the tier's maintenance margin rate: exactly the
+  // state the tiers endpoint says triggers a forced liquidation.
+  const breaching = {
+    positionId: 'p1', symbol: 'BTCUSDT', side: 'BUY', qty: '1',
+    avgPrice: '100', markPrice: '110', liqPrice: '1', marginRate: '0.001',
+  };
+
+  it('closes with the maintenance_margin reason when the margin rate is under the tier rate', async () => {
+    const closes = [];
+    const reasons = [];
+    const client = {
+      getPendingPositions: async () => [breaching],
+      closePosition: async (_symbol, positionId) => { closes.push(positionId); return { orderId: `x-${positionId}` }; },
+      getPendingTPSL: async () => [],
+      placeTPSL: async () => ({ orderId: 'sl-1' }),
+      modifyTPSL: async () => ({ orderId: 'sl-1' }),
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getTickers: async () => [{ markPrice: '110' }],
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+      getPositionTiers: async () => [
+        { symbol: 'BTCUSDT', level: 1, startValue: '0', endValue: '1000000', leverage: 200, maintenanceMarginRate: '0.003' },
+      ],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings());
+    pm.notifier = { noteClose: (positionId, reason) => reasons.push([positionId, reason]) };
+    await pm.midManage();
+    assert.deepEqual(closes, ['p1'], 'the breaching position is closed once');
+    assert.deepEqual(reasons, [['p1', 'maintenance_margin']], 'and labelled as the tiered-risk exit');
+  });
+
+  it('leaves a healthy position alone when the tier data is unavailable', async () => {
+    const closes = [];
+    const client = {
+      getPendingPositions: async () => [breaching],
+      closePosition: async (_symbol, positionId) => { closes.push(positionId); return {}; },
+      getPendingTPSL: async () => [],
+      placeTPSL: async () => ({ orderId: 'sl-1' }),
+      modifyTPSL: async () => ({ orderId: 'sl-1' }),
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getTickers: async () => [{ markPrice: '110' }],
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+      // A failing tiers call must not be read as "safe", but it also must not
+      // break the tick — the guard simply reports it could not check.
+      getPositionTiers: async () => { throw new Error('tiers endpoint down'); },
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings());
+    const guard = await pm.checkMaintenanceMargin({ ...breaching });
+    assert.equal(guard.skipped, 'no position tiers');
+    assert.deepEqual(closes, [], 'no tier data -> no forced exit');
   });
 });
 

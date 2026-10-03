@@ -8,6 +8,9 @@ function positiveNumber(value) {
 export function computeQty({ available, price, leverage, marginPct = 2 }) {
   if (!positiveNumber(available) || !positiveNumber(price)) return 0;
   const selectedLeverage = Number.isInteger(leverage) ? leverage : CONFIG.leverage;
+  // The ceiling is per symbol on /market/trading_pairs (minLeverage/maxLeverage;
+  // the docs' BTCUSDT example is 125). This guard is a last-resort bound against
+  // a nonsense value — the exchange is the real authority.
   if (!Number.isInteger(selectedLeverage) || selectedLeverage < 1 || selectedLeverage > 125) return 0;
   const selectedMarginPct = Number(marginPct);
   if (!Number.isFinite(selectedMarginPct) || selectedMarginPct <= 0 || selectedMarginPct > 100) return 0;

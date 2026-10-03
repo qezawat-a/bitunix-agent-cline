@@ -28,7 +28,9 @@ explicitly switch with `/dryrun 0` and enable `/autotrade on` in Telegram.
   strategies lower it instead of being excluded from the denominator.
 - Marketable entries: the autonomous path sends `MARKET` priced off the live mark, not a `LIMIT`
   resting at the scanner's last price, so a position (and therefore its TP/SL) exists immediately
-- Dynamic ATR-based TP/SL, breakeven, trailing, liquidation-distance guard
+- Dynamic ATR-based TP/SL, breakeven, trailing, liquidation-distance guard, and
+  the tiered-risk maintenance-margin guard (`get_position_tiers`) that exits a
+  position before the exchange force-reduces it
 - All four Bitunix TP/SL methods via `tpsl_method`: `position` (all-in/all-out),
   `partial` (staged closes at `partial_tp_fractions` / `partial_tp_roi_steps`),
   `trailing` (activation + `trailing_callback_pct` retrace), `account`

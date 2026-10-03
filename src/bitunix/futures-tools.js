@@ -152,7 +152,7 @@ export const bitunixTools = [
   },
   {
     name: 'bitunix_change_leverage',
-    description: 'Change leverage',
+    description: 'Change leverage for a symbol. Bitunix publishes the accepted band per symbol on trading_pairs (minLeverage/maxLeverage).',
     parameters: { type: 'object', properties: { symbol: { type: 'string' }, leverage: { type: 'number' } }, required: ['symbol', 'leverage'] },
     async handler({ symbol, leverage }) {
       return requireClient().changeLeverage(symbol, leverage);
@@ -222,6 +222,80 @@ export const bitunixTools = [
     parameters: { type: 'object', properties: { symbol: { type: 'string' } } },
     async handler({ symbol }) {
       return requireClient().getLeverageAndMarginMode(symbol);
+    },
+  },
+  {
+    name: 'bitunix_get_position_tiers',
+    description: 'Tiered risk limit for a symbol: for each tier the nominal-value range, the maximum leverage and the maintenance margin rate. This is the table behind Bitunix\'s liquidation mechanism.',
+    parameters: { type: 'object', properties: { symbol: { type: 'string' } }, required: ['symbol'] },
+    async handler({ symbol }) {
+      return requireClient().getPositionTiers(symbol);
+    },
+  },
+  {
+    name: 'bitunix_get_trading_settings',
+    description: 'Get the account trading settings (margin mode and leverage) for one symbol, several symbols, or every configured symbol.',
+    parameters: { type: 'object', properties: { symbols: { type: 'string', description: 'Comma-separated symbols, e.g. BTCUSDT,ETHUSDT. Omit for every configured symbol.' } } },
+    async handler({ symbols = '' }) {
+      return requireClient().getTradingSettings(symbols);
+    },
+  },
+  {
+    name: 'bitunix_asset_query',
+    description: 'Copy-trading asset query: available futures balance and maximum transferable amount (GET /api/v1/cp/asset/query).',
+    parameters: { type: 'object', properties: {} },
+    async handler() {
+      return requireClient().assetQuery();
+    },
+  },
+  {
+    name: 'bitunix_get_funding_rate_batch',
+    description: 'Get the current funding rate for every futures contract.',
+    parameters: { type: 'object', properties: {} },
+    async handler() {
+      return requireClient().getFundingRateBatch();
+    },
+  },
+  {
+    name: 'bitunix_get_funding_rate_history',
+    description: 'Get historical funding rates for a symbol. Options: starTime / startTime (ms), endTime (ms), limit (max 200).',
+    parameters: {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string' },
+        startTime: { type: 'number' },
+        endTime: { type: 'number' },
+        limit: { type: 'number' },
+      },
+      required: ['symbol'],
+    },
+    async handler({ symbol, startTime, endTime, limit }) {
+      return requireClient().getFundingRateHistory(symbol, { startTime, endTime, limit });
+    },
+  },
+  {
+    name: 'bitunix_get_pending_orders',
+    description: 'Get pending (unfilled / partially filled) orders. Options: orderId, clientId, status (NEW or PART_FILLED), startTime, endTime, skip, limit.',
+    parameters: { type: 'object', properties: { symbol: { type: 'string' }, limit: { type: 'number' }, status: { type: 'string' } } },
+    async handler({ symbol, ...options }) {
+      return requireClient().getPendingOrders(symbol, options);
+    },
+  },
+  {
+    name: 'bitunix_get_history_orders',
+    description: 'Get historical orders. Options: orderId, clientId, status, type (LIMIT/MARKET), startTime, endTime, skip, limit.',
+    parameters: { type: 'object', properties: { symbol: { type: 'string' }, limit: { type: 'number' }, status: { type: 'string' } } },
+    async handler({ symbol, ...options }) {
+      return requireClient().getHistoryOrders(symbol, options);
+    },
+  },
+  {
+    name: 'bitunix_get_order_detail',
+    description: 'Get one order by orderId or clientId (the endpoint takes no symbol).',
+    parameters: { type: 'object', properties: { orderId: { type: 'string' }, clientId: { type: 'string' } } },
+    async handler({ orderId, clientId }) {
+      if (!orderId && !clientId) throw new Error('orderId or clientId is required');
+      return requireClient().getOrderDetail(orderId ? { orderId } : { clientId });
     },
   },
   {

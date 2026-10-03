@@ -9,7 +9,9 @@
 - TPSL order-level: place_tp_sl_order / modify_tp_sl_order (modify is keyed by orderId, not positionId). These accept tpQty/slQty, which is what makes PARTIAL take-profit/stop-loss possible — a position-level TP/SL always closes the whole position.
 - Four TP/SL methods (help centre id=290): position (all-in/all-out at a fixed price), partial (close in % stages at several levels), trailing (arm at an activation price, exit on a % retrace from the peak), account (close ALL positions when total account PnL crosses a threshold). See the `tpsl_method` setting.
 - Account: GET /api/v1/futures/account?marginCoin=USDT → available, frozen, margin, positionMode ONE_WAY/HEDGE.
-- Leverage/margin/position mode: change_* endpoints per symbol.
+- Leverage/margin/position mode: change_* endpoints per symbol. The leverage band is **per symbol** on `GET /api/v1/futures/market/trading_pairs` (`minLeverage`/`maxLeverage`) — read it from there rather than hard-coding a ceiling, since it differs per symbol.
+- Tiered risk limit (the liquidation mechanism): `GET /api/v1/futures/position/get_position_tiers` returns `{level, startValue, endValue, leverage, maintenanceMarginRate}` ascending. A position whose **margin rate** falls below its tier's **maintenance margin rate** is force-reduced or force-liquidated ("When the margin rate of a position is less than the maintenance margin rate, it will trigger a forced partial liquidation or full liquidation."). Exit before the exchange does; the bot does this in `src/bitunix/tiers.js` + the maintenance-margin guard.
+- `GET /api/v1/futures/account/trading_settings` returns the margin mode + leverage for one/several/all symbols; `GET /api/v1/cp/asset/query` is the copy-trading asset query. Neither is wrapped by the Java SDK.
 - WS private needs apiKey+timestamp+nonce+sign in every subscribe params.
 - Rate limits ~10 req/sec/uid — keep scan_interval_sec >= 10, batch where possible.
 

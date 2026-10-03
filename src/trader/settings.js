@@ -182,6 +182,9 @@ export function validateSettings(s) {
     errors.push('symbol must be 5-32 uppercase letters or digits');
   }
 
+  // The exact band is per symbol on /market/trading_pairs; this is a form-level
+  // sanity bound only, and Trader.computePositionSize re-checks it against the
+  // pair's own minLeverage/maxLeverage before sizing.
   addRangeError(errors, 'leverage', s.leverage, 1, 125, true);
   addRangeError(errors, 'min_confidence', s.min_confidence, 0, 100);
   addRangeError(errors, 'tf_min_confidence', s.tf_min_confidence, 0, 100);

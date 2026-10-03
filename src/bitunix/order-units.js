@@ -53,9 +53,18 @@ function positive(value, label) {
   return number;
 }
 
+// The venue publishes the per-symbol band on /market/trading_pairs
+// (minLeverage..maxLeverage); the docs' BTCUSDT example is 1..125. Callers that
+// hold the pair metadata should prefer it — this bound only has to be a ceiling
+// no pair is known to exceed, so a symbol advertising more is validated
+// upstream and one advertising less is caught by the exchange.
+export const MAX_LEVERAGE = 125;
+
 function leverageOf(value) {
   const number = numeric(value);
-  if (!Number.isInteger(number) || number < 1 || number > 125) throw new Error(`leverage must be an integer 1-125 (got ${JSON.stringify(value)})`);
+  if (!Number.isInteger(number) || number < 1 || number > MAX_LEVERAGE) {
+    throw new Error(`leverage must be an integer 1-${MAX_LEVERAGE} (got ${JSON.stringify(value)})`);
+  }
   return number;
 }
 

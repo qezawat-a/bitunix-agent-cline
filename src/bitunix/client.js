@@ -70,6 +70,13 @@ function validateOrder(params) {
   }
 }
 
+// The venue publishes the leverage band per symbol on /market/trading_pairs
+// (minLeverage..maxLeverage; the docs' BTCUSDT example is 1..125). The client
+// used to hard-code that same 1..125, which is right for BTCUSDT but wrong for
+// any symbol whose band differs. Callers holding the pair metadata pass it in
+// via `options.maxLeverage`; the fallback is the documented example value.
+export const MAX_LEVERAGE_FALLBACK = 125;
+
 export function canonicalQuery(queryParams = {}) {
   const clean = Object.fromEntries(Object.entries(queryParams).filter(([, value]) => value !== '' && value !== undefined && value !== null));
   return Object.keys(clean).sort().map(key => `${key}${clean[key]}`).join('');
@@ -250,6 +257,11 @@ export class BitunixClient {
   async placeTPSLOrder(params) {
     if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('TP/SL order parameters must be an object');
     if (typeof params.symbol !== 'string' || !params.symbol.trim()) throw new Error('TP/SL order requires a symbol');
+    // The docs mark positionId as required for both place_tp_sl_order and
+    // place_position_tp_sl_order: the pair has to be attached to a position.
+    if (params.positionId === undefined || params.positionId === null || String(params.positionId).trim() === '') {
+      throw new Error('TP/SL order requires positionId');
+    }
     if (!positiveNumber(params.tpPrice) && !positiveNumber(params.slPrice)) {
       throw new Error('TP/SL order requires at least one of tpPrice or slPrice');
     }
@@ -285,23 +297,51 @@ export class BitunixClient {
     return listFrom(data, ['positionList', 'positionHistories']) ?? [];
   }
 
-  async getPendingTPSL(symbol) {
-    const data = await this.request('GET', '/api/v1/futures/tpsl/get_pending_orders', null, { symbol });
+  // Docs accept symbol, positionId, side, positionMode, skip and limit.
+  async getPendingTPSL(symbol, options = {}) {
+    const data = await this.request('GET', '/api/v1/futures/tpsl/get_pending_orders', null, { symbol, ...options });
     // SDK: bare ArrayList<TpslPendingOrderResp>, whose id field is `id` (not
     // `orderId`) and whose stop price is `slPrice` alongside `positionId` — feed
     // that `id` to cancelTPSL as the orderId.
     return listFrom(data, ['tpslList', 'orderList', 'pendingTpslOrders']) ?? [];
   }
 
-  async getHistoryTPSL(symbol) {
-    const data = await this.request('GET', '/api/v1/futures/tpsl/get_history_orders', null, { symbol });
+  // Docs accept symbol, side, positionMode, startTime, endTime, skip and limit.
+  async getHistoryTPSL(symbol, options = {}) {
+    const data = await this.request('GET', '/api/v1/futures/tpsl/get_history_orders', null, { symbol, ...options });
     // SDK: TpslHistoryOrdersPageResp extends PageResp, list field is `orderList`.
     return listFrom(data, ['orderList', 'tpslList']) ?? [];
   }
 
-  async changeLeverage(symbol, leverage) {
-    if (!Number.isInteger(leverage) || leverage < 1 || leverage > 125) throw new Error('leverage must be an integer 1-125');
-    return this.request('POST', '/api/v1/futures/account/change_leverage', { symbol, leverage, marginCoin: 'USDT' }, {});
+  // https://www.bitunix.com/api-docs/futures/account/change_leverage.html
+  // The accepted band is per symbol: /market/trading_pairs carries
+  // minLeverage/maxLeverage. Callers holding that metadata pass it as
+  // `options.maxLeverage`; otherwise the documented example value is used
+  // rather than a guess above what any pair is known to allow.
+  async changeLeverage(symbol, leverage, options = {}) {
+    if (!symbol) throw new Error('symbol is required to change leverage');
+    if (!Number.isInteger(leverage) || leverage < 1) throw new Error('leverage must be a positive integer');
+    const ceiling = Number.isInteger(Number(options.maxLeverage)) && Number(options.maxLeverage) >= 1
+      ? Number(options.maxLeverage)
+      : MAX_LEVERAGE_FALLBACK;
+    if (leverage > ceiling) throw new Error(`leverage must be an integer 1-${ceiling}`);
+    const marginCoin = options.marginCoin || 'USDT';
+    return this.request('POST', '/api/v1/futures/account/change_leverage', { symbol, leverage, marginCoin }, {});
+  }
+
+  // https://www.bitunix.com/api-docs/futures/account/get_trading_settings.html
+  // Documented but not wrapped by the Java SDK. `symbols` is optional; when
+  // omitted the exchange returns every symbol the key has settings for.
+  async getTradingSettings(symbols = '') {
+    const query = symbols ? { symbols: Array.isArray(symbols) ? symbols.join(',') : String(symbols) } : {};
+    const data = await this.request('GET', '/api/v1/futures/account/trading_settings', null, query);
+    return listFrom(data, ['tradingSettings', 'list']) ?? data;
+  }
+
+  // https://www.bitunix.com/api-docs/futures/copyTrading/asset/asset_query.html
+  // Copy-trading asset query (GET /api/v1/cp/asset/query, no parameters).
+  async assetQuery() {
+    return this.request('GET', '/api/v1/cp/asset/query', null, {});
   }
 
   async changeMarginMode(symbol, marginMode) {
@@ -358,7 +398,14 @@ export class BitunixClient {
   }
 
   async getFundingRateHistory(symbol, options = {}) {
-    return this.request('GET', '/api/v1/futures/market/get_funding_rate_history', null, { symbol, ...options }, { signed: false });
+    // The docs spell the start-of-range filter `starTime` (sic); `startTime`
+    // is accepted as an alias so the natural spelling reaches the exchange
+    // under the name the docs use.
+    // https://www.bitunix.com/api-docs/futures/market/get_funding_rate_history.html
+    const { startTime, ...rest } = options;
+    const query = { symbol, ...rest };
+    if (startTime !== undefined && query.starTime === undefined) query.starTime = startTime;
+    return this.request('GET', '/api/v1/futures/market/get_funding_rate_history', null, query, { signed: false });
   }
 
   async getPositionTiers(symbol) {
@@ -394,10 +441,19 @@ export class BitunixClient {
   // call is still tolerated for call-site convenience, but the leading symbol is
   // deliberately dropped from the query.
   // https://www.bitunix.com/api-docs/futures/trade/get_order_detail.html
-  async getOrderDetail(symbolOrOrderId, maybeOrderId) {
-    const orderId = maybeOrderId === undefined ? String(symbolOrOrderId) : String(maybeOrderId);
-    if (!orderId) throw new Error('orderId is required');
-    return this.request('GET', '/api/v1/futures/trade/get_order_detail', null, { orderId });
+  async getOrderDetail(orderIdOrOptions, maybeOrderId) {
+    // Docs: at least one of orderId or clientId is required. An object argument
+    // ({ orderId } / { clientId }) is passed through; a bare string (or a
+    // tolerated leading symbol + id pair) is read as the orderId.
+    let params;
+    if (orderIdOrOptions && typeof orderIdOrOptions === 'object' && !Array.isArray(orderIdOrOptions)) {
+      params = { ...orderIdOrOptions };
+    } else {
+      const orderId = maybeOrderId === undefined ? String(orderIdOrOptions ?? '') : String(maybeOrderId ?? '');
+      params = orderId ? { orderId } : {};
+    }
+    if (!params.orderId && !params.clientId) throw new Error('orderId or clientId is required');
+    return this.request('GET', '/api/v1/futures/trade/get_order_detail', null, params);
   }
 
   async getHistoryOrders(symbol, options = {}) {

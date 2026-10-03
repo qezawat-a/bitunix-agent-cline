@@ -444,15 +444,24 @@ export class Trader {
   // caller places a LIMIT would validate against the wrong (much smaller) cap.
   async computePositionSize(entryPrice, orderType = 'MARKET') {
     if (!validPositive(entryPrice)) throw new Error('entry price must be positive');
-    if (!Number.isInteger(CONFIG.leverage) || CONFIG.leverage < 1 || CONFIG.leverage > 125) {
-      throw new Error('leverage must be an integer 1-125');
-    }
     const account = await this.client.getAccount('USDT');
     const available = Number(account?.available);
     if (!validPositive(available)) throw new Error('available USDT balance must be positive');
     const pairs = await this.client.getTradingPairs(CONFIG.symbol);
     const pair = (Array.isArray(pairs) ? pairs : []).find(item => String(item.symbol).toUpperCase() === CONFIG.symbol.toUpperCase());
     if (!pair) throw new Error(`trading pair metadata missing for ${CONFIG.symbol}`);
+    // Validate against the band the venue publishes for THIS symbol on
+    // /market/trading_pairs (minLeverage/maxLeverage) rather than a local
+    // constant: the ceiling is per symbol, and a hard-coded guess is either too
+    // tight (rejecting a leverage the exchange accepts) or too loose (letting
+    // through one it refuses). The 125 fallback is the documented example value.
+    const pairMin = Number(pair.minLeverage);
+    const pairMax = Number(pair.maxLeverage);
+    const minLeverage = Number.isFinite(pairMin) && pairMin >= 1 ? Math.trunc(pairMin) : 1;
+    const maxLeverage = Number.isFinite(pairMax) && pairMax >= minLeverage ? Math.trunc(pairMax) : 125;
+    if (!Number.isInteger(CONFIG.leverage) || CONFIG.leverage < minLeverage || CONFIG.leverage > maxLeverage) {
+      throw new Error(`leverage must be an integer ${minLeverage}-${maxLeverage} for ${CONFIG.symbol}`);
+    }
     // Size against the price the exchange will actually see, so the qty and the
     // margin it commits are consistent with the limit price we submit.
     const price = roundPrice(entryPrice, pair);
@@ -491,6 +500,10 @@ export class Trader {
         try {
           const result = await this.positionManager.checkLiquidationGuard(position);
           if (result?.dryRun && result.positionId) this.state.cooldownUntil = this.positionManager.state.cooldownUntil;
+          // The tiered risk limit's maintenance-margin trigger runs on the same
+          // guard tick as the price-distance check.
+          const maintenance = await this.positionManager.checkMaintenanceMargin(position);
+          if (maintenance?.closed) this.state.cooldownUntil = this.positionManager.state.cooldownUntil;
         } catch (error) {
           errors.push({ positionId: position.positionId, message: error.message });
         }

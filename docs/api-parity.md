@@ -30,7 +30,7 @@ caller receives `data`.
 | `GET /api/v1/futures/trade/get_pending_orders` | `getPendingOrders(GetPendingOrdersRequest)` | `getPendingOrders(symbol, options)` | implemented | `OrderPageResp` → **`orderList`** (verified). |
 | `GET /api/v1/futures/position/get_history_positions` | `getHistoryPositions(GetHistoryPositionRequest)` | `getHistoryPositions(symbol, options)` | implemented | `PositionHistoryPageResp extends PageResp` → list field **`positionList`** (verified). |
 | `GET /api/v1/futures/position/get_pending_positions` | `getPendingPositions(GetPendingPositionRequest)` | `getPendingPositions(symbol)` | implemented | Bare `ArrayList<PositionPendingResp>`; tolerant of a `positionList` envelope, raw payload otherwise (so the array contract stays enforced by `position-manager`). **No `markPrice` in the model** — see *Discrepancies*. |
-| `GET /api/v1/futures/position/get_position_tiers` | `getPositionTiers(GetPositionTiersRequest)` | `getPositionTiers(symbol)` | implemented | Bare `ArrayList<PositionTiersResp>`, unsigned per the SDK. |
+| `GET /api/v1/futures/position/get_position_tiers` | `getPositionTiers(GetPositionTiersRequest)` | `getPositionTiers(symbol)` | implemented | Bare `ArrayList<PositionTiersResp>`, unsigned per the SDK. This is the tiered risk limit behind the liquidation mechanism: `{symbol, level, startValue, endValue, leverage, maintenanceMarginRate}`, ascending by `startValue` (docs example: BTCUSDT level 1 is 0–50000 at 125x with MMR 0.004). `src/bitunix/tiers.js` turns it into the ladder maths the maintenance-margin guard uses. |
 | `POST /api/v1/futures/tpsl/cancel_order` | `cancelTpslOrders(CancelTpslOrderRequest)` | `cancelTPSL(symbol, orderId)` | implemented | `CancelTpslOrderRequest{symbol, orderId}`. The id to pass is the `id` field returned by `getPendingTPSL` (see below), not a positionId. |
 | `GET /api/v1/futures/tpsl/get_history_orders` | `getHistoryTpslOrders(GetHistoryTpslOrderRequest)` | `getHistoryTPSL(symbol)` | implemented | `TpslHistoryOrdersPageResp extends PageResp` → list field **`orderList`** (verified; our older `tpslList` fallback is retained after it). |
 | `GET /api/v1/futures/tpsl/get_pending_orders` | `getPendingTpslOrders(GetPendingTpslOrderRequest)` | `getPendingTPSL(symbol)` | implemented | Bare `ArrayList<TpslPendingOrderResp>`. Fields are `id`, `positionId`, `tpPrice`, `slPrice`, `tpQty`, `slQty`, `tpStopType`, `slStopType`, … — the identifier is `id`, **not** `orderId`. |
@@ -98,7 +98,27 @@ caller receives `data`.
 8. **TP/SL pending id vs orderId.** `TpslPendingOrderResp.id` (not `orderId`)
    is what `POST /tpsl/cancel_order` expects in its `orderId` field. No behaviour
    change (the field is passed through by the caller); documented in the
-   `getPendingTPSL` comment and in the parity table.
+  `getPendingTPSL` comment and in the parity table.
+9. **Leverage ceiling was hard-coded rather than read.** The client, `settings.js`, `risk.js`
+   and `trader.js` each carried their own literal ceiling, so they could disagree with the venue
+   and with each other. The band is published per symbol on `/market/trading_pairs` as
+   `minLeverage`/`maxLeverage` (the docs' BTCUSDT example is 1–125). `trader.js` now validates
+   against the pair it already fetches, `changeLeverage` accepts `options.maxLeverage` from a
+   caller holding that metadata, and the remaining literals are a documented fallback ceiling of
+   125 rather than a claim about any particular symbol.
+10. **Order-level TP/SL needs a `positionId`.** `place_tp_sl_order` and
+    `place_position_tp_sl_order` both mark `positionId` required in the docs — the
+    pair hangs off a position — so `placeTPSLOrder()` now validates it before the
+    request is built instead of letting the exchange answer with a Parameter
+    Error.
+11. **Tiered risk limit / liquidation mechanism.** The docs state the trigger
+    verbatim: "When the margin rate of a position is less than the maintenance
+    margin rate, it will trigger a forced partial liquidation or full
+    liquidation." `src/bitunix/tiers.js` (pure) + `PositionManager.#checkMaintenanceMargin`
+    now exit a position that breaches its tier before the exchange force-reduces
+    it, on both the mid-manage and the trade guard ticks. When the tier table or
+    the position's `marginRate` is unavailable the check reports "cannot decide"
+    and never assumes the position is safe.
 
 | `GET /api/v1/futures/market/get_funding_rate_history` | `getFundingRateHistory(symbol, options)` | extra | Real Bitunix public endpoint, absent from `FuturesPath.java`. Kept — the scanner reads funding history. |
 | — | `closePosition(symbol, positionId, position)` | extra | Composite helper: resolves the position, then issues `place_order` with `tradeSide=CLOSE` (hedge) or `reduceOnly` (one-way). Not an SDK endpoint. |
@@ -114,4 +134,6 @@ caller receives `data`.
 | `GET /api/v1/futures/account` | `getAccount(String)` | `getAccount(marginCoin)` | implemented | SDK returns a single `Account` for the requested `marginCoin`; we accept both the object and a list containing it, and throw if that margin coin is absent. |
 | `GET /api/v1/futures/account/get_leverage_margin_mode` | `getLeverageAndMarginMode(String, String)` | `getLeverageAndMarginMode(symbol, marginCoin)` | implemented | `MarketSetting{symbol, marginCoin, leverage, marginMode}`. |
 | `POST /api/v1/futures/account/change_position_mode` | `changePositionMode(ChangePositionMode)` | `changePositionMode(positionMode)` | implemented | `PositionMode.ONE_WAY` / `HEDGE`; we also accept `one-way` / `hedge` input. |
-| `POST /api/v1/futures/account/change_leverage` | `changeLeverage(ChangeLeverage)` | `changeLeverage(symbol, leverage)` | implemented | Integer 1–125 guard; `marginCoin` always `USDT`. |
+| `POST /api/v1/futures/account/change_leverage` | `changeLeverage(ChangeLeverage)` | `changeLeverage(symbol, leverage, options)` | implemented | The accepted band is **per symbol**: `/market/trading_pairs` carries `minLeverage`/`maxLeverage` (docs example: BTCUSDT `maxLeverage` 125, min 1). A caller holding that metadata passes `options.maxLeverage`; otherwise `MAX_LEVERAGE_FALLBACK = 125` applies. `trader.computePositionSize` validates against the fetched pair's own band. `marginCoin` defaults to `USDT`. |
+| `GET /api/v1/futures/account/trading_settings` | — (not wrapped by the SDK) | `getTradingSettings(symbols)` | implemented (new) | Documented but absent from `FuturesPath.java`. `symbols` is optional and comma-separated; omitting it returns every symbol the key has settings for. |
+| `GET /api/v1/cp/asset/query` | — (copy-trading, not wrapped by the SDK) | `assetQuery()` | implemented (new) | Copy-trading asset query (available futures balance / max transferable). Takes no parameters. |

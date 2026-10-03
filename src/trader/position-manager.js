@@ -1,4 +1,5 @@
 import { atr as calculateAtr } from '../bitunix/indicators.js';
+import { maintenanceMarginCheck } from '../bitunix/tiers.js';
 import {
   accountPnlSummary,
   atrMultiples,
@@ -257,6 +258,9 @@ export class PositionManager {
   // unreachable metadata source must not stop a position being protected — the
   // 8-decimal default is only used as a fallback.
   quotePrecisionCache = new Map();
+  // `/position/get_position_tiers` is public and changes rarely, so the tiered
+  // risk limit for a symbol is fetched at most once and reused.
+  tiersCache = new Map();
 
   async getQuotePrecision(symbol = this.symbol) {
     const key = String(symbol || '').toUpperCase();
@@ -275,6 +279,28 @@ export class PositionManager {
     }
     this.quotePrecisionCache.set(key, digits);
     return digits;
+  }
+
+  // Tiered risk limit for the symbol, i.e. the negotiated value range / max
+  // leverage / maintenance margin rate table behind Bitunix's liquidation
+  // mechanism. Best-effort: an unreachable tiers endpoint must not stop a
+  // position being protected, so a failure caches an empty list.
+  // https://www.bitunix.com/api-docs/futures/position/get_position_tiers.html
+  async getPositionTiers(symbol = this.symbol) {
+    const key = String(symbol || '').toUpperCase();
+    if (this.tiersCache.has(key)) return this.tiersCache.get(key);
+    let tiers = [];
+    try {
+      if (typeof this.client.getPositionTiers === 'function') {
+        const data = await this.client.getPositionTiers(key);
+        if (Array.isArray(data)) tiers = data;
+      }
+    } catch {
+      // Fall through to the empty list below; every consumer treats no tiers as
+      // "cannot check", never as "safe".
+    }
+    this.tiersCache.set(key, tiers);
+    return tiers;
   }
 
   computeTPSL(entryPrice, direction, atr, confidence, quotePrecision = 8) {
@@ -624,14 +650,43 @@ export class PositionManager {
     if (!Number.isFinite(liq) || liq <= 0) return { skipped: 'no active liquidation price' };
     const distance = Math.abs(mark - liq) / mark;
     if (distance >= Number(this.settings.sl_liquidation_safety) / 100) return { skipped: 'liquidation distance safe' };
+    return this.emergencyClose(position, 'liquidation_guard');
+  }
+
+  // The tiered risk limit's own trigger, stated by the tiers endpoint verbatim:
+  // "When the margin rate of a position is less than the maintenance margin
+  // rate, it will trigger a forced partial liquidation or full liquidation."
+  // The exchange is free to start reducing the position the moment this is
+  // true, so the bot exits first rather than watching a cascading reduction.
+  // Skipped (never assumed safe) when the tiers, the position value or the
+  // margin rate are unavailable.
+  async checkMaintenanceMargin(position) {
+    const check = maintenanceMarginCheck(position, await this.getPositionTiers(position.symbol || this.symbol));
+    if (!check.checked) return { skipped: check.reason };
+    if (!check.breached) {
+      return { skipped: 'margin rate above the maintenance requirement', marginRate: check.marginRate, maintenanceMarginRate: check.maintenanceMarginRate };
+    }
+    return {
+      ...(await this.emergencyClose(position, 'maintenance_margin')),
+      marginRate: check.marginRate,
+      maintenanceMarginRate: check.maintenanceMarginRate,
+      tier: check.tier,
+    };
+  }
+
+  // A single exit path shared by the liquidation guards so a position can never
+  // be closed twice in one tick (Bitunix answers the repeat with 30042).
+  async emergencyClose(position, reason) {
+    const key = String(position.positionId);
+    if (this.closedThisCycle.has(key)) return { skipped: 'already closed this cycle' };
     this.state.cooldownUntil = Date.now() + Number(this.settings.cooldown_minutes) * 60000;
     // `closed: true` lets midManage stop working this position. Without it the
     // trailing callback below would close the same positionId again in the same
     // tick, and Bitunix answers the repeat with 30042 Client ID duplicate.
-    this.noteClose(position.positionId, 'liquidation_guard');
+    this.noteClose(position.positionId, reason);
     const result = await this.client.closePosition(this.symbol, position.positionId, position);
-    this.closedThisCycle.add(String(position.positionId));
-    return { closed: true, trigger: 'liquidation_guard', result };
+    this.closedThisCycle.add(key);
+    return { closed: true, trigger: reason, result };
   }
 
   async ensureProtection(position) {
@@ -727,7 +782,11 @@ export class PositionManager {
         if (breakeven?.slPrice) position.slPrice = breakeven.slPrice;
         const trailing = await this.checkTrailing(position);
         if (trailing?.slPrice) position.slPrice = trailing.slPrice;
-        await this.checkLiquidationGuard(position);
+        const liqGuard = await this.checkLiquidationGuard(position);
+        if (liqGuard?.closed) continue;
+        // Tiered risk limit: the exchange's own maintenance-margin trigger.
+        const marginGuard = await this.checkMaintenanceMargin(position);
+        if (marginGuard?.closed) continue;
         // Method 3: the peak/callback exit only runs under the trailing method;
         // the ATR stop tightening above stays on as the hard backstop. Skipped
         // when the liquidation guard already closed this position, otherwise the

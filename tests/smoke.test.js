@@ -335,6 +335,33 @@ describe('exchange safety', () => {
     await assert.rejects(() => trader.computePositionSize(100), /positive/);
   });
 
+  it('validates leverage against the band the pair advertises, not a local constant', async () => {
+    // A symbol whose own band is tighter than the documented example must be
+    // rejected at its real ceiling, and the message must name that band.
+    const client = {
+      getAccount: async () => ({ available: '100' }),
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001', minLeverage: 1, maxLeverage: 25 }],
+    };
+    const trader = new Trader(client);
+    Object.assign(CONFIG, { symbol: 'BTCUSDT', leverage: 50, order_unit: 'cost', position_sizing_margin_pct: 2 });
+    await assert.rejects(() => trader.computePositionSize(100, 'MARKET'), /1-25 for BTCUSDT/);
+
+    // Inside the advertised band the same leverage sizes normally, so the check
+    // is not simply refusing everything.
+    Object.assign(CONFIG, { leverage: 20 });
+    const sized = await trader.computePositionSize(100, 'MARKET');
+    assert.ok(sized.qty > 0, 'a leverage inside the pair band still sizes');
+
+    // Pair metadata that omits the band falls back to the documented 1-125
+    // rather than becoming unbounded.
+    const bare = new Trader({
+      getAccount: async () => ({ available: '100' }),
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001' }],
+    });
+    Object.assign(CONFIG, { leverage: 200 });
+    await assert.rejects(() => bare.computePositionSize(100, 'MARKET'), /1-125 for BTCUSDT/);
+  });
+
   it('serializes concurrent scan cycles into one entry', async () => {
     let orders = 0;
     const client = {
@@ -477,10 +504,13 @@ describe('tool safety', () => {
   });
 
   it('rejects an out-of-range leverage before calling the exchange', async () => {
-    // Use the real client so changeLeverage's own 1-125 guard is exercised.
+    // Use the real client so changeLeverage's own band guard is exercised.
     globalThis.fetch = async () => ({ ok: true, json: async () => ({ code: 0, data: { leverage: 5 } }) });
     const client = new BitunixClient();
     await assert.rejects(() => client.changeLeverage('BTCUSDT', 500), /1-125/);
+    // A caller holding the pair's advertised band gets that band instead of the
+    // fallback, so a symbol whose ceiling is lower is caught before the call.
+    await assert.rejects(() => client.changeLeverage('BTCUSDT', 50, { maxLeverage: 25 }), /1-25/);
   });
 
   it('validates tool arguments and serializes undefined results', () => {

@@ -47,13 +47,13 @@ network**. (Verified with `net.connect`/`dns.lookup` poisoned — the run still
 exits 0 with no socket opened.)
 
 ```
-[34/37] placeTPSLOrder(params)
+[36/39] placeTPSLOrder(params)
     kind : trade   auth: private   sdk: FuturesPrivateApiClient#placeTpslOrders
     url   : https://fapi.bitunix.com/api/v1/futures/tpsl/place_order
     method: POST
     path  : /api/v1/futures/tpsl/place_order
     query : (none)
-    body  : {"symbol":"BTCUSDT","tpPrice":"999999","slPrice":"1","tpOrderType":"LIMIT","slOrderType":"MARKET"}
+    body  : {"symbol":"BTCUSDT","positionId":"DRYRUN-POSITION","tpPrice":"999999","slPrice":"1","tpOrderType":"LIMIT","slOrderType":"MARKET"}
 ```
 
 ### Live run
@@ -76,7 +76,7 @@ with a reason when that step did not run.
 
 ## 2. Endpoint table
 
-36 REST endpoints + 1 local helper. `CREDS: no*` = public market data,
+38 REST endpoints + 1 local helper. `CREDS: no*` = public market data,
 `yes` = signed.
 
 | Node method | HTTP | Path | Kind | Creds |
@@ -92,6 +92,8 @@ with a reason when that step did not run.
 | `getAccount(marginCoin)` | GET | `/api/v1/futures/account` | read | yes |
 | `getLeverageAndMarginMode(symbol, marginCoin)` | GET | `/api/v1/futures/account/get_leverage_margin_mode` | read | yes |
 | `getPositionMode()` | GET | `/api/v1/futures/account/position_mode` | read | yes |
+| `getTradingSettings(symbols)` | GET | `/api/v1/futures/account/trading_settings` | read | yes |
+| `assetQuery()` | GET | `/api/v1/cp/asset/query` | read | yes |
 | `getPendingPositions(symbol)` | GET | `/api/v1/futures/position/get_pending_positions` | read | yes |
 | `getHistoryPositions(symbol, options)` | GET | `/api/v1/futures/position/get_history_positions` | read | yes |
 | `getPendingOrders(symbol, options)` | GET | `/api/v1/futures/trade/get_pending_orders` | read | yes |
@@ -119,8 +121,10 @@ with a reason when that step did not run.
 | `cancelTPSL(symbol, orderId)` | POST | `/api/v1/futures/tpsl/cancel_order` | trade | yes |
 | `getErrorCode(code)` | — | no request, returns the error-code doc link | read | no |
 
-`position_mode` and `get_funding_rate_history` are documented by Bitunix but are
-**not** wrapped by the Java SDK, so they have no `FuturesPath` constant.
+`position_mode`, `get_funding_rate_history` and `trading_settings` are
+documented by Bitunix but are **not** wrapped by the Java SDK, so they have no
+`FuturesPath` constant. `cp/asset/query` is the copy-trading endpoint and is also
+outside the SDK's futures surface.
 
 ---
 
@@ -171,6 +175,8 @@ with a reason when that step did not run.
 | — (no SDK method) | `closePosition(symbol, positionId, position)` |
 | — (no SDK method) | `getPositionMode()` |
 | — (no SDK method) | `getFundingRateHistory(symbol, options)` |
+| — (no SDK method) | `getTradingSettings(symbols)` |
+| — (no SDK method) | `assetQuery()` |
 | — (no SDK method) | `getErrorCode(code)` |
 
 ### `FuturesWsPublicClient` / `FuturesWsPrivateClient` (the SDK's websocket demos)

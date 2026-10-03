@@ -145,6 +145,24 @@ const CATALOG = [
     sdk: '— (Bitunix docs endpoint, not wrapped by the SDK)',
     invoke: client => client.getPositionMode(),
   },
+  {
+    name: 'getTradingSettings(symbols)',
+    method: 'GET',
+    path: '/api/v1/futures/account/trading_settings',
+    kind: 'read',
+    auth: 'private',
+    sdk: '— (Bitunix docs endpoint, not wrapped by the SDK)',
+    invoke: client => client.getTradingSettings(SYMBOL),
+  },
+  {
+    name: 'assetQuery()',
+    method: 'GET',
+    path: '/api/v1/cp/asset/query',
+    kind: 'read',
+    auth: 'private',
+    sdk: '— (Bitunix copy-trading docs endpoint, not wrapped by the SDK)',
+    invoke: client => client.assetQuery(),
+  },
   // --- private positions / orders (read) ----------------------------------
   {
     name: 'getPendingPositions(symbol)',
@@ -402,8 +420,11 @@ const CATALOG = [
     kind: 'trade',
     auth: 'private',
     sdk: 'FuturesPrivateApiClient#placeTpslOrders',
+    // The docs mark positionId as required for place_tp_sl_order, so the same
+    // "is there an open position" guard the position-level entries use applies.
+    liveGuard: ctx => (ctx.positionId ? null : 'no open position to attach an order-level TP/SL to'),
     invoke: (client, ctx) => {
-      const res = client.placeTPSLOrder({ symbol: SYMBOL, tpPrice: '999999', slPrice: '1', tpOrderType: 'LIMIT', slOrderType: 'MARKET' });
+      const res = client.placeTPSLOrder({ symbol: SYMBOL, positionId: ctx.positionId, tpPrice: '999999', slPrice: '1', tpOrderType: 'LIMIT', slOrderType: 'MARKET' });
       return res;
     },
   },
