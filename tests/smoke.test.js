@@ -105,8 +105,13 @@ describe('settings', () => {
   });
 
   it('validate catches bad leverage', () => {
-    const errs = validateSettings({ ...normalizeSettings({}), leverage: 999 });
-    assert.ok(errs.length > 0);
+    const errs = validateSettings({ ...normalizeSettings({}), leverage: 0 });
+    assert.ok(errs.length > 0, 'zero leverage is not a positive integer');
+    assert.ok(validateSettings({ ...normalizeSettings({}), leverage: 2.5 }).length > 0);
+    assert.ok(validateSettings({ ...normalizeSettings({}), leverage: -3 }).length > 0);
+    // No upper bound: the accepted band is per symbol and the exchange is the
+    // authority, so the settings form must not reject a value on its own.
+    assert.deepEqual(validateSettings({ ...normalizeSettings({}), leverage: 200 }), []);
   });
 });
 

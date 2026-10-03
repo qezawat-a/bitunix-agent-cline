@@ -5,13 +5,17 @@ function positiveNumber(value) {
   return Number.isFinite(number) && number > 0;
 }
 
-export function computeQty({ available, price, leverage, marginPct = 2 }) {
+export function computeQty({ available, price, leverage, marginPct = 2, pair }) {
   if (!positiveNumber(available) || !positiveNumber(price)) return 0;
   const selectedLeverage = Number.isInteger(leverage) ? leverage : CONFIG.leverage;
-  // The ceiling is per symbol on /market/trading_pairs (minLeverage/maxLeverage;
-  // the docs' BTCUSDT example is 125). This guard is a last-resort bound against
-  // a nonsense value — the exchange is the real authority.
-  if (!Number.isInteger(selectedLeverage) || selectedLeverage < 1 || selectedLeverage > 125) return 0;
+  // The accepted band is per symbol on /market/trading_pairs and differs between
+  // contracts, so it is read from the pair metadata when available rather than
+  // assumed. Only a value that is not a positive integer is rejected outright —
+  // inventing a ceiling here would block symbols the exchange lets you trade at
+  // high leverage, and the exchange is the real authority on the rest.
+  const pairMax = Number(pair?.maxLeverage);
+  const ceiling = Number.isFinite(pairMax) && pairMax >= 1 ? Math.trunc(pairMax) : Infinity;
+  if (!Number.isInteger(selectedLeverage) || selectedLeverage < 1 || selectedLeverage > ceiling) return 0;
   const selectedMarginPct = Number(marginPct);
   if (!Number.isFinite(selectedMarginPct) || selectedMarginPct <= 0 || selectedMarginPct > 100) return 0;
   const notional = Number(available) * selectedMarginPct / 100;

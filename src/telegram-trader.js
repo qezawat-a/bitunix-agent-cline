@@ -179,6 +179,23 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           const next = { ...getTraderSettings(CONFIG), leverage: lev };
           const errors = validateSettings(next);
           if (errors.length) return usage(chatId, `Invalid leverage: ${esc(errors[0])}`);
+          // The accepted band is published per symbol on trading_pairs and is
+          // different for every contract, so ask the exchange rather than
+          // assuming one. This is a read-only public call, and a failure here
+          // must not block a legitimate change — changeLeverage is still the
+          // authority and will reject an out-of-band value.
+          let band = null;
+          try {
+            const pairs = await client.getTradingPairs(CONFIG.symbol);
+            const pair = (Array.isArray(pairs) ? pairs : [])
+              .find(item => String(item?.symbol || '').toUpperCase() === String(CONFIG.symbol).toUpperCase());
+            if (pair && Number.isFinite(Number(pair.maxLeverage))) {
+              band = { min: Number(pair.minLeverage) || 1, max: Number(pair.maxLeverage) };
+            }
+          } catch { /* fall through: no band to show, still try the change */ }
+          if (band && (lev < band.min || lev > band.max)) {
+            return usage(chatId, `${CONFIG.symbol} allows leverage ${band.min}-${band.max}`);
+          }
           await client.changeLeverage(CONFIG.symbol, lev);
           applySettings(CONFIG, { leverage: lev });
           await save();

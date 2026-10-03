@@ -879,10 +879,14 @@ describe('order units (help centre id=170)', () => {
     assert.throws(() => convert({ value: 0, from: 'nominal', to: 'cost', price: PRICE, leverage: LEVERAGE }), /positive/);
     assert.throws(() => convert({ value: 1, from: 'nope', to: 'cost', price: PRICE, leverage: LEVERAGE }), /unknown order unit/);
     assert.throws(() => convert({ value: 1, from: 'nominal', to: 'cost', price: 0, leverage: LEVERAGE }), /price/);
-    // The local bound is the documented example ceiling (trading_pairs shows
-    // BTCUSDT maxLeverage 125); the guard fires above it and the exchange
-    // remains the authority.
+    // The band is per symbol and read from the pair metadata. Without a pair the
+    // fallback is the docs' BTCUSDT example (1-125); with a pair, that pair's
+    // own advertised band is what governs.
     assert.throws(() => convert({ value: 1, from: 'nominal', to: 'cost', price: PRICE, leverage: 500 }), /1-125/);
+    assert.doesNotThrow(() => convert({ value: 1, from: 'nominal', to: 'cost', price: PRICE, leverage: 200, pair: { maxLeverage: 200 } }),
+      'a symbol advertising 200x is not blocked by the 125 fallback');
+    assert.throws(() => convert({ value: 1, from: 'nominal', to: 'cost', price: PRICE, leverage: 30, pair: { maxLeverage: 25 } }), /1-25/,
+      'a symbol advertising a tighter band is capped at its real ceiling');
     assert.throws(() => convert({ value: 1, from: 'nominal', to: 'cost', price: PRICE, leverage: 2.5 }), /integer/);
   });
 

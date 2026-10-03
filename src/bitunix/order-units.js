@@ -53,17 +53,28 @@ function positive(value, label) {
   return number;
 }
 
-// The venue publishes the per-symbol band on /market/trading_pairs
-// (minLeverage..maxLeverage); the docs' BTCUSDT example is 1..125. Callers that
-// hold the pair metadata should prefer it — this bound only has to be a ceiling
-// no pair is known to exceed, so a symbol advertising more is validated
-// upstream and one advertising less is caught by the exchange.
+// The accepted leverage band is published per symbol on /market/trading_pairs
+// (minLeverage/maxLeverage) and differs between contracts, so it is read from
+// the pair metadata rather than assumed. This fallback applies only when the
+// pair carries no band; it is the docs' BTCUSDT example, not a venue-wide cap.
 export const MAX_LEVERAGE = 125;
 
-function leverageOf(value) {
+// Resolve the band for `pair`, falling back to the documented example range
+// when the metadata does not advertise one.
+function leverageBand(pair) {
+  const max = numeric(pair?.maxLeverage);
+  const min = numeric(pair?.minLeverage);
+  return {
+    min: min !== null && min >= 1 ? Math.trunc(min) : 1,
+    max: max !== null && max >= 1 ? Math.trunc(max) : MAX_LEVERAGE,
+  };
+}
+
+function leverageOf(value, pair) {
   const number = numeric(value);
-  if (!Number.isInteger(number) || number < 1 || number > MAX_LEVERAGE) {
-    throw new Error(`leverage must be an integer 1-${MAX_LEVERAGE} (got ${JSON.stringify(value)})`);
+  const { min, max } = leverageBand(pair);
+  if (!Number.isInteger(number) || number < min || number > max) {
+    throw new Error(`leverage must be an integer ${min}-${max} (got ${JSON.stringify(value)})`);
   }
   return number;
 }
@@ -86,12 +97,12 @@ export function normalizeUnit(unit) {
 // Convert a number between any two of the three units, using the exact formulas
 // from the help-centre article. from === to is an identity pass-through so that
 // callers can hand a user-supplied unit straight through.
-export function convert({ value, from, to, price, leverage }) {
+export function convert({ value, from, to, price, leverage, pair }) {
   const source = normalizeUnit(from);
   const target = normalizeUnit(to);
   const amount = positive(value, 'value');
   const mark = positive(price, 'price');
-  const lev = leverageOf(leverage);
+  const lev = leverageOf(leverage, pair);
   const decimals = target === 'qty' ? QTY_DECIMALS : MONEY_DECIMALS;
   if (source === target) return tidy(amount, decimals);
   let result;
@@ -152,7 +163,7 @@ export function positionSizeFromUnit({ available, unit, price, leverage, marginP
   const balance = positive(available, 'available USDT balance');
   const selected = normalizeUnit(unit);
   const mark = positive(price, 'price');
-  const lev = leverageOf(leverage);
+  const lev = leverageOf(leverage, pair);
   const pct = numeric(marginPct);
   if (!Number.isFinite(pct) || pct <= 0 || pct > 100) throw new Error(`marginPct must be a number in (0,100] (got ${JSON.stringify(marginPct)})`);
   const type = String(orderType ?? 'MARKET').trim().toUpperCase();

@@ -182,10 +182,16 @@ export function validateSettings(s) {
     errors.push('symbol must be 5-32 uppercase letters or digits');
   }
 
-  // The exact band is per symbol on /market/trading_pairs; this is a form-level
-  // sanity bound only, and Trader.computePositionSize re-checks it against the
-  // pair's own minLeverage/maxLeverage before sizing.
-  addRangeError(errors, 'leverage', s.leverage, 1, 125, true);
+  // Deliberately NO upper bound here. The accepted band is per symbol
+  // (trading_pairs minLeverage/maxLeverage) and differs between symbols, so a
+  // literal ceiling in the settings form either blocks a leverage this symbol
+  // accepts or admits one it refuses. This only rejects a value that is not a
+  // positive integer; the exchange is the authority on the real band, enforced
+  // by changeLeverage and re-checked in Trader.computePositionSize against the
+  // pair metadata it fetches.
+  if (!validNumber(s.leverage) || s.leverage < 1 || !Number.isInteger(s.leverage)) {
+    errors.push('leverage must be a positive integer');
+  }
   addRangeError(errors, 'min_confidence', s.min_confidence, 0, 100);
   addRangeError(errors, 'tf_min_confidence', s.tf_min_confidence, 0, 100);
   addRangeError(errors, 'min_agreeing_strategies', s.min_agreeing_strategies, 1, 100, true);
