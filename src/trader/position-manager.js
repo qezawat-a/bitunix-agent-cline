@@ -17,6 +17,18 @@ function finiteNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+// Are two prices the same level, allowing for them having been written at
+// different quotePrecisions? One tick of tolerance at `precision` decimals is
+// enough: the stop is re-derived from the entry price every time, and the entry
+// price is identical for the life of a position, so anything wider would start
+// treating a genuinely different level as "the same one".
+function samePrice(a, b, precision) {
+  const left = finiteNumber(a);
+  const right = finiteNumber(b);
+  if (left === null || right === null) return false;
+  const digits = Number.isInteger(Number(precision)) && Number(precision) >= 0 ? Number(precision) : 8;
+  return Math.abs(left - right) <= 10 ** -digits;
+}
 // The size a pending TP/SL row will close: the take-profit side if it has one,
 // otherwise the stop side. Returns null when the row carries no quantity at all,
 // which is what a position-level pair looks like.
@@ -47,6 +59,39 @@ export class PositionManager {
   // the liquidation guard must not also be closed by the trailing callback in
   // the same tick: Bitunix rejects the repeat with 30042 Client ID duplicate.
   closedThisCycle = new Set();
+  // Every position id closed by ANY guard path, with the time it happened.
+  //
+  // `closedThisCycle` is reset at the top of every midManage tick, which is what
+  // lets a legitimately reopened id close again. But Trader.guard() runs the same
+  // two liquidation guards on the tick immediately before midManage() (see
+  // scanCycle), so a position the guard had already closed was still open in the
+  // exchange's eyes when midManage wiped the record and then closed it a second
+  // time with the same clientId -> 30042 Client ID duplicate.
+  //
+  // This second record survives the per-tick reset for as long as a repeat close
+  // is actually unsafe. closePosition always reuses clientId
+  // "jrock-close-<positionId>", so ANY second close of the same positionId is
+  // guaranteed to be rejected with 30042 Client ID duplicate. The record is held
+  // until the id stops being listed as open — a genuinely reopened position
+  // carries a new positionId, so it is free to close on its very first tick —
+  // with the timeout as a backstop for a close that never registered.
+  closedRecently = new Map();
+  static CLOSE_DEDUPE_MS = 60000;
+  // When break-even was last applied to a position, and at which stop price.
+  //
+  // checkBreakeven could re-fire forever on a position it had already fixed. It
+  // decides by asking the exchange where the stop is (currentStop), and every
+  // answer it could get back failed to confirm the move it had just made:
+  // the pending-row lookup missed the row, or the tick cache had been reset, so
+  // `current` came back null or still below the entry. It then re-sent the same
+  // "Break-even stop SL -> <entry>" modify and re-announced it — which is what
+  // produced a chat full of identical "SL -> 0.075" lines every manage tick.
+  //
+  // Remembering the applied move makes the step idempotent: once this position's
+  // stop has been put at its entry it is at break-even, and re-sending the same
+  // modify cannot improve on that. If the stop is later genuinely lost, the
+  // ensureProtection/repair path re-arms it, which clears the marker.
+  breakEvenApplied = new Map();
   // Pending TP/SL rows for the current tick, keyed by positionId. Fetched at
   // most once per tick and reset by resetTpslCache(), so the whole manage pass
   // sees one consistent view of what the exchange actually has armed.
@@ -131,6 +176,17 @@ export class PositionManager {
       const live = new Set(normalized.map(position => String(position.positionId)));
       for (const key of this.trailingState.keys()) {
         if (!live.has(key)) this.trailingState.delete(key);
+      }
+      // Same reasoning for the break-even marker: a positionId that later
+      // reappears is a different position and must earn its own break-even.
+      for (const key of this.breakEvenApplied.keys()) {
+        if (!live.has(key)) this.breakEvenApplied.delete(key);
+      }
+      for (const [key, at] of this.closedRecently) {
+        // Dropped as soon as the id stops being listed (a genuinely reopened
+        // position carries a new id, so it is free to close immediately), with
+        // the timeout as a backstop for a close that never registered.
+        if (!live.has(key) || Date.now() - at >= PositionManager.CLOSE_DEDUPE_MS) this.closedRecently.delete(key);
       }
       return this.state.positions;
     })();
@@ -245,10 +301,16 @@ export class PositionManager {
   recordStopMove(positionId, params, positionQty = null) {
     if (!this.tpslCache || !finitePositive(Number(params?.slPrice))) return;
     const key = String(positionId);
-    const index = this.tpslCache.findIndex(item => (
+    const match = item => (
       String(item.positionId) === key
       && !this.isPartialLeg(item, positionQty)
-    ));
+    );
+    let index = this.tpslCache.findIndex(match);
+    // No position-level row: fall back to the order-level rows carrying a stop.
+    // Without this the stop we just wrote was invisible to the rest of the tick
+    // (and to break-even on the next one), so currentStop() kept reporting the
+    // pre-move level and the same break-even was re-sent every tick.
+    if (index < 0) index = this.tpslCache.findIndex(item => String(item.positionId) === key && finitePositive(Number(item.slPrice ?? item.stopPrice)));
     if (index < 0) return;
     this.tpslCache[index] = { ...this.tpslCache[index], slPrice: params.slPrice, slStopType: params.slStopType };
   }
@@ -474,7 +536,16 @@ export class PositionManager {
     if (!finitePositive(entry) || !finitePositive(mark)) throw new Error('position entry and mark prices must be positive');
     const direction = position.side === 'BUY' ? 1 : position.side === 'SELL' ? -1 : 0;
     if (!direction) throw new Error('position side must be BUY or SELL');
-    const leverage = finitePositive(this.settings.leverage) ? Number(this.settings.leverage) : 1;
+    // PositionPendingResp carries its OWN `leverage` (int32), and that is the
+    // number the exchange applies to this position's margin and PnL. Measuring
+    // the position's ROI against the globally configured leverage instead meant
+    // every break-even / trailing / account threshold fired at the wrong price
+    // whenever the two ever disagreed — e.g. after a manual change_leverage, or
+    // a tier that forces a lower leverage than the setting.
+    // https://www.bitunix.com/api-docs/futures/position/get_pending_positions.html
+    const leverage = finitePositive(position.leverage)
+      ? Number(position.leverage)
+      : finitePositive(this.settings.leverage) ? Number(this.settings.leverage) : 1;
     return ((mark - entry) / entry) * 100 * direction * leverage;
   }
 
@@ -490,6 +561,36 @@ export class PositionManager {
     return finitePositive(pendingStop) ? pendingStop : null;
   }
 
+  // The take-profit half to carry along with a stop-only modify, as params to
+  // merge into the request.
+  //
+  // /tpsl/position/modify_order replaces the WHOLE pair (PlacePositionTpslOrderRequest
+  // is its own request shape), so an omitted tpPrice deletes the live
+  // take-profit. The old code read the pair back from positionTPSL(), which
+  // deliberately ignores order-level rows — so on a position whose protection
+  // was an order-level row (a partial ladder, or a pair the bot placed while the
+  // position payload disagreed about its size) the lookup missed, no tpPrice
+  // was sent, and every break-even / trailing step silently deleted the
+  // take-profit. ensureProtection then re-armed it on the next tick, and the
+  // cycle repeated for the whole life of the trade.
+  //
+  // Every row for the position is searched instead, so a take-profit is never
+  // dropped just because the row carrying it is an order-level one.
+  async preserveTakeProfit(positionId, positionQty = null) {
+    const key = String(positionId);
+    const pending = await this.loadPendingTPSL();
+    const rows = pending.filter(item => String(item?.positionId) === key && finitePositive(Number(item?.tpPrice)));
+    if (!rows.length) return {};
+    // Prefer the position-level row (the one this endpoint owns), then fall back
+    // to whichever armed target is furthest along.
+    const positionLevel = rows.find(item => !this.isPartialLeg(item, positionQty));
+    const row = positionLevel || rows[0];
+    const preserved = { tpPrice: String(row.tpPrice) };
+    if (row.tpStopType) preserved.tpStopType = row.tpStopType;
+    if (row.tpOrderType) preserved.tpOrderType = row.tpOrderType;
+    return preserved;
+  }
+
   // `current` is passed in rather than defaulted to currentStop(position),
   // because currentStop is async — a default parameter would compare against a
   // Promise (always truthy) instead of the real stop price.
@@ -501,11 +602,26 @@ export class PositionManager {
   async checkBreakeven(position) {
     const entry = Number(position.avgPrice);
     if (!finitePositive(entry)) throw new Error('position entry price must be positive');
+    const key = String(position.positionId);
+    // Idempotency. Once this position's stop has been moved to its entry price it
+    // IS at break-even, so re-sending the identical modify is pure noise and the
+    // re-announcement is worse: the operator saw the same "SL -> <entry>" line
+    // once per manage tick for as long as the trade stayed open, because the
+    // "where is the stop now?" lookup kept failing to see the move we had just
+    // made. A tolerance is used so the same entry price re-sent at a different
+    // quotePrecision is still recognised as the same level.
+    const applied = this.breakEvenApplied.get(key);
+    if (applied && samePrice(applied.slPrice, entry, applied.precision)) {
+      return { skipped: 'break-even already applied', slPrice: String(applied.slPrice) };
+    }
     if (this.favorableRoiPct(position) >= Number(this.settings.breakeven_threshold_pct)) {
       const current = await this.currentStop(position);
       if (current && position.side === 'BUY' && entry <= current) return { skipped: 'stop already favorable' };
       if (current && position.side === 'SELL' && entry >= current) return { skipped: 'stop already favorable' };
       const result = await this.moveSLToEntry(position.positionId, entry, positionQtyOf(position));
+      // Recorded only once the move actually reached the exchange, so a failed
+      // modify is retried on the next tick rather than being remembered as done.
+      this.breakEvenApplied.set(key, { slPrice: entry, precision: await this.getQuotePrecision() });
       this.reportStopMove?.(position, 'breakeven', entry);
       return { ...result, slPrice: formatPrice(entry) };
     }
@@ -526,18 +642,14 @@ export class PositionManager {
     // tick because the stop read came from a field the position payload does
     // not have. The existing take-profit is therefore read back and resent
     // alongside the new stop, so only the stop moves.
-    const existing = await this.positionTPSL(positionId, positionQty);
+    const existing = await this.preserveTakeProfit(positionId, positionQty);
     const params = {
       symbol: this.symbol,
       positionId,
       slPrice: formatPrice(entryPrice, quotePrecision),
       slStopType: 'MARK_PRICE',
     };
-    if (existing && finitePositive(Number(existing.tpPrice))) {
-      params.tpPrice = String(existing.tpPrice);
-      if (existing.tpStopType) params.tpStopType = existing.tpStopType;
-      if (existing.tpOrderType) params.tpOrderType = existing.tpOrderType;
-    }
+    Object.assign(params, existing);
     const result = await this.client.modifyTPSL(params);
     this.recordStopMove(positionId, params, positionQty);
     return result;
@@ -566,18 +678,14 @@ export class PositionManager {
     // The existing take-profit is carried forward for the same reason as in
     // moveSLToEntry: this endpoint replaces the pair, so omitting tpPrice would
     // delete the live take-profit on every trailing step.
-    const existing = await this.positionTPSL(positionId, positionQty);
+    const existing = await this.preserveTakeProfit(positionId, positionQty);
     const params = {
       symbol: this.symbol,
       positionId,
       slPrice: formatPrice(newSL, await this.getQuotePrecision()),
       slStopType: 'MARK_PRICE',
     };
-    if (existing && finitePositive(Number(existing.tpPrice))) {
-      params.tpPrice = String(existing.tpPrice);
-      if (existing.tpStopType) params.tpStopType = existing.tpStopType;
-      if (existing.tpOrderType) params.tpOrderType = existing.tpOrderType;
-    }
+    Object.assign(params, existing);
     const result = await this.client.modifyTPSL(params);
     this.recordStopMove(positionId, params, positionQty);
     return result;
@@ -611,6 +719,7 @@ export class PositionManager {
     this.trailingState.delete(key);
     this.state.cooldownUntil = Date.now() + Number(this.settings.cooldown_minutes) * 60000;
     this.closedThisCycle.add(key);
+    this.closedRecently.set(key, Date.now());
     this.noteClose(key, 'trailing_callback');
     const result = await this.client.closePosition(this.symbol, position.positionId, position);
     return { ...outcome, closed: true, result };
@@ -636,7 +745,19 @@ export class PositionManager {
     for (const position of this.state.positions) {
       this.noteClose(position.positionId, triggered === 'tp' ? 'account_tp' : 'account_sl');
     }
-    await this.client.closeAllPosition(this.symbol);
+    // Method 4 is an ACCOUNT-level control unit, and the article is explicit
+    // that it spans symbols: "A user holds BTC, ETH, and SOL futures positions
+    // simultaneously ... the system automatically closes all futures positions
+    // once the account's overall profit or loss reaches the predefined
+    // threshold."
+    // https://www.bitunix.com/hub/helpcenter/article/bitunix-futures-position-a-guide-to-four-take-profit-and-stop-loss-methods-web?id=290
+    //
+    // close_all_position takes `symbol` as an OPTIONAL filter (docs
+    // https://www.bitunix.com/api-docs/futures/trade/close_all_position.html),
+    // so omitting it is what closes every futures position on the account.
+    // Passing this.symbol left the account guard reporting a full close while
+    // only ever closing one pair.
+    await this.client.closeAllPosition();
     // The peaks belonged to positions that no longer exist.
     this.trailingState.clear();
     return { triggered, roi, totalPnl, totalMargin };
@@ -679,6 +800,12 @@ export class PositionManager {
   async emergencyClose(position, reason) {
     const key = String(position.positionId);
     if (this.closedThisCycle.has(key)) return { skipped: 'already closed this cycle' };
+    // Also refuse a close the guard path already sent moments ago, even if a
+    // midManage tick reset the per-tick record in between.
+    const recent = this.closedRecently.get(key);
+    if (recent !== undefined && Date.now() - recent < PositionManager.CLOSE_DEDUPE_MS) {
+      return { skipped: 'already closed by an earlier guard this cycle', closedAt: recent };
+    }
     this.state.cooldownUntil = Date.now() + Number(this.settings.cooldown_minutes) * 60000;
     // `closed: true` lets midManage stop working this position. Without it the
     // trailing callback below would close the same positionId again in the same
@@ -686,6 +813,7 @@ export class PositionManager {
     this.noteClose(position.positionId, reason);
     const result = await this.client.closePosition(this.symbol, position.positionId, position);
     this.closedThisCycle.add(key);
+    this.closedRecently.set(key, Date.now());
     return { closed: true, trigger: reason, result };
   }
 
@@ -719,11 +847,13 @@ export class PositionManager {
         const ladder = await this.placePartialTPSL(position, entryPrice, direction, atr, confidence);
         if (ladder.error) throw new Error(ladder.error);
         this.resetTpslCache();
+        this.breakEvenApplied.delete(String(position.positionId));
         return { placed: true, result: ladder };
       }
       if (method === 'trailing' || method === 'account') {
         const result = await this.placeTPSLStop(position.positionId, entryPrice, direction, atr, confidence);
         this.resetTpslCache();
+        this.breakEvenApplied.delete(String(position.positionId));
         return { placed: true, result, method };
       }
       // A half-armed pair is repaired rather than duplicated: place_order on an
@@ -731,10 +861,14 @@ export class PositionManager {
       // competing target, while modifyTPSL is the endpoint that owns the pair.
       if (armed.tp !== armed.sl) {
         const result = await this.repairProtection(position, entryPrice, direction, atr, confidence, armed);
+        // The pair we just rebuilt carries fresh ATR levels, so any earlier
+        // break-even is no longer describing what is armed on the exchange.
+        this.breakEvenApplied.delete(String(position.positionId));
         return { placed: true, result, repaired: true };
       }
       const result = await this.placeTPSL(position.positionId, entryPrice, direction, atr, confidence);
       this.resetTpslCache();
+      this.breakEvenApplied.delete(String(position.positionId));
       return { placed: true, result };
     } catch (error) {
       if (this.settings.on_tpsl_failure === 'close') {
@@ -778,15 +912,25 @@ export class PositionManager {
       }
       if (protectionFailed) continue;
       try {
-        const breakeven = await this.checkBreakeven(position);
-        if (breakeven?.slPrice) position.slPrice = breakeven.slPrice;
-        const trailing = await this.checkTrailing(position);
-        if (trailing?.slPrice) position.slPrice = trailing.slPrice;
+        // ORDER IS A RISK DECISION, not a style choice. The liquidation guard
+        // and the tiered-risk-limit maintenance-margin guard are the only two
+        // steps on this tick whose failure is unrecoverable — the exchange
+        // force-liquidates the position — so they run FIRST and the position is
+        // not touched again once either has fired. They used to run last, after
+        // break-even and trailing had each re-derived an ATR stop and awaited
+        // an exchange round-trip, so a position sitting on its liquidation
+        // price spent that window being re-protected instead of being closed.
         const liqGuard = await this.checkLiquidationGuard(position);
         if (liqGuard?.closed) continue;
         // Tiered risk limit: the exchange's own maintenance-margin trigger.
         const marginGuard = await this.checkMaintenanceMargin(position);
         if (marginGuard?.closed) continue;
+
+        // Profit-side management only once the position is known to be safe.
+        const breakeven = await this.checkBreakeven(position);
+        if (breakeven?.slPrice) position.slPrice = breakeven.slPrice;
+        const trailing = await this.checkTrailing(position);
+        if (trailing?.slPrice) position.slPrice = trailing.slPrice;
         // Method 3: the peak/callback exit only runs under the trailing method;
         // the ATR stop tightening above stays on as the hard backstop. Skipped
         // when the liquidation guard already closed this position, otherwise the

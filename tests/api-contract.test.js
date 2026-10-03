@@ -1155,17 +1155,15 @@ describe('a position is closed at most once per manage cycle', () => {
     assert.equal(pm.closedThisCycle.has('p1'), true);
   });
 
-  it('clears the per-tick record so a legitimately reopened id can close again', async () => {
+  it('does not re-close an id the guard already closed while it is still listed open', async () => {
     const closes = [];
     const client = {
+      // The exchange keeps listing the position for a moment after a close
+      // lands, which is exactly the window a duplicate close is sent in.
       getPendingPositions: async () => [danger],
       closePosition: async (_symbol, positionId) => { closes.push(positionId); return {}; },
       getPendingTPSL: async () => [],
-      // Protection must SUCCEED here, otherwise ensureProtection's on_tpsl_failure
-      // branch closes the position and the liquidation guard is never reached.
       placeTPSL: async () => ({ orderId: 'sl-1' }),
-      // breakeven/trailing both move the stop; without this they throw and abort
-      // the tick before the liquidation guard is ever reached.
       modifyTPSL: async () => ({ orderId: 'sl-1' }),
       getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
       getTickers: async () => [{ markPrice: '110' }],
@@ -1173,16 +1171,36 @@ describe('a position is closed at most once per manage cycle', () => {
     };
     const pm = new PositionManager(client, 'BTCUSDT', settings());
     await pm.midManage();
-    // The record holds this tick's closes; it is reset at the START of the next
-    // tick, so the same positionId can legitimately close again.
     assert.equal(pm.closedThisCycle.size, 1, 'the tick records what it closed');
-    const afterFirst = closes.length;
-    assert.ok(afterFirst >= 1, 'the first tick must close');
+    assert.equal(closes.filter(id => id === 'p1').length, 1, 'the first tick closes once');
     await pm.midManage();
-    assert.ok(closes.length > afterFirst,
-      'a still-open position must be closable again on the next tick');
-    assert.equal(closes.filter(id => id === 'p1').length, closes.length,
-      'every close targets the reopened position');
+    assert.equal(closes.filter(id => id === 'p1').length, 1,
+      'the same positionId is never closed twice: closePosition reuses clientId '
+      + '"jrock-close-<positionId>", so a repeat is always rejected with 30042');
+  });
+
+  it('lets a reopened position (new id) close on its very first tick', async () => {
+    const closes = [];
+    let live = danger;
+    const client = {
+      getPendingPositions: async () => [live],
+      closePosition: async (_symbol, positionId) => { closes.push(positionId); return {}; },
+      getPendingTPSL: async () => [],
+      placeTPSL: async () => ({ orderId: 'sl-1' }),
+      modifyTPSL: async () => ({ orderId: 'sl-1' }),
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getTickers: async () => [{ markPrice: '110' }],
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', settings());
+    await pm.midManage();
+    assert.deepEqual(closes, ['p1']);
+    // Reopening the pair yields a NEW positionId, so the dedupe record for p1
+    // is dropped as soon as it stops being listed and the new id is free to
+    // close on the very next tick.
+    live = { ...danger, positionId: 'p2' };
+    await pm.midManage();
+    assert.deepEqual(closes, ['p1', 'p2']);
   });
 });
 
@@ -2021,5 +2039,228 @@ describe('one lone timeframe cannot carry the whole signal', () => {
     const direction = net(eligible) > 0 ? 'bullish' : 'bearish';
     const agrees = enoughTimeframes(eligible.length) && aligned(eligible, direction) >= quorumFor(2);
     assert.equal(agrees, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Regression: break-even re-fired on a position it had already fixed.
+//
+// Symptom reported from the running bot: the same line repeating once per manage
+// tick for the whole life of a trade —
+//     🛡 Break-even stop
+//     LONG SANDUSDT  SL → 0.075
+//
+// checkBreakeven decides by asking the exchange where the stop is, and every way
+// that lookup could fail confirmed the stop was NOT at entry: the pending row
+// was missed, the tick cache had been reset, or the move had landed on an
+// order-level row. It then re-sent the identical modify and re-announced it.
+// The first call was correct; every one after it was noise.
+// ---------------------------------------------------------------------------
+
+describe('break-even is applied once per position, not once per manage tick', () => {
+  const settings = (over = {}) => ({
+    symbol: 'BTCUSDT', leverage: 10, min_confidence: 80,
+    tpsl_method: 'position', breakeven_threshold_pct: 20, trailing_trigger_roi_pct: 25,
+    trailing_callback_pct: 5, sl_liquidation_safety: 0.6, cooldown_minutes: 1,
+    on_tpsl_failure: 'close', max_positions: 3,
+    account_tp_roi_pct: 0, account_sl_roi_pct: 0,
+    partial_tp_fractions: [0.3, 0.4, 0.3], partial_tp_roi_steps: [1, 2, 3],
+    ...over,
+  });
+
+  // +10% at 10x leverage = +100% ROI, comfortably over the 20% break-even
+  // threshold, so the threshold is never what stops it re-firing.
+  const position = {
+    positionId: 'p1', symbol: 'BTCUSDT', side: 'BUY', qty: '1000',
+    avgPrice: '0.075', markPrice: '0.0825', liqPrice: '0.01', leverage: 10,
+  };
+
+  function buildClient({ rows }) {
+    const sent = [];
+    return {
+      sent,
+      getPendingPositions: async () => [position],
+      getPendingTPSL: async () => rows,
+      placeTPSL: async () => ({ orderId: 'sl-1' }),
+      modifyTPSL: async (params) => { sent.push(params); return { orderId: 'sl-1' }; },
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({
+        high: String(1 + i / 1000), low: String(0.9 + i / 1000), close: String(0.95 + i / 1000),
+      })),
+      getTickers: async () => [{ symbol: 'BTCUSDT', markPrice: '0.0825' }],
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 5, basePrecision: 2 }],
+    };
+  }
+
+  it('does not re-send the move, or re-announce it, once the stop is at entry', async () => {
+    // The exchange still reports the PRE-move stop: the exact lag that used to
+    // make every tick look like the break-even had never been applied.
+    const stale = [{ positionId: 'p1', tpPrice: '0.09', slPrice: '0.06', tpStopType: 'MARK_PRICE', slStopType: 'MARK_PRICE' }];
+    const client = buildClient({ rows: stale });
+    const announced = [];
+    const pm = new PositionManager(client, 'BTCUSDT', settings());
+    pm.notifier = { reportStopMove: (p, action, price) => announced.push([action, price]) };
+    await pm.midManage();
+    assert.equal(client.sent.length, 1, 'the first tick moves the stop once');
+    assert.deepEqual(announced, [['breakeven', 0.075]]);
+    for (let i = 0; i < 5; i += 1) await pm.midManage();
+    assert.equal(client.sent.length, 1, 'no repeat modify is sent on later ticks');
+    assert.equal(announced.length, 1, 'the operator is told about it exactly once');
+  });
+
+  it('preserves the take-profit carried on an order-level row', async () => {
+    // tpQty/slQty below the position size marks this a ladder leg, which the
+    // position-level lookup deliberately skips — the case where break-even used
+    // to send modifyTPSL with no tpPrice and delete the live take-profit.
+    const orderLevel = [{
+      positionId: 'p1', id: 'leg-1',
+      tpPrice: '0.09', slPrice: '0.06', tpQty: '400', slQty: '400',
+      tpStopType: 'MARK_PRICE', slStopType: 'MARK_PRICE',
+    }];
+    const client = buildClient({ rows: orderLevel });
+    const pm = new PositionManager(client, 'BTCUSDT', settings());
+    await pm.checkBreakeven(position);
+    assert.equal(client.sent.length, 1);
+    assert.equal(client.sent[0].tpPrice, '0.09', 'the take-profit is carried along, not deleted');
+    assert.equal(client.sent[0].slPrice, '0.075');
+  });
+
+  it('measures ROI against the position leverage, not the configured one', async () => {
+    // Entry 100 -> mark 101 is +1%. At the position's own 10x that is +10% ROI,
+    // which is under a 15% break-even threshold, so it must NOT fire. Measured
+    // against a configured leverage of 100 it would read +100% and fire wrongly.
+    const client = buildClient({ rows: [] });
+    const pm = new PositionManager(client, 'BTCUSDT', settings({ leverage: 100, breakeven_threshold_pct: 15 }));
+    const scaled = { ...position, avgPrice: '100', markPrice: '101', liqPrice: '50' };
+    const result = await pm.checkBreakeven(scaled);
+    assert.equal(result.skipped, 'threshold not reached');
+    assert.equal(client.sent.length, 0, 'no stop move is sent');
+    assert.equal(pm.favorableRoiPct(scaled), 10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Account TP/SL is an ACCOUNT-level control unit and spans symbols.
+//
+// The article: "A user holds BTC, ETH, and SOL futures positions simultaneously
+// ... the system automatically closes all futures positions once the account's
+// overall profit or loss reaches the predefined threshold."
+// close_all_position takes `symbol` as an OPTIONAL filter, so passing one
+// narrowed an account-wide exit to a single pair.
+// ---------------------------------------------------------------------------
+
+describe('the account guard closes every futures position, not just one symbol', () => {
+  it('sends close_all_position without a symbol filter', async () => {
+    const calls = [];
+    const client = {
+      getPendingPositions: async () => [],
+      closeAllPosition: async (...args) => { calls.push(args); return {}; },
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', {
+      symbol: 'BTCUSDT', leverage: 10, tpsl_method: 'account',
+      account_tp_roi_pct: 5, account_sl_roi_pct: 0, cooldown_minutes: 1,
+    });
+    pm.state.positions = [{
+      positionId: 'p1', side: 'BUY', qty: '1', avgPrice: '100',
+      markPrice: '110', unrealizedPNL: '50', margin: '100', leverage: 10,
+    }];
+    const result = await pm.checkAccountGuard();
+    assert.equal(result.triggered, 'tp');
+    assert.deepEqual(calls, [[]], 'no symbol is passed, so the whole account is closed');
+  });
+
+  it('omits the symbol from the request body entirely', async () => {
+    const seen = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      seen.push({ url, body: init?.body });
+      return { ok: true, json: async () => ({ code: 0, data: '', msg: 'Success' }) };
+    };
+    try {
+      const client = new BitunixClient('https://fapi.bitunix.com', 'k', 's');
+      await client.closeAllPosition();
+      assert.equal(seen[0].body, '{}', 'the documented empty body is sent');
+      assert.equal(seen[0].url, 'https://fapi.bitunix.com/api/v1/futures/trade/close_all_position');
+      await client.closeAllPosition('BTCUSDT');
+      assert.equal(seen[1].body, '{"symbol":"BTCUSDT"}', 'an explicit symbol still narrows the close');
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// trading_pairs publishes the tradable state of the pair; it was unchecked.
+// ---------------------------------------------------------------------------
+
+describe('order pre-flight honours the pair trading status', () => {
+  it('refuses to trade a pair that is not OPEN', () => {
+    const pair = { symbol: 'BTCUSDT', quotePrecision: 2, basePrecision: 4, symbolStatus: 'STOP' };
+    assert.throws(
+      () => traderReject({ symbol: 'BTCUSDT', side: 'BUY', qty: '1', orderType: 'MARKET' }, pair),
+      /is STOP, so it cannot be traded/,
+    );
+    assert.throws(
+      () => traderReject({ symbol: 'BTCUSDT', side: 'BUY', qty: '1', orderType: 'MARKET' }, { ...pair, symbolStatus: 'CANCEL_ONLY' }),
+      /CANCEL_ONLY/,
+    );
+  });
+
+  it('refuses a pair with API trading disabled, and allows an OPEN one', () => {
+    const body = { symbol: 'BTCUSDT', side: 'BUY', qty: '1', orderType: 'MARKET' };
+    assert.throws(
+      () => traderReject(body, { symbol: 'BTCUSDT', quotePrecision: 2, basePrecision: 4, symbolStatus: 'OPEN', isApiSupported: false }),
+      /API trading disabled/,
+    );
+    assert.doesNotThrow(
+      () => traderReject(body, { symbol: 'BTCUSDT', quotePrecision: 2, basePrecision: 4, symbolStatus: 'OPEN', isApiSupported: true }),
+    );
+  });
+
+  it('rejects a LIMIT price outside the priceProtectScope band', () => {
+    // mark 10000, scope 0.02 -> buy band is 9800-10200.
+    const pair = { symbol: 'BTCUSDT', quotePrecision: 2, basePrecision: 4, symbolStatus: 'OPEN', priceProtectScope: '0.02' };
+    const limit = (side, price) => ({
+      symbol: 'BTCUSDT', side, qty: '1', orderType: 'LIMIT', effect: 'GTC',
+      price: String(price), markPrice: '10000',
+    });
+    assert.doesNotThrow(() => traderReject(limit('BUY', 10200), pair));
+    assert.throws(() => traderReject(limit('BUY', 10500), pair), /outside priceProtectScope/);
+    assert.throws(() => traderReject(limit('SELL', 9500), pair), /outside priceProtectScope/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The liquidation guards are the only unrecoverable failures on a manage tick,
+// so they must not be the last thing the tick does.
+// ---------------------------------------------------------------------------
+
+describe('liquidation guards run before any profit-side stop management', () => {
+  it('does not touch the stop of a position it is about to liquidate-close', async () => {
+    const calls = [];
+    const danger = {
+      positionId: 'p1', symbol: 'BTCUSDT', side: 'BUY', qty: '1',
+      avgPrice: '100', markPrice: '110', liqPrice: '99.5', leverage: 10,
+    };
+    const client = {
+      getPendingPositions: async () => [danger],
+      getPendingTPSL: async () => [],
+      closePosition: async () => { calls.push('close'); return {}; },
+      placeTPSL: async () => { calls.push('place'); return { orderId: 'sl-1' }; },
+      modifyTPSL: async () => { calls.push('modify'); return { orderId: 'sl-1' }; },
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getTickers: async () => [{ symbol: 'BTCUSDT', markPrice: '110' }],
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', {
+      symbol: 'BTCUSDT', leverage: 10, min_confidence: 80, tpsl_method: 'position',
+      breakeven_threshold_pct: 20, trailing_trigger_roi_pct: 25, trailing_callback_pct: 5,
+      sl_liquidation_safety: 90, cooldown_minutes: 1, on_tpsl_failure: 'close',
+      max_positions: 3, account_tp_roi_pct: 0, account_sl_roi_pct: 0,
+      partial_tp_fractions: [0.3, 0.4, 0.3], partial_tp_roi_steps: [1, 2, 3],
+    });
+    await pm.midManage();
+    // ROI is +100% here, far over both the break-even and trailing triggers, so
+    // the old ordering sent a stop move before the emergency close.
+    assert.deepEqual(calls, ['place', 'close'], 'protection is placed, then the close; no stop move');
   });
 });

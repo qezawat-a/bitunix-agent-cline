@@ -24,6 +24,24 @@ function decimalsOf(value) {
 export function assertOrderMatchesPair(body, pair) {
   if (!pair || typeof pair !== 'object') return;
   const errors = [];
+  // The venue publishes the tradable state of the pair on the same record as its
+  // precisions, and the bot was checking every numeric field except these:
+  //   symbolStatus     OPEN: trade normal / CANCEL_ONLY: cancel only /
+  //                    STOP: can't open or close position
+  //   isApiSupported   false: API Trading Disabled
+  // https://www.bitunix.com/api-docs/futures/market/get_trading_pairs.html
+  //
+  // Neither is enforced by precision or volume validation, so an entry could be
+  // sent to a delisted pair, or the closing leg of an emergency exit could be
+  // rejected outright because the symbol is CANCEL_ONLY — which is precisely
+  // when getting out matters most.
+  const status = String(pair.symbolStatus ?? '').trim().toUpperCase();
+  if (status && !['OPEN'].includes(status)) {
+    errors.push(`${pair.symbol ?? 'pair'} is ${status}, so it cannot be traded`);
+  }
+  if (pair.isApiSupported === false) {
+    errors.push(`${pair.symbol ?? 'pair'} has API trading disabled (isApiSupported=false)`);
+  }
   const quotePrecision = Number(pair.quotePrecision);
   const basePrecision = Number(pair.basePrecision);
   if (Number.isInteger(quotePrecision) && quotePrecision >= 0) {
@@ -57,6 +75,29 @@ export function assertOrderMatchesPair(body, pair) {
   }
   if (body.orderType === 'LIMIT' && !body.effect) {
     errors.push('a LIMIT order requires an effect (GTC, IOC, FOK or POST_ONLY)');
+  }
+  // Price protection. The venue caps how far from the current mark an order may
+  // sit: "current mark price is: 10000, priceProtectScope=0.02, the minimum sell
+  // order price = 10000*(1-0.02)=9800; the maximum buy order price = 10000*(1+
+  // 0.02) = 10200". A price outside that band is rejected, which matters here
+  // because TP/SL levels are derived from ATR and can sit far from the mark on a
+  // volatile symbol.
+  if (body.effect === 'GTC' || body.orderType === 'LIMIT') {
+    const scope = Number(pair.priceProtectScope);
+    const mark = Number(body.markPrice ?? body.referencePrice);
+    if (Number.isFinite(scope) && scope > 0 && Number.isFinite(mark) && mark > 0 && Number(body.price) > 0) {
+      const price = Number(body.price);
+      const minBuy = mark * (1 - scope);
+      const maxBuy = mark * (1 + scope);
+      const minSell = mark * (1 - scope);
+      const maxSell = mark * (1 + scope);
+      if (body.side === 'BUY' && (price < minBuy || price > maxBuy)) {
+        errors.push(`BUY price ${price} is outside priceProtectScope +/-${scope} of the ${mark} mark price (${minBuy}-${maxBuy})`);
+      }
+      if (body.side === 'SELL' && (price < minSell || price > maxSell)) {
+        errors.push(`SELL price ${price} is outside priceProtectScope +/-${scope} of the ${mark} mark price (${minSell}-${maxSell})`);
+      }
+    }
   }
   if (errors.length) throw new Error(`order rejected before sending: ${errors.join('; ')}`);
 }

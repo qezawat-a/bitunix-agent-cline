@@ -233,7 +233,14 @@ export class BitunixClient {
   }
 
   async closeAllPosition(symbol) {
-    return this.request('POST', '/api/v1/futures/trade/close_all_position', { symbol }, {});
+    // `symbol` is an OPTIONAL filter on this endpoint
+    // (https://www.bitunix.com/api-docs/futures/trade/close_all_position.html).
+    // Omitting it closes every futures position on the account, which is what
+    // Bitunix's account-level TP/SL does; passing it narrows the close to one
+    // pair. The empty value is filtered out of the body so the request stays
+    // exactly the documented `{}`.
+    const payload = symbol ? { symbol } : {};
+    return this.request('POST', '/api/v1/futures/trade/close_all_position', payload, {});
   }
 
   async placeTPSL(params) {

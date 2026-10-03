@@ -22,7 +22,7 @@ caller receives `data`.
 | `POST /api/v1/futures/trade/batch_order` | `batchPlaceOrder(BatchPlaceOrderRequest)` | `batchOrder(symbol, orderList)` | implemented | `BatchPlaceOrderRequest{symbol, orderList}` where each entry is a full `PlaceOrderRequest`; 1–5 entries. Per-entry side casing is now normalised like `placeOrder`. |
 | `POST /api/v1/futures/trade/cancel_all_orders` | `cancelAllOrders(CancelAllOrdersRequest)` | `cancelAllOrders(symbol)` | implemented | `CancelAllOrdersRequest{marginCoin, symbol}`; we send `symbol` only, `marginCoin` is optional per the docs. |
 | `POST /api/v1/futures/trade/cancel_orders` | `cancelOrders(CancelOrdersRequest)` | `cancelOrder(symbol, orderId, clientId)` | implemented | Identifiers are nested: `{symbol, orderList:[{orderId}]}`. |
-| `POST /api/v1/futures/trade/close_all_position` | `closeAllPosition(CloseAllPositionRequest)` | `closeAllPosition(symbol)` | implemented | — |
+| `POST /api/v1/futures/trade/close_all_position` | `closeAllPosition(CloseAllPositionRequest)` | `closeAllPosition(symbol)` | implemented | `symbol` is an **optional** filter on this endpoint. Called with no argument the body is `{}` and every futures position on the account is closed — which is what Bitunix's account-level TP/SL does; passing it narrows the close to one pair. |
 | `POST /api/v1/futures/trade/flash_close_position` | `flashClosePosition(FlashClosePositionRequest)` | `flashClosePosition(positionId)` | implemented | `FlashClosePositionRequest{marginCoin, positionId}`. |
 | `GET /api/v1/futures/trade/get_history_orders` | `getHistoryOrders(GetHistoryOrdersRequest)` | `getHistoryOrders(symbol, options)` | implemented | `OrderPageResp extends PageResp` → list field **`orderList`** (verified). Unwrapped `orderList`; bare array still accepted. |
 | `GET /api/v1/futures/trade/get_history_trades` | `getHistoryTrades(GetHistoryTradesRequest)` | `getHistoryTrades(symbol, options)` | implemented | `TradePageResp extends PageResp` → list field **`tradeList`** (verified). |
@@ -137,3 +137,46 @@ caller receives `data`.
 | `POST /api/v1/futures/account/change_leverage` | `changeLeverage(ChangeLeverage)` | `changeLeverage(symbol, leverage, options)` | implemented | The accepted band is **per symbol**: `/market/trading_pairs` carries `minLeverage`/`maxLeverage` (docs example: BTCUSDT `maxLeverage` 125, min 1). A caller holding that metadata passes `options.maxLeverage`; otherwise `MAX_LEVERAGE_FALLBACK = 125` applies. `trader.computePositionSize` validates against the fetched pair's own band. `marginCoin` defaults to `USDT`. |
 | `GET /api/v1/futures/account/trading_settings` | — (not wrapped by the SDK) | `getTradingSettings(symbols)` | implemented (new) | Documented but absent from `FuturesPath.java`. `symbols` is optional and comma-separated; omitting it returns every symbol the key has settings for. |
 | `GET /api/v1/cp/asset/query` | — (copy-trading, not wrapped by the SDK) | `assetQuery()` | implemented (new) | Copy-trading asset query (available futures balance / max transferable). Takes no parameters. |
+12. **Position leverage was ignored when measuring ROI.** `PositionPendingResp`
+    carries its own `leverage` (int32), and that is the number the exchange
+    applies to the position's margin and PnL. `favorableRoiPct()` multiplied by
+    the globally configured `leverage`, so every break-even / trailing /
+    account-ROI threshold was evaluated against a possibly different number —
+    e.g. after a manual `change_leverage`, or a risk-limit tier that forces a
+    lower leverage than the setting. It now prefers `position.leverage` and only
+    falls back to the setting when the position carries none.
+13. **`trading_pairs` tradable state was unchecked.** Every numeric field on the
+    pair record was validated except `symbolStatus` (`OPEN` / `CANCEL_ONLY` /
+    `STOP`) and `isApiSupported`. `assertOrderMatchesPair()` now refuses either,
+    so the bot cannot send an entry to a delisted pair or have its emergency exit
+    rejected because the symbol is cancel-only. `priceProtectScope` is also
+    enforced for LIMIT orders against the mark price.
+14. **`tpsl/position/modify_order` replaces the whole TP/SL pair.** An omitted
+    `tpPrice` therefore deletes the live take-profit. The pair was read back
+    through `positionTPSL()`, which deliberately ignores order-level rows, so on
+    a position protected by an order-level row (a partial ladder) break-even and
+    trailing each sent a stop-only modify and silently deleted the take-profit —
+    which `ensureProtection` then re-armed on the next tick, repeating for the
+    life of the trade. `preserveTakeProfit()` now searches **every** row for the
+    position, so a take-profit is never dropped over which row carries it.
+15. **Break-even could re-fire on a position it had already fixed.** It decided
+    by asking the exchange where the stop was, and any lag in that answer (row
+    missed, tick cache reset, move landed on an order-level row) looked exactly
+    like "break-even never applied", so the same modify was re-sent and
+    re-announced every manage tick — the repeated `SL -> 0.075` lines reported
+    from the running bot. `breakEvenApplied` records the applied move per
+    position, making the step idempotent; the marker is dropped when the position
+    disappears and whenever protection is re-armed or repaired.
+16. **A position could be closed twice across ticks.** `closePosition()` reuses
+    `clientId: "jrock-close-<positionId>"`, so any second close of the same id is
+    always rejected with `30042 Client ID duplicate`. `Trader.guard()` runs the
+    same liquidation guards on the tick immediately before `midManage()`, which
+    reset its per-tick record — so a position the guard had just closed was
+    closed a second time by midManage. `closedRecently` now holds each closed id
+    until it stops being listed as open (a reopened position carries a new id, so
+    it is free to close immediately), with a timeout backstop.
+17. **Guard ordering in `midManage()`.** The liquidation-distance and
+    maintenance-margin guards are the only steps whose failure is unrecoverable —
+    the exchange force-liquidates — but they ran *last*, after break-even and
+    trailing had each re-derived an ATR stop and awaited a round-trip. They now
+    run first, and the position is left alone once either has fired.
