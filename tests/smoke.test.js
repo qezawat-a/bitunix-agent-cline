@@ -1,0 +1,1490 @@
+import { describe, it, afterEach, beforeEach } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { Pool } from 'pg';
+import { ema, rsi, bollinger, atr, macd, superTrend, atrBreakout, computeSignal } from '../src/bitunix/indicators.js';
+import {
+  applyPersistedSettings,
+  applySettings,
+  getPersistentSettings,
+  getTraderSettings,
+  normalizeSettings,
+  parseSettingValue,
+  validateSettings,
+} from '../src/trader/settings.js';
+import { parseThinkingLevel } from '../src/agent/thinking.js';
+import { CONFIG, parseBoolean, applySettingsFile } from '../src/config.js';
+import { createTraderCommands } from '../src/telegram-trader.js';
+import { PositionNotifier, closeMessage, normalizeSide, openMessage, positionRoiPct, sideLabel } from '../src/trader/notifier.js';
+import { BitunixClient } from '../src/bitunix/client.js';
+import Scanner from '../src/bitunix/scanner.js';
+import { liqDistanceOk } from '../src/bitunix/risk.js';
+import { Trader } from '../src/trader/trader.js';
+import { PositionManager } from '../src/trader/position-manager.js';
+import { setPositionManager, setTraderInstances, traderTools } from '../src/trader/agent-tools.js';
+import { bitunixTools, setBitunixClient } from '../src/bitunix/futures-tools.js';
+import { detectProviders } from '../src/agent/config.js';
+import { chat, listOpenAiModels, resolveOpenAiModelsUrl, resolveOpenAiUrl, shouldSendTemperature } from '../src/agent/brain.js';
+import { createAgent, sanitizeHistory, say, resetAgent } from '../src/agent/loop.js';
+import { stringifyToolResult, validateToolArguments } from '../src/agent/tools.js';
+import { splitHtml } from '../src/telegram-bot.js';
+import {
+  BitunixWs,
+  KLINE_INTERVALS,
+  PRIVATE_CHANNELS,
+  normalizePrivateChannel,
+  normalizePublicChannel,
+} from '../src/bitunix/ws.js';
+import crypto from 'node:crypto';
+import { mock } from 'node:test';
+
+const originalConfig = { ...CONFIG, timeframes: [...CONFIG.timeframes] };
+const originalFetch = globalThis.fetch;
+
+afterEach(() => {
+  Object.assign(CONFIG, originalConfig, { timeframes: [...originalConfig.timeframes] });
+  globalThis.fetch = originalFetch;
+  setTraderInstances(null, null);
+  setPositionManager(null);
+  setBitunixClient(null);
+});
+
+function fakePosition(overrides = {}) {
+  return {
+    symbol: 'BTCUSDT',
+    positionId: 'p1',
+    side: 'BUY',
+    size: '1',
+    avgPrice: '100',
+    markPrice: '100',
+    liqPrice: '50',
+    openTime: Math.floor(Date.now() / 1000),
+    ...overrides,
+  };
+}
+
+describe('indicators', () => {
+  it('ema returns number for enough data', () => {
+    const arr = Array.from({ length: 30 }, (_, i) => 100 + i);
+    assert.ok(typeof ema(arr, 20) === 'number');
+  });
+
+  it('rsi returns 0-100', () => {
+    const arr = Array.from({ length: 30 }, (_, i) => 100 + Math.sin(i) * 5 + i * 0.2);
+    const v = rsi(arr);
+    assert.ok(v === null || (v >= 0 && v <= 100));
+  });
+
+  it('bollinger returns band', () => {
+    const arr = Array.from({ length: 30 }, (_, i) => 100 + i * 0.5);
+    const bb = bollinger(arr);
+    assert.ok(bb && bb.upper > bb.mid && bb.mid > bb.lower);
+  });
+
+  it('computeSignal returns direction+confidence', () => {
+    const kl = Array.from({ length: 60 }, (_, i) => ({
+      open: String(100 + i), high: String(101 + i), low: String(99 + i), close: String(100 + i),
+    }));
+    const vols = Array.from({ length: 60 }, () => 10);
+    const res = computeSignal(kl, vols, 0);
+    assert.ok(['bullish', 'bearish', 'neutral'].includes(res.direction));
+    assert.ok(res.confidence >= 0 && res.confidence <= 100);
+    assert.ok(Object.hasOwn(res.signals, 'supertrend'));
+    assert.ok(Object.hasOwn(res.signals, 'atr_breakout'));
+  });
+});
+
+describe('settings', () => {
+  it('normalize fills defaults', () => {
+    const s = normalizeSettings({});
+    assert.equal(s.symbol, 'BTCUSDT');
+    assert.ok(s.timeframes.includes('3m'));
+    assert.ok(s.min_confidence === 80);
+  });
+
+  it('validate catches bad leverage', () => {
+    const errs = validateSettings({ ...normalizeSettings({}), leverage: 0 });
+    assert.ok(errs.length > 0, 'zero leverage is not a positive integer');
+    assert.ok(validateSettings({ ...normalizeSettings({}), leverage: 2.5 }).length > 0);
+    assert.ok(validateSettings({ ...normalizeSettings({}), leverage: -3 }).length > 0);
+    // No upper bound: the accepted band is per symbol and the exchange is the
+    // authority, so the settings form must not reject a value on its own.
+    assert.deepEqual(validateSettings({ ...normalizeSettings({}), leverage: 200 }), []);
+  });
+});
+
+describe('thinking', () => {
+  it('parses levels', () => {
+    assert.equal(parseThinkingLevel('high'), 'high');
+    assert.equal(parseThinkingLevel('off'), 'off');
+    assert.equal(parseThinkingLevel('zzz'), 'mid');
+  });
+});
+
+describe('safety configuration', () => {
+  it('parses common boolean values and rejects unsafe values', () => {
+    assert.equal(parseBoolean('true', false, 'TEST'), true);
+    assert.equal(parseBoolean('0', true, 'TEST'), false);
+    assert.throws(() => parseBoolean('maybe', true, 'TEST'), /TEST/);
+  });
+
+  it('normalizes aliases and rejects invalid persisted values', () => {
+    const settings = normalizeSettings({ margin_mode: 'isolated', timeframes: '1m, 5m' });
+    assert.equal(settings.position_type, 'isolated');
+    assert.deepEqual(settings.timeframes, ['1m', '5m']);
+    assert.ok(validateSettings({ ...settings, leverage: NaN }).length > 0);
+    assert.ok(validateSettings({ ...settings, max_positions: 0 }).length > 0);
+    assert.equal(parseSettingValue('max_positions', '4'), 4);
+  });
+
+  it('migrates persisted settings while ignoring secret and unknown fields', () => {
+    const target = { ...getTraderSettings(CONFIG), auto_trade: false };
+    applyPersistedSettings(target, { symbol: 'ETHUSDT', leverage: 12, BITUNIX_API_SECRET: 'secret', unknown: 'value', dry_run: false });
+    assert.equal(target.symbol, 'ETHUSDT');
+    assert.equal(target.leverage, 12);
+    assert.equal(Object.hasOwn(target, 'unknown'), false);
+    assert.equal(Object.hasOwn(target, 'dry_run'), false);
+    assert.equal(Object.hasOwn(target, 'BITUNIX_API_SECRET'), false);
+  });
+
+  it('exposes only public settings and excludes auto_trade from persistence', () => {
+    CONFIG.BITUNIX_API_SECRET = 'secret-sentinel';
+    CONFIG.AUTO_TRADE_PERSIST = false;
+    const publicSettings = getTraderSettings(CONFIG);
+    assert.equal(Object.hasOwn(publicSettings, 'BITUNIX_API_SECRET'), false);
+    const persistent = getPersistentSettings(CONFIG);
+    // auto_trade is the live trading authority: never resume it after a restart.
+    assert.equal(Object.hasOwn(persistent, 'auto_trade'), false);
+    assert.equal(Object.hasOwn(persistent, 'symbol'), true);
+    assert.equal(Object.hasOwn(persistent, 'BITUNIX_API_SECRET'), false);
+  });
+
+  it('keeps auto_trade out of the store by default but honours AUTO_TRADE_PERSIST', () => {
+    // Default (off): the flag must never reach the store, so a redeploy cannot
+    // silently resume live trading.
+    const off = { ...getTraderSettings(CONFIG), auto_trade: true, AUTO_TRADE_PERSIST: false };
+    assert.equal(Object.hasOwn(getPersistentSettings(off), 'auto_trade'), false);
+
+    // Opted in: /autotrade on is expected to survive a deploy.
+    const on = { ...getTraderSettings(CONFIG), auto_trade: true, AUTO_TRADE_PERSIST: true };
+    const persisted = getPersistentSettings(on);
+    assert.equal(Object.hasOwn(persisted, 'auto_trade'), true);
+    assert.equal(persisted.auto_trade, true);
+
+    // applyPersistedSettings must mirror it in both directions.
+    const restoreDefault = { ...getTraderSettings(CONFIG), auto_trade: false, AUTO_TRADE_PERSIST: false };
+    applyPersistedSettings(restoreDefault, { auto_trade: true });
+    assert.equal(restoreDefault.auto_trade, false, 'default must not restore trading authority');
+
+    const restoreOptIn = { ...getTraderSettings(CONFIG), auto_trade: false, AUTO_TRADE_PERSIST: true };
+    applyPersistedSettings(restoreOptIn, { auto_trade: true });
+    assert.equal(restoreOptIn.auto_trade, true, 'AUTO_TRADE_PERSIST=1 must restore auto_trade');
+  });
+});
+
+describe('indicator correctness', () => {
+  it('calculates directional RSI, MACD, Super Trend, and ATR breakout', () => {
+    const increasing = Array.from({ length: 80 }, (_, index) => 100 + index * index);
+    const highs = increasing.map(value => value + 1);
+    const lows = increasing.map(value => value - 1);
+    assert.equal(rsi(increasing), 100);
+    assert.equal(macd(increasing), 'bullish');
+    assert.equal(superTrend(highs, lows, increasing), 'bullish');
+    const decreasing = Array.from({ length: 80 }, (_, index) => 1000 - index * index);
+    assert.equal(superTrend(decreasing.map(value => value + 1), decreasing.map(value => value - 1), decreasing), 'bearish');
+    const flat = Array.from({ length: 60 }, () => 100);
+    assert.equal(superTrend(flat.map(value => value + 1), flat.map(value => value - 1), flat), 'neutral');
+    const breakout = [...increasing];
+    breakout[breakout.length - 2] = breakout[breakout.length - 3];
+    breakout[breakout.length - 1] += 10;
+    const breakoutHighs = breakout.map(value => value + 1);
+    const breakoutLows = breakout.map(value => value - 1);
+    assert.equal(atrBreakout(breakoutHighs, breakoutLows, breakout, 5, 5, 0.1), 'bullish');
+  });
+
+  it('rejects malformed kline values', () => {
+    const klines = Array.from({ length: 60 }, (_, index) => ({ close: String(100 + index), high: 'NaN', low: '1' }));
+    const volumes = Array.from({ length: 60 }, () => 1);
+    assert.throws(() => computeSignal(klines, volumes, 0), /positive finite/);
+  });
+});
+
+describe('exchange safety', () => {
+  it('rejects Bitunix API error envelopes', async () => {
+    const client = new BitunixClient();
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ code: '1001', msg: 'rejected', data: null }) });
+    await assert.rejects(() => client.request('POST', '/test', { a: 1 }), /rejected/);
+  });
+
+  it('uses official Bitunix position close and TP/SL contracts', async () => {
+    const requests = [];
+    globalThis.fetch = async (url, options) => {
+      requests.push({ url, body: options.body ? JSON.parse(options.body) : null });
+      return { ok: true, json: async () => ({ code: 0, data: { orderId: 'x' } }) };
+    };
+    const client = new BitunixClient();
+    await client.closePosition('BTCUSDT', 'p1', { symbol: 'BTCUSDT', positionId: 'p1', side: 'LONG', qty: '2' });
+    await client.placeTPSL({ symbol: 'BTCUSDT', positionId: 'p1', tpPrice: '110', slPrice: '90' });
+    await client.getLeverageAndMarginMode('BTCUSDT');
+    await client.getPositionMode();
+    assert.match(requests[0].url, /trade\/place_order/);
+    assert.equal(requests[0].body.side, 'BUY');
+    assert.equal(requests[0].body.tradeSide, 'CLOSE');
+    assert.match(requests[1].url, /tpsl\/position\/place_order/);
+    assert.equal(Object.hasOwn(requests[1].body, 'tpOrderType'), false);
+    assert.match(requests[2].url, /account\/get_leverage_margin_mode\?symbol=BTCUSDT&marginCoin=USDT/);
+    assert.match(requests[3].url, /account\/position_mode/);
+  });
+
+  it('does not substitute a different margin coin', async () => {
+    const client = new BitunixClient();
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ code: 0, data: [{ marginCoin: 'USDC', available: '10' }] }) });
+    await assert.rejects(() => client.getAccount('USDT'), /USDT not found/);
+  });
+
+  it('fails closed when liquidation data is missing', () => {
+    assert.equal(liqDistanceOk({ markPrice: 100, liqPrice: undefined }), false);
+    assert.equal(liqDistanceOk({ markPrice: 0, liqPrice: 50 }), false);
+    assert.equal(liqDistanceOk({ markPrice: 100, liqPrice: 0 }), true);
+    assert.equal(liqDistanceOk({ markPrice: 100, liqPrice: 50 }), true);
+  });
+
+  it('enforces minimum scanner confidence', async () => {
+    const klines = Array.from({ length: 60 }, (_, index) => ({ close: String(100 + index * index), high: String(101 + index * index), low: String(99 + index * index), baseVol: '10' }));
+    const scanner = new Scanner({ getKlines: async () => klines, getFundingRate: async () => ({ value: 0 }) });
+    Object.assign(CONFIG, { timeframes: ['1m'], min_agreeing_strategies: 1, tf_min_confidence: 0, min_confidence: 101 });
+    const result = await scanner.scan('BTCUSDT');
+    assert.equal(result.signal, 'hold');
+  });
+
+  it('uses the live ticker price, not a stale kline close, for lastPrice', async () => {
+    // The last kline's close (100 + 59*59 = 3581) is stale by up to a full
+    // bar; the real-time tickers endpoint is the source of truth for price.
+    const klines = Array.from({ length: 60 }, (_, index) => ({ close: String(100 + index * index), high: String(101 + index * index), low: String(99 + index * index), baseVol: '10' }));
+    const scanner = new Scanner({
+      getKlines: async () => klines,
+      getFundingRate: async () => ({ value: 0 }),
+      getTickers: async () => [{ symbol: 'BTCUSDT', lastPrice: '99999.5', markPrice: '99999.1' }],
+    });
+    Object.assign(CONFIG, { timeframes: ['1m'], min_agreeing_strategies: 1, tf_min_confidence: 0, min_confidence: 0 });
+    const result = await scanner.scan('BTCUSDT');
+    assert.equal(result.lastPrice, 99999.5);
+  });
+
+  it('falls back to the kline close if the ticker call fails', async () => {
+    const klines = Array.from({ length: 60 }, (_, index) => ({ close: String(100 + index * index), high: String(101 + index * index), low: String(99 + index * index), baseVol: '10' }));
+    const scanner = new Scanner({ getKlines: async () => klines, getFundingRate: async () => ({ value: 0 }) });
+    Object.assign(CONFIG, { timeframes: ['1m'], min_agreeing_strategies: 1, tf_min_confidence: 0, min_confidence: 0 });
+    const result = await scanner.scan('BTCUSDT');
+    assert.equal(result.lastPrice, klines.at(-1).close);
+  });
+
+  it('does not order when auto-trade is disabled', async () => {
+    const calls = [];
+    const client = {
+      getPendingPositions: async () => [],
+      getAccount: async () => ({ available: '100' }),
+      placeOrder: async body => { calls.push(body); return { orderId: 'o1' }; },
+    };
+    const trader = new Trader(client);
+    trader.scanner.scan = async symbol => ({ symbol, signal: 'bullish', lastPrice: '100', tfSignals: {} });
+    CONFIG.auto_trade = false;
+    CONFIG.dry_run = true;
+    const result = await trader.scanAndOpen();
+    assert.equal(result.executed, false);
+    assert.equal(calls.length, 0);
+  });
+
+  it('reconciles an order after an ambiguous write failure', async () => {
+    let submitted;
+    const client = {
+      getAccount: async () => ({ available: '100' }),
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001' }],
+      placeOrder: async body => { submitted = body; throw Object.assign(new Error('timeout'), { executionUnknown: true }); },
+      getPendingOrders: async () => [{ clientId: submitted.clientId, orderId: 'o1', status: 'FILLED' }],
+      getHistoryOrders: async () => [],
+      getPendingPositions: async () => [],
+    };
+    const trader = new Trader(client);
+    Object.assign(CONFIG, { auto_trade: true, leverage: 10, margin_amount_pct: 2, cooldown_minutes: 5 });
+    const result = await trader.openPosition('BTCUSDT', 100, 'bullish', 2);
+    assert.equal(result.orderId, 'o1');
+  });
+
+  it('rechecks auto-trade immediately before order submission', async () => {
+    let resolveAccount;
+    let orders = 0;
+    const account = new Promise(resolve => { resolveAccount = resolve; });
+    const client = {
+      getPendingPositions: async () => [],
+      getAccount: async () => account,
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001' }],
+      placeOrder: async () => { orders++; return { orderId: 'o1' }; },
+    };
+    const trader = new Trader(client);
+    trader.scanner.scan = async symbol => ({ symbol, signal: 'bullish', lastPrice: '100', tfSignals: { [CONFIG.timeframes[0]]: { atr: 2 } } });
+    Object.assign(CONFIG, { auto_trade: true, signal_confirm_scans: 1, cooldown_minutes: 0, leverage: 10 });
+    const pending = trader.scanAndOpen();
+    await new Promise(resolve => setImmediate(resolve));
+    CONFIG.auto_trade = false;
+    resolveAccount({ available: '100' });
+    await assert.rejects(() => pending, /disabled before order/);
+    assert.equal(orders, 0);
+  });
+
+  it('rejects a minimum order when available balance is zero', async () => {
+    const client = { getAccount: async () => ({ available: '0' }) };
+    const trader = new Trader(client);
+    await assert.rejects(() => trader.computePositionSize(100), /positive/);
+  });
+
+  it('validates leverage against the band the pair advertises, not a local constant', async () => {
+    // A symbol whose own band is tighter than the documented example must be
+    // rejected at its real ceiling, and the message must name that band.
+    const client = {
+      getAccount: async () => ({ available: '100' }),
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001', minLeverage: 1, maxLeverage: 25 }],
+    };
+    const trader = new Trader(client);
+    Object.assign(CONFIG, { symbol: 'BTCUSDT', leverage: 50, order_unit: 'cost', position_sizing_margin_pct: 2 });
+    await assert.rejects(() => trader.computePositionSize(100, 'MARKET'), /1-25 for BTCUSDT/);
+
+    // Inside the advertised band the same leverage sizes normally, so the check
+    // is not simply refusing everything.
+    Object.assign(CONFIG, { leverage: 20 });
+    const sized = await trader.computePositionSize(100, 'MARKET');
+    assert.ok(sized.qty > 0, 'a leverage inside the pair band still sizes');
+
+    // Pair metadata that omits the band falls back to the documented 1-125
+    // rather than becoming unbounded.
+    const bare = new Trader({
+      getAccount: async () => ({ available: '100' }),
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001' }],
+    });
+    Object.assign(CONFIG, { leverage: 200 });
+    await assert.rejects(() => bare.computePositionSize(100, 'MARKET'), /1-125 for BTCUSDT/);
+  });
+
+  it('serializes concurrent scan cycles into one entry', async () => {
+    let orders = 0;
+    const client = {
+      getPendingPositions: async () => [],
+      getAccount: async () => ({ available: '100' }),
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001' }],
+      placeOrder: async () => { orders++; await new Promise(resolve => setTimeout(resolve, 10)); return { orderId: 'o1' }; },
+    };
+    const trader = new Trader(client);
+    trader.scanner.scan = async symbol => {
+      await new Promise(resolve => setTimeout(resolve, 5));
+      return { symbol, signal: 'bullish', lastPrice: '100', tfSignals: { [CONFIG.timeframes[0]]: { atr: 2 } } };
+    };
+    Object.assign(CONFIG, { auto_trade: true, signal_confirm_scans: 1, cooldown_minutes: 0, leverage: 10 });
+    const results = await Promise.all([trader.scanAndOpen(), trader.scanAndOpen()]);
+    // The guard is on order submission, not on the scan itself: both cycles may
+    // scan, but the in-flight lock must let exactly one order through.
+    assert.equal(orders, 1);
+    assert.equal(results.filter(result => result?.executed).length, 1);
+    assert.equal(results.find(result => !result?.executed).reason, 'entry_in_flight');
+  });
+
+  it('verifies exchange account settings before live trading', async () => {
+    const trader = new Trader({
+      getAccount: async () => ({ positionMode: 'HEDGE' }),
+      getLeverageAndMarginMode: async () => ({ leverage: CONFIG.leverage, marginMode: 'CROSS' }),
+      getPositionMode: async () => ({ positionMode: 'HEDGE' }),
+    });
+    await trader.verifyAccountSettings();
+    const mismatched = new Trader({
+      getAccount: async () => ({ positionMode: 'HEDGE' }),
+      getLeverageAndMarginMode: async () => ({ leverage: CONFIG.leverage + 1, marginMode: 'CROSS' }),
+      getPositionMode: async () => ({ positionMode: 'HEDGE' }),
+    });
+    await assert.rejects(() => mismatched.verifyAccountSettings(), /does not match/);
+  });
+
+  // Whatever CONFIG asks for is what the stubbed exchange reports back, so the
+  // only deliberate mismatch in these tests is the leverage.
+  const EXCHANGE_MODE = CONFIG.position_mode === 'hedge' ? 'HEDGE' : 'ONE_WAY';
+  // The reported failure: `/autotrade on` answered "Cannot enable: exchange
+  // leverage 10 does not match configured leverage 40" forever. syncAccountSettings
+  // called verifyAccountSettings() first, which throws on a mismatch, so the
+  // changeLeverage/changeMarginMode/changePositionMode calls below it were
+  // unreachable — the repair path could never run.
+  it('repairs a leverage mismatch when asked to apply', async () => {
+    const calls = [];
+    // Deliberately not CONFIG.leverage: the point is that the exchange disagrees.
+    let exchangeLeverage = CONFIG.leverage + 1;
+    const client = {
+      getPendingPositions: async () => [],
+      getPendingOrders: async () => [],
+      getAccount: async () => ({ positionMode: EXCHANGE_MODE }),
+      getLeverageAndMarginMode: async () => ({ leverage: exchangeLeverage, marginMode: CONFIG.position_type === 'isolated' ? 'ISOLATION' : 'CROSS' }),
+      getPositionMode: async () => ({ positionMode: EXCHANGE_MODE }),
+      changeLeverage: async (symbol, leverage) => {
+        calls.push(['leverage', symbol, leverage]);
+        exchangeLeverage = leverage;
+      },
+      changeMarginMode: async () => { calls.push(['margin_mode']); },
+      changePositionMode: async () => { calls.push(['position_mode']); },
+    };
+    const trader = new Trader(client);
+    const result = await trader.syncAccountSettings({ apply: true });
+    assert.deepEqual(calls.map(c => c[0]), ['leverage']);
+    assert.equal(calls[0][2], CONFIG.leverage, 'the exchange must be moved to the configured leverage');
+    assert.equal(result.applied, true);
+    assert.deepEqual(result.mismatches, [], 'and the settings must verify afterwards');
+  });
+
+  it('still refuses when only verifying', async () => {
+    const trader = new Trader({
+      getPendingPositions: async () => [],
+      getPendingOrders: async () => [],
+      getAccount: async () => ({ positionMode: EXCHANGE_MODE }),
+      getLeverageAndMarginMode: async () => ({ leverage: CONFIG.leverage + 1, marginMode: CONFIG.position_type === 'isolated' ? 'ISOLATION' : 'CROSS' }),
+      getPositionMode: async () => ({ positionMode: EXCHANGE_MODE }),
+      changeLeverage: async () => { throw new Error('must not be called'); },
+    });
+    // apply:false changes nothing, so a mismatch stays fatal.
+    await assert.rejects(() => trader.syncAccountSettings({ apply: false }), /does not match/);
+  });
+
+  it('does not repair a mismatch while exposure is open', async () => {
+    let changed = 0;
+    const trader = new Trader({
+      getPendingPositions: async () => [fakePosition()],
+      getPendingOrders: async () => [],
+      getAccount: async () => ({ positionMode: EXCHANGE_MODE }),
+      getLeverageAndMarginMode: async () => ({ leverage: CONFIG.leverage + 1, marginMode: CONFIG.position_type === 'isolated' ? 'ISOLATION' : 'CROSS' }),
+      getPositionMode: async () => ({ positionMode: EXCHANGE_MODE }),
+      changeLeverage: async () => { changed += 1; },
+    });
+    const result = await trader.syncAccountSettings({ apply: true });
+    assert.equal(result.skipped, 'open_exposure');
+    assert.equal(changed, 0, 'leverage cannot be changed under an open position');
+  });
+
+  it('does not apply account settings while exposure is open', async () => {
+    let changed = 0;
+    const client = {
+      getPendingPositions: async () => [fakePosition()],
+      getPendingOrders: async () => [],
+      getAccount: async () => ({ positionMode: 'HEDGE' }),
+      getLeverageAndMarginMode: async () => ({ leverage: CONFIG.leverage, marginMode: 'CROSS' }),
+      getPositionMode: async () => ({ positionMode: 'HEDGE' }),
+      changeLeverage: async () => { changed++; },
+    };
+    const trader = new Trader(client);
+    const result = await trader.syncAccountSettings({ apply: true });
+    assert.equal(result.skipped, 'open_exposure');
+    assert.equal(changed, 0);
+  });
+
+  it('places missing TP/SL protection after a fill', async () => {
+    const calls = [];
+    const client = {
+      getPendingTPSL: async () => [],
+      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      placeTPSL: async params => { calls.push(params); return { orderId: 'sl-1' }; },
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', getTraderSettings(CONFIG));
+    const result = await pm.ensureProtection(fakePosition({ slPrice: undefined, atr: 2 }));
+    assert.equal(result.placed, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].positionId, 'p1');
+  });
+
+  it('closes the exact position when the liquidation guard trips', async () => {
+    const calls = [];
+    const client = {
+      getPendingPositions: async () => [fakePosition()],
+      closePosition: async (...args) => { calls.push(args); return { ok: true, closed: 'p1' }; },
+    };
+    // sl_liquidation_safety 90 => a 0.5% mark-to-liq distance must trigger a close.
+    const pm = new PositionManager(client, 'BTCUSDT', { ...getTraderSettings(CONFIG), sl_liquidation_safety: 90, cooldown_minutes: 1 });
+    const result = await pm.checkLiquidationGuard(fakePosition({ markPrice: '100', liqPrice: '99.5' }));
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], 'BTCUSDT');
+    assert.equal(calls[0][1], 'p1');
+    // The guard now reports `closed: true` so midManage can tell it closed the
+    // position (and skip the trailing callback, which would otherwise close the
+    // same positionId again and draw Bitunix 30042 Client ID duplicate). The raw
+    // client result stays reachable under `result`.
+    assert.equal(result.closed, true);
+    assert.equal(result.trigger, 'liquidation_guard');
+    assert.equal(result.result.closed, 'p1');
+  });
+
+  it('leaves positions alone when the liquidation distance is safe', async () => {
+    let closes = 0;
+    const client = { getPendingPositions: async () => [fakePosition()], closePosition: async () => { closes++; } };
+    const pm = new PositionManager(client, 'BTCUSDT', { ...getTraderSettings(CONFIG), sl_liquidation_safety: 10 });
+    const result = await pm.checkLiquidationGuard(fakePosition({ markPrice: '100', liqPrice: '50' }));
+    assert.equal(result.skipped, 'liquidation distance safe');
+    assert.equal(closes, 0);
+  });
+
+  it('normalizes documented LONG positions for management', async () => {
+    const client = { getPendingPositions: async () => [{ symbol: 'BTCUSDT', positionId: 'p1', side: 'LONG', qty: '1', avgOpenPrice: '100', liqPrice: '50' }], getTickers: async () => [{ lastPrice: '101' }] };
+    const pm = new PositionManager(client, 'BTCUSDT', { ...getTraderSettings(CONFIG), symbol: 'BTCUSDT' });
+    const positions = await pm.fetchPositions();
+    assert.equal(positions[0].side, 'BUY');
+    assert.equal(positions[0].avgPrice, '100');
+    assert.equal(positions[0].markPrice, 101);
+  });
+
+  it('uses the configured symbol for position reads', async () => {
+    const requested = [];
+    const client = { getPendingPositions: async symbol => { requested.push(symbol); return []; } };
+    const settings = { ...getTraderSettings(CONFIG), symbol: 'ETHUSDT' };
+    const pm = new PositionManager(client, 'ETHUSDT', settings);
+    await pm.fetchPositions();
+    assert.deepEqual(requested, ['ETHUSDT']);
+  });
+});
+
+describe('tool safety', () => {
+  it('redacts configuration from the settings tool', async () => {
+    setTraderInstances(null, {});
+    CONFIG.BITUNIX_API_SECRET = 'secret-sentinel';
+    const tool = traderTools.find(item => item.name === 'trader_get_settings');
+    const result = await tool.handler();
+    assert.equal(JSON.stringify(result).includes('secret-sentinel'), false);
+  });
+
+  it('forwards a specific position ID and never closes all positions', async () => {
+    const calls = [];
+    setTraderInstances(null, { closePosition: async (...args) => { calls.push(args); return { ok: true }; } });
+    const tool = traderTools.find(item => item.name === 'trader_close_position');
+    await tool.handler({ symbol: 'BTCUSDT', positionId: 'p1' });
+    assert.deepEqual(calls, [['BTCUSDT', 'p1']]);
+  });
+
+  it('forwards a valid Bitunix change_leverage request', async () => {
+    const calls = [];
+    setBitunixClient({ changeLeverage: async (...args) => { calls.push(args); return { ok: true }; } });
+    const tool = bitunixTools.find(item => item.name === 'bitunix_change_leverage');
+    await tool.handler({ symbol: 'BTCUSDT', leverage: 5 });
+    assert.deepEqual(calls, [['BTCUSDT', 5]]);
+  });
+
+  it('rejects an out-of-range leverage before calling the exchange', async () => {
+    // Use the real client so changeLeverage's own band guard is exercised.
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ code: 0, data: { leverage: 5 } }) });
+    const client = new BitunixClient();
+    await assert.rejects(() => client.changeLeverage('BTCUSDT', 500), /1-125/);
+    // A caller holding the pair's advertised band gets that band instead of the
+    // fallback, so a symbol whose ceiling is lower is caught before the call.
+    await assert.rejects(() => client.changeLeverage('BTCUSDT', 50, { maxLeverage: 25 }), /1-25/);
+  });
+
+  it('validates tool arguments and serializes undefined results', () => {
+    assert.throws(() => validateToolArguments({ type: 'object', required: ['symbol'] }, {}), /missing required/);
+    assert.equal(stringifyToolResult(undefined), '{"ok":true}');
+  });
+
+});
+
+describe('every entry carries a take-profit and a stop-loss', () => {
+  // A real 25x trade was closed at -38% ROI with "TP: -" in the open
+  // notification: the position was opened through a tool that called
+  // placeOrder directly, so no exit existed until a human closed it. These
+  // tests lock down every remaining path that can send an OPEN order.
+  const pair = { symbol: 'BTCUSDT', basePrecision: 3, quotePrecision: 2, minTradeVolume: '0.001', maxMarketOrderVolume: '1000', maxLimitOrderVolume: '1000' };
+  const klines = Array.from({ length: 60 }, (_, index) => ({
+    high: String(101 + index), low: String(99 + index), close: String(100 + index), baseVol: '10',
+  }));
+
+  function manualClient(overrides = {}) {
+    const calls = { orders: [], tpsl: [], closed: [] };
+    const client = {
+      calls,
+      getAccount: async () => ({ available: '100' }),
+      getTradingPairs: async () => [pair],
+      getKlines: async () => klines,
+      // Deliberately returns several symbols: the price must be matched by
+      // symbol, not read off the first row.
+      getTickers: async () => [
+        { symbol: 'ETHUSDT', markPrice: '4000' },
+        { symbol: 'BTCUSDT', markPrice: '100', lastPrice: '101' },
+      ],
+      getPendingPositions: async () => [],
+      getPendingTPSL: async () => calls.tpsl,
+      placeTPSL: async (body) => { calls.tpsl.push({ ...body, positionId: 'p1' }); return { orderId: 't1' }; },
+      closePosition: async (...args) => { calls.closed.push(args); return {}; },
+      placeOrder: async (body) => { calls.orders.push(body); return { orderId: 'o1' }; },
+      ...overrides,
+    };
+    return client;
+  }
+
+  const withSettings = (values) => Object.assign(CONFIG, { auto_trade: false, leverage: 10, cooldown_minutes: 0, max_positions: 3, min_confidence: 50, tpsl_method: 'position', on_tpsl_failure: 'close' }, values);
+
+  it('rejects a naked open through the raw place_order tool', async () => {
+    const submitted = [];
+    setBitunixClient({ placeOrder: async (body) => { submitted.push(body); return { orderId: 'o1' }; } });
+    const tool = bitunixTools.find(item => item.name === 'bitunix_place_order');
+    // The exact shape that opened the unprotected position: no tradeSide at all.
+    await assert.rejects(
+      () => tool.handler({ symbol: 'BTCUSDT', side: 'SELL', qty: '5.77', orderType: 'MARKET' }),
+      /cannot open a position/,
+    );
+    await assert.rejects(
+      () => tool.handler({ symbol: 'BTCUSDT', side: 'SELL', qty: '5.77', tradeSide: 'OPEN' }),
+      /cannot open a position/,
+    );
+    assert.equal(submitted.length, 0);
+  });
+
+  it('still allows reduce-only closes through the raw place_order tool', async () => {
+    const submitted = [];
+    setBitunixClient({ placeOrder: async (body) => { submitted.push(body); return { orderId: 'o1' }; } });
+    const tool = bitunixTools.find(item => item.name === 'bitunix_place_order');
+    await tool.handler({ symbol: 'BTCUSDT', side: 'BUY', qty: '1', tradeSide: 'CLOSE', positionId: 'p1' });
+    assert.equal(submitted[0].tradeSide, 'CLOSE');
+    assert.equal(submitted[0].reduceOnly, true);
+    await assert.rejects(
+      () => tool.handler({ symbol: 'BTCUSDT', side: 'BUY', qty: '1', tradeSide: 'CLOSE', reduceOnly: false }),
+      /reduceOnly/,
+    );
+  });
+
+  it('attaches both levels to a manual market entry and prices it from its own symbol', async () => {
+    withSettings({ symbol: 'BTCUSDT' });
+    const client = manualClient();
+    const trader = new Trader(client);
+    const result = await trader.openManualPosition({ symbol: 'BTCUSDT', side: 'SELL', qty: '1' });
+    const body = client.calls.orders[0];
+    assert.equal(body.tradeSide, 'OPEN');
+    assert.equal(body.orderType, 'MARKET');
+    // 100 is BTCUSDT's mark price; 4000 is the ETHUSDT row that comes first.
+    // ATR 2, target 2.4x below entry and stop 1.325x above it for a short.
+    assert.equal(body.tpPrice, '95.2');
+    assert.equal(body.slPrice, '102.65');
+    assert.equal(body.tpStopType, 'MARK_PRICE');
+    assert.equal(body.slStopType, 'MARK_PRICE');
+    assert.ok(Number(body.tpPrice) < 100, 'a short take-profit must sit below entry');
+    assert.ok(Number(body.slPrice) > 100, 'a short stop must sit above entry');
+    assert.equal(result.tpPrice, body.tpPrice);
+    assert.equal(result.slPrice, body.slPrice);
+  });
+
+  it('routes the agent tool through the protected path', async () => {
+    withSettings({ symbol: 'BTCUSDT' });
+    const client = manualClient();
+    setTraderInstances(new Trader(client), client);
+    const tool = traderTools.find(item => item.name === 'trader_open_position');
+    const result = await tool.handler({ symbol: 'btcusdt', side: 'SELL', qty: '1' });
+    const body = client.calls.orders[0];
+    assert.ok(body.tpPrice && body.slPrice);
+    assert.equal(result.tpPrice, body.tpPrice);
+    setTraderInstances(null, null);
+  });
+
+  it('refuses to open when no stop distance can be computed', async () => {
+    withSettings({ symbol: 'BTCUSDT' });
+    const client = manualClient({ getKlines: async () => [] });
+    const trader = new Trader(client);
+    await assert.rejects(
+      () => trader.openManualPosition({ symbol: 'BTCUSDT', side: 'BUY', qty: '1' }),
+      /klines/,
+    );
+    assert.equal(client.calls.orders.length, 0);
+  });
+
+  it('refuses a manual entry on a symbol the risk engine does not track', async () => {
+    withSettings({ symbol: 'BTCUSDT' });
+    const client = manualClient();
+    const trader = new Trader(client);
+    await assert.rejects(
+      () => trader.openManualPosition({ symbol: 'ETHUSDT', side: 'BUY', qty: '1' }),
+      /configured symbol/,
+    );
+    assert.equal(client.calls.orders.length, 0);
+  });
+
+  it('closes the position when protection cannot be armed (on_tpsl_failure: close)', async () => {
+    withSettings({ symbol: 'BTCUSDT', on_tpsl_failure: 'close' });
+    const open = { positionId: 'p1', symbol: 'BTCUSDT', side: 'SELL', qty: '1', avgOpenPrice: '100', markPrice: '100' };
+    // The entry needs ATR to build its levels; the post-fill verification pass
+    // then hits a dead kline feed and cannot arm anything.
+    let klineCalls = 0;
+    const client = manualClient({
+      getPendingPositions: async () => [open],
+      getPendingTPSL: async () => [],
+      getKlines: async () => {
+        klineCalls++;
+        if (klineCalls > 1) throw new Error('kline feed down');
+        return klines;
+      },
+    });
+    const trader = new Trader(client);
+    const result = await trader.openManualPosition({ symbol: 'BTCUSDT', side: 'SELL', qty: '1' });
+    assert.equal(client.calls.orders.length, 1);
+    assert.equal(result.protection[0].closed, true);
+    assert.equal(client.calls.closed.length, 1);
+  });
+
+  it('renders the entry from avgOpenPrice in the open notification', async () => {
+    // Bitunix pending positions expose the entry as avgOpenPrice; reading only
+    // avgPrice printed "Entry: -" for a position that was fully known.
+    const text = openMessage({ positionId: 'p1', symbol: 'BTCUSDT', side: 'SHORT', qty: '5.77', avgOpenPrice: '2.2437', leverage: 25 });
+    assert.match(text, /POSITION OPENED/);
+    assert.match(text, /2\.2437/);
+    assert.doesNotMatch(text, /Entry: <code>-<\/code>/);
+  });
+
+});
+
+describe('provider and websocket safety', () => {
+  // Every AUTO test writes data/model-cache.json. Point it at a throwaway
+  // directory so one run can never seed the next one (a remembered model from
+  // a previous run would skip the probe the test is asserting on).
+  const withCleanCache = (run) => {
+    const dir = mkdtempSync(join(tmpdir(), 'model-cache-'));
+    const cwd = process.cwd();
+    process.chdir(dir);
+    return Promise.resolve()
+      .then(run)
+      .finally(() => {
+        process.chdir(cwd);
+        rmSync(dir, { recursive: true, force: true });
+      });
+  };
+
+  it('auto-selects a discovered model without a hardcoded fallback', async () => {
+    await withCleanCache(async () => {
+    Object.assign(CONFIG, { AI_PROVIDER: 'openai', AI_BASE_URL: 'https://auto-provider.test/v1', AI_API_KEY: 'test-key', AI_MODEL: 'AUTO' });
+    const requests = [];
+    globalThis.fetch = async (url, options) => {
+      requests.push({ url, body: options.body ? JSON.parse(options.body) : null });
+      if (url.endsWith('/models')) return { ok: true, json: async () => ({ data: [{ id: 'standard' }] }) };
+      return { ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) };
+    };
+    const result = await chat([{ role: 'user', content: 'hello' }], 'openai');
+    assert.equal(result.text, 'ok');
+    assert.equal(requests[1].body.model, 'standard');
+    });
+  });
+
+  it('treats a 429 as rate limiting rather than "model unavailable"', async () => {
+    await withCleanCache(async () => {
+
+      Object.assign(CONFIG, { AI_PROVIDER: 'openai', AI_BASE_URL: 'https://throttled.test/v1', AI_API_KEY: 'test-key', AI_MODEL: 'AUTO' });
+      const probed = [];
+      globalThis.fetch = async (url, options) => {
+        if (url.endsWith('/models')) return { ok: true, json: async () => ({ data: [{ id: 'good' }, { id: 'bad' }] }) };
+        probed.push(JSON.parse(options.body).model);
+        // Only "good" is throttled; the loop must move past it to "bad" instead
+        // of concluding that the key has no working model.
+        if (JSON.parse(options.body).model === 'good') {
+          return { ok: false, status: 429, text: async () => 'rate limited' };
+        }
+        return { ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) };
+      };
+      const res = await chat([{ role: 'user', content: 'hello' }], 'openai');
+      assert.equal(res.text, 'ok');
+      assert.ok(probed.includes('good') && probed.includes('bad'), 'a 429 on one model must not end the search');    });
+  });
+
+  it('retries a probe that only objects to max_tokens', async () => {
+    await withCleanCache(async () => {
+
+      Object.assign(CONFIG, { AI_PROVIDER: 'openai', AI_BASE_URL: 'https://reasoning.test/v1', AI_API_KEY: 'test-key', AI_MODEL: 'AUTO' });
+      const bodies = [];
+      globalThis.fetch = async (url, options) => {
+        if (url.endsWith('/models')) return { ok: true, json: async () => ({ data: [{ id: 'reasoner' }] }) };
+        const body = JSON.parse(options.body);
+        bodies.push(body);
+        if ('max_tokens' in body && !('max_completion_tokens' in body)) {
+          return { ok: false, status: 400, text: async () => 'unsupported_value: max_tokens is not supported, use max_completion_tokens' };
+        }
+        return { ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) };
+      };
+      const res = await chat([{ role: 'user', content: 'hello' }], 'openai');
+      assert.equal(res.text, 'ok');
+      assert.ok(bodies.length >= 2, 'the probe must be retried with max_completion_tokens');    });
+  });
+
+  it('falls back to AI_MODEL_FALLBACKS when the endpoint hides /models', async () => {
+    await withCleanCache(async () => {
+
+      Object.assign(CONFIG, {
+        AI_PROVIDER: 'openai', AI_BASE_URL: 'https://nolist.test/v1', AI_API_KEY: 'test-key',
+        AI_MODEL: 'AUTO', AI_MODEL_FALLBACKS: 'my-working-model',
+      });
+      let probed = null;
+      globalThis.fetch = async (url, options) => {
+        if (url.endsWith('/models')) return { ok: false, status: 404, text: async () => 'not found' };
+        probed = JSON.parse(options.body).model;
+        return { ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) };
+      };
+      const res = await chat([{ role: 'user', content: 'hello' }], 'openai');
+      assert.equal(res.text, 'ok');
+      assert.equal(probed, 'my-working-model');    });
+  });
+
+  it('explains what it tried when no model works', async () => {
+    await withCleanCache(async () => {
+
+      Object.assign(CONFIG, { AI_PROVIDER: 'openai', AI_BASE_URL: 'https://dead.test/v1', AI_API_KEY: 'test-key', AI_MODEL: 'AUTO', AI_MODEL_FALLBACKS: '' });
+      globalThis.fetch = async (url) => {
+        if (url.endsWith('/models')) return { ok: true, json: async () => ({ data: [{ id: 'a' }, { id: 'b' }] }) };
+        return { ok: false, status: 400, text: async () => 'model not found' };
+      };
+      await assert.rejects(
+        () => chat([{ role: 'user', content: 'hello' }], 'openai'),
+        /AUTO could not find a working model/,
+      );    });
+  });
+
+  it('reuses a previously working model instead of rediscovering it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'model-cache-'));
+    const cwd = process.cwd();
+    let probes = 0;
+    try {
+      process.chdir(dir);
+      // A remembered model is probed first, so exactly one probe is needed.
+      writeFileSync(join(dir, 'model-cache.json'), JSON.stringify({ 'https://memo.test/v1': 'remembered-model' }));
+      Object.assign(CONFIG, {
+        AI_PROVIDER: 'openai', AI_BASE_URL: 'https://memo.test/v1', AI_API_KEY: 'test-key',
+        AI_MODEL: 'AUTO', AI_MODEL_FALLBACKS: '',
+      });
+      globalThis.fetch = async (url, options) => {
+        if (url.endsWith('/models')) return { ok: true, json: async () => ({ data: [{ id: 'remembered-model' }, { id: 'other' }] }) };
+        probes += 1;
+        return { ok: true, json: async () => ({ choices: [{ message: { content: 'ok' } }] }) };
+      };
+      const res = await chat([{ role: 'user', content: 'hello' }], 'openai');
+      assert.equal(res.text, 'ok');
+      // One probe plus the real request; the probe must be the remembered model.
+      assert.equal(probes, 2, 'the remembered model must be tried before the rest of the list');
+      // And the winner is written back so the next process starts here too.
+      const saved = JSON.parse(readFileSync(join(dir, 'model-cache.json'), 'utf8'));
+      assert.equal(saved['https://memo.test/v1'], 'remembered-model');
+    } finally {
+      process.chdir(cwd);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('lists models from an OpenAI-compatible endpoint', async () => {
+    Object.assign(CONFIG, { AI_BASE_URL: 'https://example.test/v1', AI_API_KEY: 'test-key' });
+    globalThis.fetch = async url => {
+      assert.equal(url, 'https://example.test/v1/models');
+      return { ok: true, json: async () => ({ data: [{ id: 'model-a' }, { id: 'model-b' }] }) };
+    };
+    assert.deepEqual(await listOpenAiModels(), ['model-a', 'model-b']);
+    assert.equal(resolveOpenAiModelsUrl('https://example.test/v1'), 'https://example.test/v1/models');
+  });
+
+  it('normalizes OpenAI-compatible base URLs', () => {
+    assert.equal(resolveOpenAiUrl('https://api.openai.com/v1'), 'https://api.openai.com/v1/chat/completions');
+    assert.equal(resolveOpenAiUrl('https://openrouter.ai/api/v1/'), 'https://openrouter.ai/api/v1/chat/completions');
+    assert.equal(resolveOpenAiUrl('https://example.test/custom/chat/completions'), 'https://example.test/custom/chat/completions');
+  });
+
+  it('sanitizes history into a provider-safe tool sequence', () => {
+    const history = [
+      { role: 'user', content: 'set tf' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'set_tf', arguments: { tf: '5m' } } }] },
+      { role: 'tool', tool_call_id: 'c1', name: 'set_tf', content: { ok: true } },
+      { role: 'assistant', content: 'done' },
+    ];
+    const clean = sanitizeHistory(history, 20);
+    assert.equal(clean.length, 4);
+    assert.equal(clean[1].tool_calls[0].function.arguments, '{"tf":"5m"}');
+    assert.deepEqual(Object.keys(clean[2]).sort(), ['content', 'role', 'tool_call_id']);
+    assert.equal(clean[2].content, '{"ok":true}');
+    // A window that cuts the assistant call away must drop the orphaned result,
+    // otherwise the provider answers 400 and the session stays poisoned.
+    const cut = sanitizeHistory(history, 2);
+    assert.ok(!cut.some(message => message.role === 'tool'));
+    assert.ok(!sanitizeHistory([{ role: 'assistant', content: null }], 5).length);
+    assert.ok(!sanitizeHistory([{ role: 'assistant', content: '', tool_calls: [{ id: 'x', function: { name: 'f' } }] }], 5).length);
+  });
+
+  it('omits temperature for reasoning endpoints and sends it elsewhere', () => {
+    assert.equal(shouldSendTemperature('ag/gemini-3.8-flash-high', ''), undefined);
+    assert.equal(shouldSendTemperature('kc/deepseek/deepseek-reasoner', ''), undefined);
+    assert.equal(shouldSendTemperature('kc/openai/o3', ''), undefined);
+    assert.equal(shouldSendTemperature('ag/gemini-3-flash', ''), 0.7);
+    assert.equal(shouldSendTemperature('ag/gemini-3-flash', '0.2'), 0.2);
+  });
+
+  it('rolls a failed turn back so the next message starts clean', async () => {
+    Object.assign(CONFIG, { AI_PROVIDER: 'auto', AI_API_KEY: 'test-key', AI_BASE_URL: 'https://example.test/v1', AI_MODEL: 'fixed-model', ANTHROPIC_API_KEY: '', GEMINI_API_KEY: '' });
+    const agent = createAgent({ system: 'rules', tools: [], history: [{ role: 'user', content: 'earlier' }, { role: 'assistant', content: 'noted' }] });
+    globalThis.fetch = async () => ({ ok: false, status: 400, text: async () => 'invalid_request_error' });
+    const failed = await say(agent, 'set timeframes');
+    assert.equal(failed.error, true);
+    assert.match(failed.content, /LLM error/);
+    assert.equal(agent.history.length, 2);
+    assert.equal(agent.history[1].content, 'noted');
+    assert.equal(resetAgent(agent), 2);
+    assert.equal(agent.history.length, 0);
+  });
+
+  it('auto-selects an available provider', () => {
+    Object.assign(CONFIG, { AI_PROVIDER: 'auto', AI_API_KEY: '', ANTHROPIC_API_KEY: 'anthropic-key', GEMINI_API_KEY: '' });
+    assert.equal(detectProviders(), 'anthropic');
+  });
+
+  it('sends system and tool definitions to Anthropic and Gemini', async () => {
+    const bodies = [];
+    globalThis.fetch = async (_url, options) => {
+      bodies.push(JSON.parse(options.body));
+      return { ok: true, json: async () => ({ content: [{ type: 'text', text: 'ok' }] }) };
+    };
+    Object.assign(CONFIG, { ANTHROPIC_API_KEY: 'anthropic-key', GEMINI_API_KEY: 'gemini-key' });
+    const tools = [{ name: 'probe', description: 'probe', parameters: { type: 'object', properties: {} } }];
+    await chat([{ role: 'system', content: 'rules' }, { role: 'user', content: 'hello' }], 'anthropic', tools);
+    await chat([{ role: 'system', content: 'rules' }, { role: 'user', content: 'hello' }], 'google', tools);
+    assert.equal(bodies[0].system, 'rules');
+    assert.equal(bodies[0].tools[0].name, 'probe');
+    assert.equal(bodies[1].systemInstruction.parts[0].text, 'rules');
+    assert.equal(bodies[1].tools[0].functionDeclarations[0].name, 'probe');
+  });
+
+  it('executes Anthropic tool calls through the shared loop', async () => {
+    let calls = 0;
+    let round = 0;
+    Object.assign(CONFIG, { AI_PROVIDER: 'anthropic', AI_API_KEY: '', ANTHROPIC_API_KEY: 'anthropic-key', GEMINI_API_KEY: '' });
+    globalThis.fetch = async () => {
+      round += 1;
+      return { ok: true, json: async () => round === 1 ? { content: [{ type: 'tool_use', id: 'call-1', name: 'probe', input: { value: 1 } }] } : { content: [{ type: 'text', text: 'done' }] } };
+    };
+    const agent = createAgent({
+      system: 'rules',
+      tools: [{ name: 'probe', parameters: { type: 'object', properties: { value: { type: 'number' } }, required: ['value'] }, handler: async () => { calls += 1; return { ok: true }; } }],
+      maxRounds: 3,
+    });
+    const result = await agent.say('run probe');
+    assert.equal(calls, 1);
+    assert.equal(result.content, 'done');
+  });
+
+  it('does not reconnect a socket after close', () => {
+    const sockets = [];
+    class FakeSocket {
+      constructor(url) { this.url = url; this.handlers = {}; sockets.push(this); }
+      on(event, handler) { this.handlers[event] = handler; }
+      send() {}
+      close() { this.handlers.close?.(); }
+    }
+    const ws = new BitunixWs({}, FakeSocket);
+    const socket = ws.connectPublic();
+    ws.close();
+    socket.handlers.close?.();
+    assert.equal(sockets.length, 1);
+  });
+});
+
+describe('telegram formatting', () => {
+  it('keeps long HTML messages within safe chunks', () => {
+    const chunks = splitHtml(`<b>${'x'.repeat(9000)}</b>`);
+    assert.ok(chunks.length > 1);
+    for (const chunk of chunks) {
+      assert.ok(chunk.length <= 3500);
+      assert.equal((chunk.match(/<b>/g) || []).length, (chunk.match(/<\/b>/g) || []).length);
+    }
+  });
+
+describe('bitunix websocket channel contracts', () => {
+  it('maps documented channel names and common aliases', () => {
+    assert.deepEqual(normalizePublicChannel({ ch: 'tickers', symbol: 'BTCUSDT' }), { symbol: 'BTCUSDT', ch: 'tickers' });
+    assert.deepEqual(normalizePublicChannel('price'), { ch: 'price' });
+    assert.deepEqual(normalizePublicChannel('depth'), { ch: 'depth_books' });
+    assert.deepEqual(normalizePublicChannel('market_price'), { ch: 'price' });
+    assert.deepEqual(normalizePublicChannel('depth_book1'), { ch: 'depth_book1' });
+  });
+
+  it('translates kline intervals to the websocket naming scheme', () => {
+    assert.deepEqual(normalizePublicChannel({ ch: 'kline', interval: '15m', symbol: 'BTCUSDT' }), { symbol: 'BTCUSDT', ch: 'market_kline_15min' });
+    assert.deepEqual(normalizePublicChannel('mark_kline_1h'), { ch: 'mark_kline_60min' });
+    assert.deepEqual(normalizePublicChannel('market_kline_1d'), { ch: 'market_kline_1day' });
+    assert.deepEqual(normalizePublicChannel('market_kline_1M'), { ch: 'market_kline_1month' });
+    assert.equal(normalizePublicChannel({ ch: 'kline', interval: '1week' }).ch, 'market_kline_1week');
+    assert.ok(KLINE_INTERVALS.includes('1min') && KLINE_INTERVALS.includes('1month'));
+  });
+
+  it('rejects channels the server would silently ignore', () => {
+    for (const bad of ['', 'depths', 'klines', 'ticker_1s']) {
+      assert.throws(() => normalizePublicChannel(bad), /public WS channel/);
+    }
+    assert.throws(() => normalizePublicChannel({ ch: 'kline', symbol: 'BTCUSDT' }), /interval/);
+    assert.throws(() => normalizePublicChannel({ ch: 'kline', interval: '7m' }), /interval/);
+    assert.throws(() => normalizePublicChannel('market_kline_3s'), /interval/);
+  });
+
+  it('normalizes private channels, including the tp_sl alias', () => {
+    assert.equal(normalizePrivateChannel('tp_sl'), 'tpsl');
+    assert.equal(normalizePrivateChannel({ ch: 'TPSL' }), 'tpsl');
+    for (const channel of PRIVATE_CHANNELS) assert.equal(normalizePrivateChannel(channel), channel);
+    assert.throws(() => normalizePrivateChannel('positions'), /unknown private WS channel/);
+  });
+});
+
+
+describe('bitunix websocket frames', () => {
+  let sockets = [];
+  class FakeSocket {
+    static OPEN = 1;
+    constructor(url) { this.url = url; this.readyState = FakeSocket.OPEN; this.handlers = {}; this.sent = []; sockets.push(this); }
+    on(event, handler) { this.handlers[event] = handler; }
+    send(payload) { this.sent.push(JSON.parse(payload)); }
+    close() { this.readyState = 3; this.handlers.close?.(); }
+    open() { this.handlers.open?.(); }
+    message(payload) { this.handlers.message?.(Buffer.from(JSON.stringify(payload))); }
+  }
+
+  beforeEach(() => { sockets = []; });
+
+  it('sends normalized subscribe args and forwards only channel data', () => {
+    const received = [];
+    const ws = new BitunixWs({ onPublic: message => received.push(message) }, FakeSocket);
+    const socket = ws.connectPublic(['tickers', { ch: 'depth', symbol: 'BTCUSDT' }]);
+    socket.open();
+    assert.deepEqual(socket.sent[0], { op: 'subscribe', args: [{ ch: 'tickers' }, { symbol: 'BTCUSDT', ch: 'depth_books' }] });
+    socket.message({ op: 'connect', data: { result: true } });
+    socket.message({ op: 'ping', pong: 1, ping: 2 });
+    socket.message({ ch: 'tickers', symbol: 'BTCUSDT', data: [{ s: 'BTCUSDT' }] });
+    assert.equal(received.length, 1);
+    assert.equal(received[0].ch, 'tickers');
+    ws.close();
+  });
+
+  it('logs in with an integer seconds timestamp and a matching signature', () => {
+    Object.assign(CONFIG, { BITUNIX_API_KEY: 'test-key', BITUNIX_API_SECRET: 'test-secret' });
+    const ws = new BitunixWs({}, FakeSocket);
+    const socket = ws.connectPrivate(['balance', 'tp_sl']);
+    socket.open();
+    const [login, subscribe] = socket.sent;
+    assert.equal(login.op, 'login');
+    const arg = login.args[0];
+    assert.equal(typeof arg.timestamp, 'number');
+    assert.ok(Math.abs(arg.timestamp - Math.floor(Date.now() / 1000)) <= 2);
+    assert.equal(arg.apiKey, 'test-key');
+    assert.match(arg.nonce, /^[0-9a-f]{32}$/);
+    assert.match(arg.sign, /^[0-9a-f]{64}$/);
+    const digest = crypto.createHash('sha256').update(`${arg.nonce}${arg.timestamp}${arg.apiKey}`).digest('hex');
+    assert.equal(arg.sign, crypto.createHash('sha256').update(digest + 'test-secret').digest('hex'));
+    // The docs sign ONLY nonce+timestamp+apiKey; the REST-style sorted key/value
+    // blob must not creep back in or every private login is rejected.
+    const restStyle = `apiKey${arg.apiKey}nonce${arg.nonce}timestamp${arg.timestamp}`;
+    const restDigest = crypto.createHash('sha256').update(`${arg.nonce}${arg.timestamp}${arg.apiKey}${restStyle}`).digest('hex');
+    assert.notEqual(arg.sign, crypto.createHash('sha256').update(restDigest + 'test-secret').digest('hex'));
+    assert.deepEqual(subscribe, { op: 'subscribe', args: [{ ch: 'balance' }, { ch: 'tpsl' }] });
+    ws.close();
+  });
+
+  it('refuses to open a socket for an unknown channel', () => {
+    const ws = new BitunixWs({}, FakeSocket);
+    assert.throws(() => ws.connectPublic(['depth_book7']), /unknown public WS channel/);
+    assert.throws(() => ws.connectPrivate(['tp_sl_v2']), /unknown private WS channel/);
+    assert.equal(sockets.length, 0);
+  });
+
+  it('requires an unsubscribe before switching kline intervals', () => {
+    const ws = new BitunixWs({}, FakeSocket);
+    const socket = ws.connectPublic([{ ch: 'kline', interval: '1m', symbol: 'BTCUSDT' }]);
+    socket.open();
+    assert.deepEqual(socket.sent[0].args[0], { symbol: 'BTCUSDT', ch: 'market_kline_1min' });
+    ws.unsubscribePublic([{ ch: 'kline', interval: '5m', symbol: 'BTCUSDT' }]);
+    ws.subscribePublic([{ ch: 'kline', interval: '5m', symbol: 'BTCUSDT' }]);
+    assert.deepEqual(socket.sent.at(-2), { op: 'unsubscribe', args: [{ symbol: 'BTCUSDT', ch: 'market_kline_5min' }] });
+    assert.deepEqual(socket.sent.at(-1), { op: 'subscribe', args: [{ symbol: 'BTCUSDT', ch: 'market_kline_5min' }] });
+    ws.close();
+  });
+
+  it('keeps the connection alive with a ping frame and stops it on close', () => {
+    mock.timers.enable({ apis: ['setInterval'] });
+    try {
+      const ws = new BitunixWs({}, FakeSocket);
+      const socket = ws.connectPublic(['tickers']);
+      socket.open();
+      mock.timers.tick(15000);
+      const ping = socket.sent.at(-1);
+      assert.equal(ping.op, 'ping');
+      assert.equal(typeof ping.ping, 'number');
+      assert.ok(Math.abs(ping.ping - Math.floor(Date.now() / 1000)) <= 2);
+      mock.timers.tick(15000);
+      assert.equal(socket.sent.length, 3);
+      ws.close();
+      mock.timers.tick(60000);
+      assert.equal(socket.sent.length, 3);
+    } finally {
+      mock.timers.reset();
+    }
+  });
+
+  it('surfaces socket errors without reconnecting after close', () => {
+    const errors = [];
+    const ws = new BitunixWs({ onError: error => errors.push(error.message) }, FakeSocket);
+    const socket = ws.connectPublic(['tickers']);
+    socket.handlers.error(new Error('boom'));
+    assert.deepEqual(errors, ['boom']);
+    ws.close();
+    assert.equal(ws.publicWs, null);
+    assert.equal(ws.publicPingTimer, null);
+  });
+});
+
+describe('telegram settings persistence and autotrade', () => {
+  const replies = [];
+  const realFetch = globalThis.fetch;
+  let savedToken;
+  let savedOwner;
+
+  beforeEach(() => {
+    replies.length = 0;
+    savedToken = CONFIG.TELEGRAM_BOT_TOKEN;
+    savedOwner = CONFIG.ALLOWED_USER_ID;
+    CONFIG.TELEGRAM_BOT_TOKEN = 'test-token';
+    CONFIG.ALLOWED_USER_ID = '42';
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('sendMessage')) {
+        replies.push(JSON.parse(init.body).text);
+        return { ok: true, status: 200, json: async () => ({ ok: true }) };
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    };
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    CONFIG.TELEGRAM_BOT_TOKEN = savedToken;
+    CONFIG.ALLOWED_USER_ID = savedOwner;
+  });
+
+  const ownerMsg = { chat: { id: 42 }, from: { id: 42 } };
+
+  it('persists the store after /set, /leverage and /symbol', async () => {
+    const saves = [];
+    const { handleCommand } = createTraderCommands({
+      client: { getPendingPositions: async () => [], changeLeverage: async () => ({}) },
+      scanner: {}, trader: {}, agent: {},
+      persistSettings: async () => { saves.push({ ...CONFIG }); },
+    });
+
+    await handleCommand(ownerMsg, '/set min_confidence 65');
+    await handleCommand(ownerMsg, '/leverage 12');
+    await handleCommand(ownerMsg, '/symbol ETHUSDT');
+
+    // Every mutating command must write through, otherwise the change is lost
+    // on the next deploy.
+    assert.equal(saves.length, 3, 'each settings change must persist once');
+    assert.equal(saves[0].min_confidence, 65);
+    assert.equal(saves[1].leverage, 12);
+    assert.equal(saves[2].symbol, 'ETHUSDT');
+  });
+
+  it('refuses to enable auto-trade when the exchange does not match config', async () => {
+    const savedAuto = CONFIG.auto_trade;
+    CONFIG.auto_trade = false;
+    try {
+      const { handleCommand } = createTraderCommands({
+        client: {},
+        scanner: {},
+        trader: {
+          syncAccountSettings: async () => { throw new Error('exchange leverage 20 does not match configured leverage 10'); },
+        },
+        agent: {},
+        persistSettings: async () => {},
+      });
+
+      await handleCommand(ownerMsg, '/autotrade on');
+      // It must not report success, and must not grant trading authority.
+      assert.equal(CONFIG.auto_trade, false, 'auto_trade must stay off when verification fails');
+      assert.match(replies.join('\n'), /Cannot enable/);
+    } finally {
+      CONFIG.auto_trade = savedAuto;
+    }
+  });
+
+  it('enables auto-trade and turns scanning on once the exchange matches', async () => {
+    const savedAuto = CONFIG.auto_trade;
+    CONFIG.auto_trade = false;
+    let synced = null;
+    try {
+      const { handleCommand, scanState } = createTraderCommands({
+        client: {},
+        scanner: {},
+        trader: { syncAccountSettings: async (opts) => { synced = opts; return { applied: true }; } },
+        agent: {},
+        persistSettings: async () => {},
+      });
+
+      await handleCommand(ownerMsg, '/autotrade on');
+      assert.equal(CONFIG.auto_trade, true);
+      assert.equal(scanState.scanOn, true);
+      assert.deepEqual(synced, { apply: true }, 'must sync the exchange before granting authority');
+      assert.match(replies.join('\n'), /AUTO_TRADE=<code>on<\/code>/);
+    } finally {
+      CONFIG.auto_trade = savedAuto;
+    }
+  });
+
+  it('persists /stop so a restart cannot bring auto-trade back', async () => {
+    const savedAuto = CONFIG.auto_trade;
+    CONFIG.auto_trade = true;
+    let persisted = 0;
+    try {
+      const { handleCommand, scanState } = createTraderCommands({
+        client: {}, scanner: {}, trader: {}, agent: {},
+        persistSettings: async () => { persisted += 1; },
+      });
+      await handleCommand(ownerMsg, '/stop');
+      assert.equal(CONFIG.auto_trade, false);
+      assert.equal(scanState.scanOn, false);
+      assert.equal(persisted, 1, '/stop must persist the stop');
+    } finally {
+      CONFIG.auto_trade = savedAuto;
+    }
+  });
+});
+
+describe('store ssl contract', () => {
+  it('does not override the sslmode from the connection string', () => {
+    // Regression: persist.js hardcoded ssl:{rejectUnauthorized:true}, which made
+    // pg ignore sslmode in DATABASE_URL and fail against any provider with its
+    // own CA (Neon) using DEPTH_ZERO_SELF_SIGNED_CERT. That silently downgraded
+    // the store to the local file, which is why settings reset on every deploy.
+    const source = readFileSync(new URL('../src/store/persist.js', import.meta.url), 'utf8');
+    const poolBlock = source.slice(source.indexOf('new Pool('), source.indexOf('new Pool(') + 220);
+    assert.ok(poolBlock.includes('connectionString: CONFIG.DATABASE_URL'), 'pool must use the connection string');
+    assert.equal(/ssl\s*:\s*\{/.test(poolBlock), false, 'pool must not hardcode an ssl object');
+  });
+
+  it('resolves a Neon-style connection string to no forced ssl override', () => {
+    // The real pg behaviour: passing ssl explicitly is what broke it.
+    const withSsl = new Pool({ connectionString: 'postgres://u:p@ep-x.neon.tech/db?sslmode=require', ssl: { rejectUnauthorized: true } });
+    const withoutSsl = new Pool({ connectionString: 'postgres://u:p@ep-x.neon.tech/db?sslmode=require' });
+    assert.deepEqual(withoutSsl.options.ssl, undefined, 'sslmode alone must let pg decide');
+    assert.deepEqual(withSsl.options.ssl, { rejectUnauthorized: true }, 'explicit ssl overrides the connection string');
+    withSsl.end().catch(() => {});
+    withoutSsl.end().catch(() => {});
+  });
+});
+
+});
+
+// ---------------------------------------------------------------------------
+// Position lifecycle notifications.
+//
+// The bot used to report signals only: an entry filling, a stop hitting or the
+// liquidation guard closing a position produced no message at all. The notifier
+// diffs the exchange's position list, so it catches every exit regardless of
+// which code path caused it.
+// ---------------------------------------------------------------------------
+describe('position lifecycle notifications', () => {
+  function harness(initial = []) {
+    let positions = initial;
+    const sent = [];
+    const client = {
+      getPendingPositions: async () => positions,
+      getHistoryPositions: async () => [{
+        positionId: 'p1', symbol: 'BTCUSDT', side: 'LONG', qty: '1',
+        entryPrice: '100', closePrice: '110', realizedPNL: '10', leverage: 10,
+      }],
+      getPendingTPSL: async () => [{ positionId: 'p1', tpPrice: '120', slPrice: '95' }],
+    };
+    const notifier = new PositionNotifier({
+      client,
+      settings: { ...CONFIG, notify_open: true, notify_close: true, notify_tpsl: false },
+      send: async (chatId, text) => { sent.push({ chatId, text }); },
+      chatId: '42',
+    });
+    return {
+      notifier,
+      sent,
+      set(next) { positions = next; },
+    };
+  }
+
+  const open = { positionId: 'p1', symbol: 'BTCUSDT', side: 'LONG', qty: '1', avgPrice: '100', leverage: 10 };
+
+  it('stays silent on the first pass so pre-existing positions are not announced', async () => {
+    const h = harness([open]);
+    await h.notifier.sync();
+    assert.equal(h.sent.length, 0);
+  });
+
+  it('announces a position that appears after the baseline', async () => {
+    const h = harness([]);
+    await h.notifier.sync();
+    h.set([open]);
+    const events = await h.notifier.sync();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'opened');
+    assert.match(h.sent[0].text, /POSITION OPENED/);
+    assert.match(h.sent[0].text, /LONG/);
+    // The armed TP/SL is read from the pending list, not the position payload.
+    assert.match(h.sent[0].text, /120/);
+    assert.match(h.sent[0].text, /95/);
+  });
+
+  it('announces a close with the realized PnL and ROI', async () => {
+    const h = harness([open]);
+    await h.notifier.sync();
+    h.set([]);
+    const events = await h.notifier.sync();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'closed');
+    assert.match(h.sent[0].text, /POSITION CLOSED/);
+    assert.match(h.sent[0].text, /\$10\.00/);
+    // +10% price move at 10x leverage is +100% ROI.
+    assert.match(h.sent[0].text, /\+100\.00%/);
+  });
+
+  it('labels the close with a reason recorded by the caller', async () => {
+    const h = harness([open]);
+    await h.notifier.sync();
+    h.notifier.noteClose('p1', 'liquidation_guard');
+    h.set([]);
+    const events = await h.notifier.sync();
+    assert.equal(events[0].reason, 'liquidation_guard');
+    assert.match(h.sent[0].text, /Liquidation guard/);
+  });
+
+  it('honours notify_open and notify_close', async () => {
+    const h = harness([]);
+    h.notifier.settings.notify_open = false;
+    await h.notifier.sync();
+    h.set([open]);
+    await h.notifier.sync();
+    assert.equal(h.sent.length, 0);
+
+    h.notifier.settings.notify_close = false;
+    h.notifier.noteClose('p1', 'manual');
+    h.set([]);
+    await h.notifier.sync();
+    assert.equal(h.sent.length, 0);
+  });
+
+  it('never lets a send failure break the loop', async () => {
+    const h = harness([open]);
+    h.notifier.send = async () => { throw new Error('telegram down'); };
+    await h.notifier.sync();
+    h.set([]);
+    await assert.doesNotReject(() => h.notifier.sync());
+  });
+
+  it('does not re-announce a position it is already tracking', async () => {
+    const h = harness([]);
+    await h.notifier.sync();
+    h.set([open]);
+    await h.notifier.sync();
+    await h.notifier.sync();
+    assert.equal(h.sent.length, 1);
+  });
+
+  it('normalizes both side casings Bitunix uses', () => {
+    assert.equal(normalizeSide('LONG'), 'BUY');
+    assert.equal(normalizeSide('SHORT'), 'SELL');
+    assert.equal(sideLabel('BUY'), 'LONG');
+    assert.equal(sideLabel('SELL'), 'SHORT');
+  });
+
+  it('mirrors ROI for shorts', () => {
+    const long = positionRoiPct({ entryPrice: 100, closePrice: 110, side: 'BUY', leverage: 10 });
+    const short = positionRoiPct({ entryPrice: 100, closePrice: 110, side: 'SELL', leverage: 10 });
+    assert.equal(long, 100);
+    assert.equal(short, -100);
+  });
+
+  // The reported close shipped "Exit: -" with no realized PnL and no ROI. The
+  // close is announced the moment the position leaves the pending list, but
+  // get_history_positions is written asynchronously by the exchange, so the
+  // first lookup raced it and returned nothing — and the message was sent once
+  // and never revised.
+  it('retries the history lookup before reporting a close without an exit price', async () => {
+    let calls = 0;
+    const sent = [];
+    let positions = [{ positionId: 'p1', symbol: 'BTCUSDT', side: 'LONG', qty: '1', avgPrice: '100', leverage: 10 }];
+    const notifier = new PositionNotifier({
+      client: {
+        getPendingPositions: async () => positions,
+        // Empty for the first two polls, exactly like an exchange whose history
+        // has not caught up yet.
+        getHistoryPositions: async () => {
+          calls += 1;
+          return calls < 3 ? [] : [{ positionId: 'p1', symbol: 'BTCUSDT', side: 'LONG', qty: '1', entryPrice: '100', closePrice: '110', realizedPNL: '10', leverage: 10 }];
+        },
+        getPendingTPSL: async () => [],
+      },
+      settings: { ...CONFIG, notify_open: true, notify_close: true, notify_tpsl: false },
+      send: async (chatId, text) => { sent.push(text); },
+      chatId: '42',
+    });
+    await notifier.sync();          // baseline
+    positions = [];                 // the position closed
+    await notifier.sync();
+    assert.equal(calls, 3, 'the lookup must be retried, not fired once');
+    assert.match(sent.at(-1), /Exit: <code>110<\/code>/, 'the exit price must not be lost');
+    assert.match(sent.at(-1), /Realized PnL/);
+  });
+
+  it('gives up cleanly when the close never appears in history', async () => {
+    const sent = [];
+    let positions = [{ positionId: 'p1', symbol: 'BTCUSDT', side: 'LONG', qty: '1', avgPrice: '100', leverage: 10 }];
+    const notifier = new PositionNotifier({
+      client: {
+        getPendingPositions: async () => positions,
+        getHistoryPositions: async () => { throw new Error('history unavailable'); },
+        getPendingTPSL: async () => [],
+      },
+      settings: { ...CONFIG, notify_open: true, notify_close: true, notify_tpsl: false },
+      send: async (chatId, text) => { sent.push(text); },
+      chatId: '42',
+    });
+    await notifier.sync();
+    positions = [];
+    await notifier.sync();
+    assert.match(sent.at(-1), /Entry: <code>100<\/code>/, 'the known facts are still reported');
+    assert.doesNotMatch(sent.at(-1), /Realized PnL/, 'and nothing is invented');
+  });
+
+  it('reports the exit price and PnL without them when the history is missing', () => {
+    const withData = closeMessage({
+      position: { positionId: 'p1', symbol: 'BTCUSDT', side: 'BUY', entryPrice: '100', closePrice: '101', qty: '1', leverage: 10, realizedPNL: '1' },
+      reason: 'take_profit',
+    });
+    assert.match(withData, /Take-profit/);
+    assert.match(withData, /101/);
+    const bare = closeMessage({ position: { positionId: 'p2', side: 'BUY', entryPrice: '100' }, reason: 'unknown' });
+    assert.match(bare, /Closed on the exchange/);
+  });
+
+  it('labels the reason the PositionManager records on each close path', async () => {
+    const reasons = [];
+    const client = {
+      getPendingPositions: async () => [fakePosition({ markPrice: '100', liqPrice: '99.5' })],
+      closePosition: async () => ({}),
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', {
+      ...getTraderSettings(CONFIG), sl_liquidation_safety: 90, tpsl_method: 'position',
+    });
+    pm.notifier = { noteClose: (_id, reason) => reasons.push(reason) };
+    await pm.checkLiquidationGuard(fakePosition({ markPrice: '100', liqPrice: '99.5' }));
+    assert.deepEqual(reasons, ['liquidation_guard']);
+  });
+
+  it('reports the account guard close against every open position', async () => {
+    const reasons = [];
+    const client = {
+      getPendingPositions: async () => [],
+      closeAllPosition: async () => ({}),
+    };
+    const pm = new PositionManager(client, 'BTCUSDT', {
+      ...getTraderSettings(CONFIG),
+      tpsl_method: 'account', account_tp_roi_pct: 5, account_sl_roi_pct: 0,
+    });
+    pm.notifier = { noteClose: (_id, reason) => reasons.push(reason) };
+    pm.state.positions = [{ positionId: 'p1', side: 'BUY', qty: '1', avgPrice: '100', markPrice: '110', unrealizedPNL: '50', margin: '100' }];
+    const result = await pm.checkAccountGuard();
+    assert.equal(result.triggered, 'tp');
+    assert.deepEqual(reasons, ['account_tp']);
+  });
+});

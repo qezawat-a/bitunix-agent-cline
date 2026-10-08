@@ -1,0 +1,25 @@
+{
+  "name": "j-rock",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "AI Agent futures trader (Bitunix USDT-M) — Telegram chat + autonomous agent",
+  "main": "src/main.js",
+  "bin": {
+    "jrock": "./bin/j-rock.js"
+  },
+  "scripts": {
+    "start": "node src/main.js",
+    "agent": "node src/agent/tui.js",
+    "harness": "node src/harness.js",
+    "db:check": "node scripts/db-check.js",
+    "check": "node scripts/check.js",
+    "demo": "node scripts/api-demo.js",
+    "test": "node --test --test-concurrency=1 tests/*.test.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4",
+    "pg": "^8.12",
+    "ws": "^8.16"
+  },
+  "devDependencies": {}
+}
