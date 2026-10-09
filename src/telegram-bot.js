@@ -191,6 +191,14 @@ export function formatSignalReport(res) {
   if ((res.agreeingStrategies || 0) < CONFIG.min_agreeing_strategies) {
     reasons.push(`${esc(String(res.agreeingStrategies))} strategies, min_agreeing_strategies is ${esc(String(CONFIG.min_agreeing_strategies))}`);
   }
+  // The regime gates say why a scan that LOOKS strong was not traded. Printed
+  // explicitly rather than left to inference: every other gate is reported, and
+  // a gate that holds without naming itself is indistinguishable from a broken
+  // scanner. This is the range filter doing its job, and it should read as a
+  // deliberate skip, not a failure.
+  for (const reason of res.blockedBy || []) {
+    reasons.push(esc(reason));
+  }
   // The gate text is what the operator reads when nothing trades, so it has to
   // agree with the direction printed above it. Deriving the verdict the same way
   // the scanner derives it means the two cannot drift apart again.
@@ -203,7 +211,14 @@ export function formatSignalReport(res) {
   return `<b>SIGNAL ${esc(res.symbol)}</b>\nDirection: <b>${esc(res.signal)}</b>`
     + ` | raw <b>${esc(String(res.rawDirection))}</b> <b>${esc(String(res.rawConfidence))}</b>%`
     + ` | tf ${esc(String(res.eligibleTimeframes))}/${esc(String(Object.keys(res.tfSignals || {}).length))}`
-    + ` | strategies <b>${esc(String(res.agreeingStrategies))}</b>\nPrice: <code>${esc(String(res.lastPrice ?? '-'))}</code>\n${tfRows}${gate}`;
+    + ` | strategies <b>${esc(String(res.agreeingStrategies))}</b>`
+    + (res.trendEfficiency === null || res.trendEfficiency === undefined
+      ? ''
+      : `\nEfficiency: <code>${esc(String(res.trendEfficiency))}%</code> of distance travelled was net progress (min ${esc(String(res.minEfficiency ?? 0))}%)`)
+    + (res.trendAdx === null || res.trendAdx === undefined
+      ? ''
+      : ` | ADX(14) <code>${esc(String(res.trendAdx))}</code> (min ${esc(String(res.minAdx ?? 0))})`)
+    + `\nPrice: <code>${esc(String(res.lastPrice ?? '-'))}</code>\n${tfRows}${gate}`;
 }
 
 export { esc };

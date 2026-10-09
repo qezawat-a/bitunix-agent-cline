@@ -86,6 +86,14 @@ export const CONFIG = {
   // direction is tradeable. Without it a single qualifying timeframe carried
   // the whole signal on its own.
   min_eligible_timeframes: Number(S('min_eligible_timeframes', 2)),
+  // Regime gates. min_efficiency is the one that matters: it is the share of the
+  // distance price travelled that was net progress rather than churn, so a
+  // bounded oscillation scores near zero. 0 disables the gate. min_adx = 0
+  // disables the ADX second opinion (25 is the conventional ADX(14) floor).
+  // min_score_margin is a mean-per-timeframe book score, 0 disables it.
+  min_efficiency: Number(S('min_efficiency', 20)),
+  min_adx: Number(S('min_adx', 25)),
+  min_score_margin: Number(S('min_score_margin', 12)),
   signal_confirm_scans: Number(S('signal_confirm_scans', 1)),
   cooldown_minutes: Number(S('cooldown_minutes', 5)),
   max_positions: Number(S('max_positions', 3)),
@@ -127,6 +135,7 @@ export const CONFIG = {
 const FILE_TRADER_KEYS = new Set([
   'symbol', 'leverage', 'position_type', 'timeframes', 'margin_amount_pct', 'margin_risk_pct',
   'min_confidence', 'tf_min_confidence', 'min_agreeing_strategies', 'min_eligible_timeframes', 'signal_confirm_scans',
+  'min_efficiency', 'min_adx', 'min_score_margin',
   'cooldown_minutes', 'max_positions', 'position_mode', 'scan_interval_sec', 'guard_interval_sec',
   'breakeven_threshold_pct', 'trailing_trigger_roi_pct', 'trailing_atr_multiple', 'trailing_atr_strength_reduction', 'sl_liquidation_safety', 'on_tpsl_failure', 'reversal_enabled', 'reversal_confidence',
   'report_interval_sec', 'mid_manage_interval_sec', 'order_unit', 'position_sizing_margin_pct',

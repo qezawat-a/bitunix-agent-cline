@@ -175,6 +175,37 @@ export function atr(highs, lows, closes, period = 14) {
   return recent.reduce((sum, value) => sum + value, 0) / period;
 }
 
+// Kaufman efficiency ratio, as a percentage: how much of the distance price
+// actually travelled was net progress, rather than churn.
+//
+// This exists because ADX turned out to be the wrong instrument for the job it
+// was put to. ADX scores directional MOVEMENT, not progress, so a slow bounded
+// oscillation rates as a strong trend: measured across bounded sawtooths, the
+// range read ADX 70.8 while a genuine trend read 52.1 — the range scored higher.
+// Each leg of a sawtooth is a directional run, and Wilder's smoothing keeps the
+// dominant side elevated for as long as the legs are long relative to the
+// smoothing window.
+//
+// The ratio has no such blind spot. A trend walks its net displacement in one
+// direction and scores high; a range covers the same ground repeatedly and
+// scores near zero. Measured on the same set: ranges topped out at 16.1% and
+// real trends bottomed out at 38.9%.
+//
+// The window is the whole series on purpose. A short window is the same
+// mistake again in miniature — one clean leg of a long-period sawtooth looks
+// maximally efficient, and a 30-bar read of a smooth 80-bar sawtooth measured
+// 83.3%. A trend that began only 20 bars ago still reads 28.9% over the full
+// window, which is the price of not being fooled by a single leg.
+export function efficiency(closes) {
+  if (!validSeries(closes) || closes.length < 3) return null;
+  const net = Math.abs(closes[closes.length - 1] - closes[0]);
+  let path = 0;
+  for (let index = 1; index < closes.length; index++) path += Math.abs(closes[index] - closes[index - 1]);
+  // A flat series has no path to divide by. It is not a trend, so report 0
+  // rather than a NaN that would poison the comparison upstream.
+  return path === 0 ? 0 : (net / path) * 100;
+}
+
 export function adx(highs, lows, closes, period = 14) {
   if (!validSeries(highs) || !validSeries(lows) || !validSeries(closes) || period < 1 || highs.length < period + 1 || highs.length !== lows.length || highs.length !== closes.length) return null;
   const trueRanges = [];
@@ -441,6 +472,17 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
     activeWeight,
     totalWeight,
     atr: atr(highs, lows, closes, 14),
+    // ADX measures trend STRENGTH and is direction-agnostic, so it cannot
+    // score as a strategy (agreement would be meaningless — it never says
+    // "bullish"). It is the regime gate instead: below ~25 the book is in a
+    // range, where every directional indicator here whipsaws together.
+    // adx() was already implemented but had no call site, so nothing ever
+    // asked whether a trend existed before trading one.
+    adx: adx(highs, lows, closes, 14),
+    // The regime gate that actually discriminates. See efficiency() above:
+    // ADX rates a slow sawtooth as a stronger trend than a real one, so it is
+    // reported but the scanner gates on this instead.
+    efficiency: efficiency(closes),
     last,
     rsi: rsiValue,
     momentum,

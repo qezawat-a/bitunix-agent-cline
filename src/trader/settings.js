@@ -9,6 +9,18 @@ export const DEFAULTS = {
   tf_min_confidence: 60,
   min_agreeing_strategies: 2,
   min_eligible_timeframes: 2,
+  // Regime gates. Every other gate measures how many strategies agreed; these
+  // ask whether there is a trend to ride and whether the vote was decisive
+  // enough to act on. 0 disables any of them.
+  //
+  // min_efficiency is the gate that actually discriminates. ADX alone does not:
+  // it scores directional MOVEMENT, so a slow bounded oscillation reads as a
+  // strong trend (measured: ranges up to ADX 70.8, real trends as low as 52.1).
+  // Efficiency — net progress over path travelled — separated the same set with
+  // ranges maxing at 16.1% and real trends bottoming out at 38.9%.
+  min_efficiency: 20,
+  min_adx: 25,
+  min_score_margin: 12,
   signal_confirm_scans: 1,
   cooldown_minutes: 5,
   max_positions: 3,
@@ -85,6 +97,9 @@ const INTEGER_KEYS = new Set([
   'min_agreeing_strategies',
   'min_eligible_timeframes',
   'signal_confirm_scans',
+  'min_efficiency',
+  'min_adx',
+  'min_score_margin',
   'cooldown_minutes',
   'max_positions',
 ]);
@@ -198,6 +213,12 @@ export function validateSettings(s) {
   addRangeError(errors, 'tf_min_confidence', s.tf_min_confidence, 0, 100);
   addRangeError(errors, 'min_agreeing_strategies', s.min_agreeing_strategies, 1, 100, true);
   addRangeError(errors, 'min_eligible_timeframes', s.min_eligible_timeframes, 1, 20, true);
+  // 0 disables the gate, so the lower bound is 0 rather than >0. The score
+  // margin is a mean per qualifying timeframe, so its ceiling is one
+  // timeframe's whole book weight — see the note on netScore in scanner.js.
+  addRangeError(errors, 'min_efficiency', s.min_efficiency, 0, 100);
+  addRangeError(errors, 'min_adx', s.min_adx, 0, 100);
+  addRangeError(errors, 'min_score_margin', s.min_score_margin, 0, 146);
   addRangeError(errors, 'signal_confirm_scans', s.signal_confirm_scans, 1, 100, true);
   addRangeError(errors, 'cooldown_minutes', s.cooldown_minutes, 0, 1440, true);
   addRangeError(errors, 'max_positions', s.max_positions, 1, 100, true);

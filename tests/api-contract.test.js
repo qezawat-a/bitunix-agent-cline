@@ -2415,6 +2415,198 @@ describe('one lone timeframe cannot carry the whole signal', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Regression: the bot bled a position down one stop at a time in a range.
+//
+// Symptom from the live account (OGNUSDT, ~$0.042):
+//     LONG  entry 0.04254 -> closed 0.04230   realizedPNL -0.0503
+//     LONG  entry 0.04252 -> closed 0.04249   realizedPNL -0.0152
+//     SHORT entry 0.04208 -> closed 0.04253   realizedPNL -0.2253
+//
+// A long while price fell, twice, then a short while price rose: the book was
+// flipping sides on a ranging market and each trade died at ~1.1x ATR. Every
+// gate in the scanner measured HOW MANY strategies agreed, and in a range the
+// correlated indicators (EMA, MACD, momentum, RSI, Supertrend, ATR breakout) all
+// derive from one close series, so they flipped together and agreed at 100%
+// while being wrong. Nothing asked whether a trend existed — ADX was
+// implemented in indicators.js with no call site.
+//
+// The fix is a regime gate, not a strategy: ADX stays out of the scored book
+// (it is directionless and could never contribute to agreement) and gates entry
+// instead, plus a margin gate so a barely-tilted score cannot open a position.
+// ---------------------------------------------------------------------------
+
+describe('the scanner refuses to trade a market that is going nowhere', () => {
+  // A bounded oscillation. Every directional indicator still fires — which is
+  // the point.
+  const sawtoothKlines = ({ period = 80, amp = 6, noise = 0, seed = 424242 } = {}) => {
+    let s = seed;
+    const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+    const gauss = () => Math.sqrt(-2 * Math.log(1 - rnd())) * Math.cos(2 * Math.PI * rnd());
+    const closes = [];
+    for (let i = 0; i < 200; i++) {
+      const phase = i % period;
+      const leg = phase < period / 2
+        ? amp * (phase / (period / 2))
+        : amp * (1 - (phase - period / 2) / (period / 2));
+      closes.push(100 + leg + gauss() * noise);
+    }
+    return closes.map((p, i) => {
+      const prev = i ? closes[i - 1] : p;
+      return {
+        open: String(prev), high: String(Math.max(p, prev) + 0.15),
+        low: String(Math.min(p, prev) - 0.15), close: String(p), baseVol: '1000',
+      };
+    });
+  };
+  const trendKlines = () => {
+    const out = [];
+    let q = 100;
+    for (let i = 0; i < 200; i++) {
+      q += 0.9;
+      const dip = i % 7 === 0 ? -0.8 : 0;
+      out.push({ open: String(q + 0.2), high: String(q + 0.5), low: String(q + dip), close: String(q + dip + 0.3), baseVol: '1000' });
+    }
+    return out;
+  };
+  const vols = () => Array.from({ length: 200 }, () => 1000);
+
+  const scanWith = async klines => {
+    const { CONFIG } = await import('../src/config.js');
+    const Scanner = (await import('../src/bitunix/scanner.js')).default;
+    const client = {
+      getKlines: async () => klines,
+      getFundingRate: async () => ({ fundingRate: '0' }),
+      getTickers: async () => ({ symbol: CONFIG.symbol, lastPrice: '100' }),
+    };
+    return new Scanner(client).scan(CONFIG.symbol);
+  };
+
+  it('publishes efficiency as net progress, not as a strategy direction', async () => {
+    const { computeSignal, STRATEGY_KEYS } = await import('../src/bitunix/indicators.js');
+    const ranged = computeSignal(sawtoothKlines(), vols(), 0);
+    const trended = computeSignal(trendKlines(), vols(), 0);
+    assert.ok(Number.isFinite(ranged.efficiency), 'efficiency is exposed on the scan result');
+    assert.ok(ranged.efficiency < 20, `a bounded oscillation must read low, got ${ranged.efficiency}`);
+    assert.ok(trended.efficiency >= 20, `a trend must read at or above 20, got ${trended.efficiency}`);
+    // The gate does not smuggle the measure back into the scored book: neither
+    // ADX nor efficiency has a direction, so letting either score would add
+    // weight to what is actually a neutral vote.
+    assert.ok(!STRATEGY_KEYS.includes('adx'), 'ADX does not score as a strategy');
+    assert.ok(!STRATEGY_KEYS.includes('efficiency'), 'efficiency does not score as a strategy');
+    assert.ok(!('efficiency' in ranged.strategyDirections), 'and it is not a scored direction');
+  });
+
+  it('blocks a bounded oscillation that ADX rates as a strong trend', async () => {
+    // The regression this gate exists for. ADX scores directional MOVEMENT, so a
+    // slow oscillation reads as a trend — measured across shapes, ranges reached
+    // ADX 70.8 while genuine trends bottomed out at 52.1, i.e. the range scored
+    // HIGHER than the trend. A min_adx gate alone therefore let ranges straight
+    // through, which is how a position was ground down one stop at a time.
+    const { computeSignal } = await import('../src/bitunix/indicators.js');
+    const ranged = computeSignal(sawtoothKlines(), vols(), 0);
+    const result = await scanWith(sawtoothKlines());
+    assert.ok(ranged.adx > 25, `this shape must defeat an ADX gate, got ADX ${ranged.adx}`);
+    assert.equal(result.signal, 'hold', 'and must still be refused');
+    assert.equal(result.efficiencyOk, false, 'the efficiency gate is what held it');
+    assert.ok(result.blockedBy.some(r => r.includes('efficiency') && r.includes('min_efficiency')),
+      `the hold must name the gate, got ${JSON.stringify(result.blockedBy)}`);
+    assert.equal(typeof result.trendEfficiency, 'number', 'the reading is still reported');
+    assert.equal(typeof result.trendAdx, 'number', 'and so is ADX, for the operator');
+  });
+
+  it('still produces a confident directional reading of a range — the gates are what stop it', async () => {
+    // Guards against a false fix. If the range merely stopped producing signals,
+    // the gate would be untested; the loss happened because a range DID read as
+    // confident and tradeable, so that is the behaviour the gate must intercept.
+    const { computeSignal } = await import('../src/bitunix/indicators.js');
+    const ranged = computeSignal(sawtoothKlines(), vols(), 0);
+    assert.notEqual(ranged.direction, 'neutral', 'the range still reads a direction');
+    assert.ok(ranged.confidence > 0, 'and still reads a confidence — confidence alone never caught this');
+  });
+
+  it('lets a genuine trend through the same gates', async () => {
+    const result = await scanWith(trendKlines());
+    assert.equal(result.efficiencyOk, true, 'a trending market clears the efficiency gate');
+    assert.equal(result.adxOk, true, 'and the ADX second opinion');
+    assert.equal(result.signal, 'bullish', 'and the trend is still actually tradeable');
+  });
+
+  it('treats 0 as "gate off" and refuses to guess at an unreadable threshold', async () => {
+    const { CONFIG } = await import('../src/config.js');
+    const { DEFAULTS, validateSettings } = await import('../src/trader/settings.js');
+    assert.equal(Number(DEFAULTS.min_efficiency), 20, 'the gate is on by default');
+    assert.ok(!validateSettings({ ...DEFAULTS, min_efficiency: 0 }).some(e => e.includes('min_efficiency')),
+      '0 is a valid way to disable the gate');
+    assert.ok(validateSettings({ ...DEFAULTS, min_efficiency: 140 }).some(e => e.includes('min_efficiency')),
+      'but an impossible efficiency threshold is still rejected');
+    assert.ok(validateSettings({ ...DEFAULTS, min_efficiency: -1 }).some(e => e.includes('min_efficiency')));
+
+    // Fail CLOSED. `Number(x) || 0` is the obvious implementation and it fails
+    // open twice: an unreadable value AND an absent one both become 0, which is
+    // the documented "gate off" value — so a typo in the environment silently
+    // removes the control. Each of these must refuse to trade and say so.
+    for (const bad of ['abc', null, undefined, '', '  ']) {
+      const original = CONFIG.min_efficiency;
+      CONFIG.min_efficiency = bad;
+      try {
+        const result = await scanWith(trendKlines());
+        assert.equal(result.signal, 'hold', `min_efficiency=${JSON.stringify(bad)} must not trade`);
+        assert.equal(result.efficiencyOk, false);
+        assert.ok(result.blockedBy.some(r => r.includes('min_efficiency')),
+          `min_efficiency=${JSON.stringify(bad)} must name itself, got ${JSON.stringify(result.blockedBy)}`);
+      } finally {
+        CONFIG.min_efficiency = original;
+      }
+    }
+    // A real numeric zero still disables the gate — the distinction is "0 means
+    // off", not "anything falsy means off".
+    CONFIG.min_efficiency = 0;
+    try {
+      const result = await scanWith(trendKlines());
+      assert.equal(result.efficiencyOk, true, 'an explicit 0 turns the gate off');
+    } finally {
+      CONFIG.min_efficiency = 20;
+    }
+  });
+
+  it('measures the score margin per timeframe so it cannot weaken as timeframes pile up', async () => {
+    // netScore is a SUM over qualifying timeframes, so a sum-based threshold
+    // gets weaker every time another timeframe qualifies: at the default of 12
+    // with five timeframes each only had to lean 2.4 points out of a 146-point
+    // book and the gate blocked nothing at all. Averaging holds the threshold
+    // constant in book points, and makes the 0-146 validation range mean exactly
+    // what it says.
+    const perTimeframe = (net, eligible, min = 12) => (eligible ? Math.abs(net) / eligible : 0) >= min;
+    assert.equal(perTimeframe(60, 5), true, 'five timeframes leaning 12 each clears 12');
+    assert.equal(perTimeframe(59, 5), false, 'five timeframes leaning 11.8 each does not');
+    assert.equal(perTimeframe(3, 1), false, 'a single barely-tilted book is noise, not a vote');
+    assert.equal(perTimeframe(-3, 1), false, 'and neither is -3');
+    assert.equal(perTimeframe(3, 1, 0), true, 'min_score_margin 0 disables the gate');
+
+    const { DEFAULTS, validateSettings } = await import('../src/trader/settings.js');
+    assert.ok(!validateSettings({ ...DEFAULTS, min_score_margin: 146 }).some(e => e.includes('min_score_margin')),
+      '146 is one timeframe\'s whole book weight, so it is a legal maximum');
+    assert.ok(validateSettings({ ...DEFAULTS, min_score_margin: 147 }).some(e => e.includes('min_score_margin')));
+  });
+
+  it('prints the gate reason in the /signal hold text', async () => {
+    const { formatSignalReport } = await import('../src/telegram-bot.js');
+    const report = formatSignalReport({
+      symbol: 'OGNUSDT', signal: 'hold', rawDirection: 'bearish', rawConfidence: 95,
+      confidence: 0, agreeingStrategies: 8, timeframesAgree: true,
+      alignedTimeframes: 4, eligibleTimeframes: 5, lastPrice: '0.0423',
+      tfSignals: { '15m': { direction: 'bearish', sideAgreement: 100, confidence: 95, alignedWeight: 100, activeWeight: 100, strategyDirections: {} } },
+      trendEfficiency: 8.4, minEfficiency: 20, trendAdx: 31.3, minAdx: 25,
+      blockedBy: ['efficiency 8.4% below min_efficiency 20% (price is going nowhere)'],
+    });
+    assert.ok(report.includes('HOLD because'), 'a gated scan reads as a hold');
+    assert.ok(report.includes('efficiency 8.4% below min_efficiency 20%'), `the reason must be visible, got: ${report}`);
+    assert.ok(report.includes('<code>8.4%</code>'), 'and the reading itself is shown');
+    assert.ok(report.includes('ADX(14) <code>31.3</code>'), 'alongside the ADX second opinion');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Regression: break-even re-fired on a position it had already fixed.
 //
 // Symptom reported from the running bot: the same line repeating once per manage
