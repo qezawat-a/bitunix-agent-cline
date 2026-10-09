@@ -212,11 +212,20 @@ class Scanner {
       && adxOk
       && marginOk;
 
-    // Previously: klinesMap[timeframes[0]]?.at(-1)?.close — stale by up to
-    // one full bar of whichever timeframe happened to be listed first, which
-    // is the "price tolerance" drift between what the bot thinks the price
-    // is and the live market. Fall back to the kline close only if the
-    // ticker call itself fails, so scanning doesn't hard-stop on a blip.
+    // The ticker call is the live source of truth: a kline's `close` is a
+    // snapshot as of when that candle formed, stale by up to a full interval of
+    // whichever timeframe happens to be listed first. Fall back to the kline
+    // close only if the ticker call itself fails, so scanning doesn't
+    // hard-stop on a blip.
+    //
+    // `.at(-1)` is the newest bar and that is now what it actually means.
+    // getKlines returns CHRONOLOGICAL bars (the exchange sends newest-first;
+    // client.js normalises), so the most recent candle is the LAST element.
+    // While the series was still inverted this same expression silently read
+    // the OLDEST bar in the window — up to 199 bars stale rather than one,
+    // which is what the "price tolerance" drift actually was. Fixing the
+    // ordering in client.js is therefore also what makes this line correct;
+    // changing it to `[0]` would re-break it.
     let lastPrice;
     try {
       lastPrice = await this.getLastPrice(symbol);

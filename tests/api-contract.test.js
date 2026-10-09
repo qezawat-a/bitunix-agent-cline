@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { BitunixClient, canonicalQuery } from '../src/bitunix/client.js';
+import { BitunixClient, canonicalQuery, toChronological } from '../src/bitunix/client.js';
 import { convert, normalizeUnit, positionSizeFromUnit, roundPrice, roundQty } from '../src/bitunix/order-units.js';
 import { assertOrderMatchesPair as traderReject, parseWsTime } from '../src/trader/trader.js';
 import {
@@ -37,6 +37,7 @@ import {
   STRATEGIES,
   STRATEGY_KEYS,
   TOTAL_STRATEGY_WEIGHT,
+  atr as calculateAtr,
   computeSignal,
   describeStrategies,
 } from '../src/bitunix/indicators.js';
@@ -91,6 +92,59 @@ function defaultData(pathname) {
   if (pathname === '/api/v1/futures/account') return { marginCoin: 'USDT', available: '100' };
   return [];
 }
+
+// ---------------------------------------------------------------------------
+// kline fixtures
+//
+// Bitunix returns GET /api/v1/futures/market/kline NEWEST-FIRST (verified live
+// against the exchange), and client.js normalises that to chronological order
+// before anything consumes it.
+//
+// Every kline fixture in this file is therefore built in WIRE ORDER — newest
+// first, index 0 the most recent bar. That is the whole point: the fixtures
+// used to be built ascending while production was descending, which is exactly
+// why the suite read 299/299 green while every indicator was walking the real
+// series backwards in time. A fixture that does not resemble the wire cannot
+// catch a wire-shaped bug.
+//
+// `newestFirst()` is the adapter: fixtures are still GENERATED chronologically
+// (so the walk and each bar's own open/high/low stay coherent — reversing the
+// generator's index instead would decouple `open` from the bar before it), and
+// the finished array is emitted the way the exchange emits it.
+// ---------------------------------------------------------------------------
+
+// 2026-10-09T16:20:00Z, and a 15m step: arbitrary but real-looking, so the
+// defensive timestamp sort has something to compare. `time` is a STRING on the
+// wire, which is why the client coerces with Number() before sorting.
+const KLINE_EPOCH = 1791514800000;
+const KLINE_STEP = 900000;
+
+const newestFirst = bars => bars.reverse();
+
+// The bar timestamps for a series built ascending from index 0: bar i is
+// KLINE_STEP * (n - 1 - i) old once the array has been flipped newest-first.
+const barTime = (i, n) => String(KLINE_EPOCH - (n - 1 - i) * KLINE_STEP);
+
+// Everything downstream of the wire — computeSignal, the scanner, ATR sizing —
+// consumes CHRONOLOGICAL bars, because that is what BitunixClient.getKlines
+// hands back. Route every wire-order fixture through here so these tests walk
+// the same path production does: newest-first wire -> getKlines -> indicators.
+// Reading `toChronological` into a stub named `getKlines` is deliberate: the
+// stub stands in for the client, so it must return what the client returns.
+const asClientReturns = toChronological;
+
+// A plain rising 60-bar series in WIRE order, with the real field names and the
+// string `time` the exchange actually sends. For tests that need "some
+// plausible bars" — ATR sizing, protection repair — rather than a specific
+// market shape.
+const atrKlines = (n = 60) => Array.from({ length: n }, (_, i) => {
+  const price = 100 + (n - 1 - i);
+  return {
+    time: barTime(i, n),
+    high: String(price + 1), low: String(price - 1), close: String(price),
+    baseVol: '1000',
+  };
+});
 
 // ---------------------------------------------------------------------------
 // constants transcribed from the SDK sources
@@ -1176,7 +1230,7 @@ describe('a position is closed at most once per manage cycle', () => {
       // breakeven/trailing both move the stop; without this they throw and abort
       // the tick before the liquidation guard is ever reached.
       modifyTPSL: async () => ({ orderId: 'sl-1' }),
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getKlines: async () => asClientReturns(atrKlines()),
       getTickers: async () => [{ markPrice: '110' }],
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
     };
@@ -1200,7 +1254,7 @@ describe('a position is closed at most once per manage cycle', () => {
       getPendingTPSL: async () => [],
       placeTPSL: async () => ({ orderId: 'sl-1' }),
       modifyTPSL: async () => ({ orderId: 'sl-1' }),
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getKlines: async () => asClientReturns(atrKlines()),
       getTickers: async () => [{ markPrice: '110' }],
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
     };
@@ -1223,7 +1277,7 @@ describe('a position is closed at most once per manage cycle', () => {
       getPendingTPSL: async () => [],
       placeTPSL: async () => ({ orderId: 'sl-1' }),
       modifyTPSL: async () => ({ orderId: 'sl-1' }),
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getKlines: async () => asClientReturns(atrKlines()),
       getTickers: async () => [{ markPrice: '110' }],
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
     };
@@ -1333,7 +1387,7 @@ describe('the maintenance-margin guard exits a position before the exchange forc
       getPendingTPSL: async () => [],
       placeTPSL: async () => ({ orderId: 'sl-1' }),
       modifyTPSL: async () => ({ orderId: 'sl-1' }),
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getKlines: async () => asClientReturns(atrKlines()),
       getTickers: async () => [{ markPrice: '110' }],
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
       getPositionTiers: async () => [
@@ -1355,7 +1409,7 @@ describe('the maintenance-margin guard exits a position before the exchange forc
       getPendingTPSL: async () => [],
       placeTPSL: async () => ({ orderId: 'sl-1' }),
       modifyTPSL: async () => ({ orderId: 'sl-1' }),
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getKlines: async () => asClientReturns(atrKlines()),
       getTickers: async () => [{ markPrice: '110' }],
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
       // A failing tiers call must not be read as "safe", but it also must not
@@ -1427,7 +1481,7 @@ describe('moving the stop never deletes the take-profit', () => {
       getPendingTPSL: async () => [{ ...pendingWithTP[0], slPrice: '95' }],
       modifyTPSL: async (params) => { modifies.push(params); return { orderId: 'tp-1' }; },
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getKlines: async () => asClientReturns(atrKlines()),
     };
     const pm = new PositionManager(reflecting(client), 'BTCUSDT', settings());
     await pm.checkTrailing({ ...live, atr: 2 });
@@ -1689,27 +1743,36 @@ describe('signal confidence separates agreement from breadth', async () => {
   // 200 candles of a clean, strong uptrend: enough strategies agree that a real
   // trend read scores high, which is the point — the number has to separate
   // "most of the book agrees" from "two indicators happened to agree".
-  const uptrend = (n = 200) => Array.from({ length: n }, (_, i) => {
+  const uptrend = (n = 200) => newestFirst(Array.from({ length: n }, (_, i) => {
     const base = 100 + i * 0.5;
     return {
+      time: barTime(i, n),
       close: String(base), open: String(base - 0.2),
       high: String(base + 0.6), low: String(base - 0.6),
       baseVol: String(1000 + i),
     };
-  });
+  }));
 
   // The mirror image of uptrend(): the same shape walked downwards, so the
   // strategies that fire are the bearish ones.
-  const downtrend = (n = 200) => Array.from({ length: n }, (_, i) => {
+  const downtrend = (n = 200) => newestFirst(Array.from({ length: n }, (_, i) => {
     const base = 200 - i * 0.5;
     return {
+      time: barTime(i, n),
       close: String(base), open: String(base + 0.2),
       high: String(base + 0.6), low: String(base - 0.6),
       baseVol: String(1000 + i),
     };
-  });
+  }));
 
-  const scores = (klines) => computeSignal(klines, klines.map(k => Number(k.baseVol)), 0);
+  // `wireBars` arrives newest-first; computeSignal receives what the client
+  // hands it, so the normalisation happens here rather than in the builder.
+  // The volumes are mapped from the SAME normalised array, so price and volume
+  // stay aligned index-for-index exactly as scanner.js:69 does in production.
+  const scores = (wireBars) => {
+    const klines = asClientReturns(wireBars);
+    return computeSignal(klines, klines.map(k => Number(k.baseVol)), 0);
+  };
 
   // Force an exact split so the "not one-sided" assertion is about the maths
   // rather than about whichever strategies a synthetic candle happens to fire.
@@ -1823,9 +1886,7 @@ describe('a position with a stop but no take-profit still gets its take-profit',
       getPendingTPSL: async () => [{ id: 'tp-1', positionId: 'p1', slPrice: '95', slStopType: 'MARK_PRICE' }],
       modifyTPSL: async (params) => { modifies.push(params); return { orderId: 'tp-1' }; },
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({
-        high: String(101 + i), low: String(99 + i), close: String(100 + i),
-      })),
+      getKlines: async () => asClientReturns(atrKlines()),
     };
     const pm = new PositionManager(reflecting(client), 'BTCUSDT', settings());
     const result = await pm.ensureProtection(live);
@@ -1845,9 +1906,7 @@ describe('a position with a stop but no take-profit still gets its take-profit',
       }],
       modifyTPSL: async (params) => { modifies.push(params); return { orderId: 'tp-1' }; },
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({
-        high: String(101 + i), low: String(99 + i), close: String(100 + i),
-      })),
+      getKlines: async () => asClientReturns(atrKlines()),
     };
     const pm = new PositionManager(reflecting(client), 'BTCUSDT', settings());
     await pm.ensureProtection(live);
@@ -1861,9 +1920,7 @@ describe('a position with a stop but no take-profit still gets its take-profit',
       getPendingTPSL: async () => [],
       placeTPSL: async (params) => { places.push(params); return { orderId: 'tp-1' }; },
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({
-        high: String(101 + i), low: String(99 + i), close: String(100 + i),
-      })),
+      getKlines: async () => asClientReturns(atrKlines()),
     };
     const pm = new PositionManager(reflecting(client), 'BTCUSDT', settings({ tpsl_method: 'trailing' }));
     const result = await pm.ensureProtection(live);
@@ -2450,13 +2507,18 @@ describe('the scanner refuses to trade a market that is going nowhere', () => {
         : amp * (1 - (phase - period / 2) / (period / 2));
       closes.push(100 + leg + gauss() * noise);
     }
-    return closes.map((p, i) => {
+    // Built chronologically — `open` must be the close of the bar BEFORE it in
+    // time, so the walk has to run forwards — then emitted newest-first to
+    // match the wire. Reversing the finished array keeps that pairing intact:
+    // the neighbour relationship is a property of the walk, not of the index.
+    return newestFirst(closes.map((p, i) => {
       const prev = i ? closes[i - 1] : p;
       return {
+        time: barTime(i, closes.length),
         open: String(prev), high: String(Math.max(p, prev) + 0.15),
         low: String(Math.min(p, prev) - 0.15), close: String(p), baseVol: '1000',
       };
-    });
+    }));
   };
   const trendKlines = () => {
     const out = [];
@@ -2464,17 +2526,21 @@ describe('the scanner refuses to trade a market that is going nowhere', () => {
     for (let i = 0; i < 200; i++) {
       q += 0.9;
       const dip = i % 7 === 0 ? -0.8 : 0;
-      out.push({ open: String(q + 0.2), high: String(q + 0.5), low: String(q + dip), close: String(q + dip + 0.3), baseVol: '1000' });
+      out.push({ time: barTime(i, 200), open: String(q + 0.2), high: String(q + 0.5), low: String(q + dip), close: String(q + dip + 0.3), baseVol: '1000' });
     }
-    return out;
+    return newestFirst(out);
   };
+  // A flat volume series, so order cannot matter here.
   const vols = () => Array.from({ length: 200 }, () => 1000);
 
-  const scanWith = async klines => {
+  // `wireBars` is in the order the exchange sends. The stub stands in for
+  // BitunixClient.getKlines, so it returns what the client returns —
+  // chronological — exactly as `getKlines` does after its normalisation.
+  const scanWith = async wireBars => {
     const { CONFIG } = await import('../src/config.js');
     const Scanner = (await import('../src/bitunix/scanner.js')).default;
     const client = {
-      getKlines: async () => klines,
+      getKlines: async () => asClientReturns(wireBars),
       getFundingRate: async () => ({ fundingRate: '0' }),
       getTickers: async () => ({ symbol: CONFIG.symbol, lastPrice: '100' }),
     };
@@ -2483,8 +2549,8 @@ describe('the scanner refuses to trade a market that is going nowhere', () => {
 
   it('publishes efficiency as net progress, not as a strategy direction', async () => {
     const { computeSignal, STRATEGY_KEYS } = await import('../src/bitunix/indicators.js');
-    const ranged = computeSignal(sawtoothKlines(), vols(), 0);
-    const trended = computeSignal(trendKlines(), vols(), 0);
+    const ranged = computeSignal(asClientReturns(sawtoothKlines()), vols(), 0);
+    const trended = computeSignal(asClientReturns(trendKlines()), vols(), 0);
     assert.ok(Number.isFinite(ranged.efficiency), 'efficiency is exposed on the scan result');
     assert.ok(ranged.efficiency < 20, `a bounded oscillation must read low, got ${ranged.efficiency}`);
     assert.ok(trended.efficiency >= 20, `a trend must read at or above 20, got ${trended.efficiency}`);
@@ -2503,7 +2569,7 @@ describe('the scanner refuses to trade a market that is going nowhere', () => {
     // HIGHER than the trend. A min_adx gate alone therefore let ranges straight
     // through, which is how a position was ground down one stop at a time.
     const { computeSignal } = await import('../src/bitunix/indicators.js');
-    const ranged = computeSignal(sawtoothKlines(), vols(), 0);
+    const ranged = computeSignal(asClientReturns(sawtoothKlines()), vols(), 0);
     const result = await scanWith(sawtoothKlines());
     assert.ok(ranged.adx > 25, `this shape must defeat an ADX gate, got ADX ${ranged.adx}`);
     assert.equal(result.signal, 'hold', 'and must still be refused');
@@ -2519,7 +2585,7 @@ describe('the scanner refuses to trade a market that is going nowhere', () => {
     // the gate would be untested; the loss happened because a range DID read as
     // confident and tradeable, so that is the behaviour the gate must intercept.
     const { computeSignal } = await import('../src/bitunix/indicators.js');
-    const ranged = computeSignal(sawtoothKlines(), vols(), 0);
+    const ranged = computeSignal(asClientReturns(sawtoothKlines()), vols(), 0);
     assert.notEqual(ranged.direction, 'neutral', 'the range still reads a direction');
     assert.ok(ranged.confidence > 0, 'and still reads a confidence — confidence alone never caught this');
   });
@@ -2647,8 +2713,14 @@ describe('break-even is applied once per position, not once per manage tick', ()
       getPendingTPSL: async () => rows,
       placeTPSL: async () => ({ orderId: 'sl-1' }),
       modifyTPSL: async (params) => { sent.push(params); return { orderId: 'sl-1' }; },
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({
-        high: String(1 + i / 1000), low: String(0.9 + i / 1000), close: String(0.95 + i / 1000),
+      // A sub-$1 coin, so the ATR maths is exercised on a decimal price. Wire
+      // order like every other fixture: newest bar first.
+      getKlines: async () => asClientReturns(Array.from({ length: 60 }, (_, i) => {
+        const price = 0.95 + (59 - i) / 1000;
+        return {
+          time: barTime(i, 60),
+          high: String(price + 0.05), low: String(price - 0.05), close: String(price),
+        };
       })),
       getTickers: async () => [{ symbol: 'BTCUSDT', markPrice: '0.0825' }],
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 5, basePrecision: 2 }],
@@ -2811,7 +2883,7 @@ describe('liquidation guards run before any profit-side stop management', () => 
       closePosition: async () => { calls.push('close'); return {}; },
       placeTPSL: async () => { calls.push('place'); return { orderId: 'sl-1' }; },
       modifyTPSL: async () => { calls.push('modify'); return { orderId: 'sl-1' }; },
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getKlines: async () => asClientReturns(atrKlines()),
       getTickers: async () => [{ symbol: 'BTCUSDT', markPrice: '110' }],
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
     };
@@ -2843,14 +2915,15 @@ describe('liquidation guards run before any profit-side stop management', () => 
 
 describe('the declared strategy set is the set the scanner scores', () => {
   function fakeKlines(count = 80) {
-    return Array.from({ length: count }, (_, i) => ({
+    return newestFirst(Array.from({ length: count }, (_, i) => ({
+      time: barTime(i, count),
       open: String(100 + i), high: String(102 + i), low: String(99 + i), close: String(101 + i),
       baseVol: String(1000 + i),
-    }));
+    })));
   }
 
   it('declares the ten strategies the scanner actually emits', () => {
-    const klines = fakeKlines();
+    const klines = asClientReturns(fakeKlines());
     const signal = computeSignal(klines, klines.map(k => Number(k.baseVol)), 0.0001);
     assert.equal(STRATEGIES.length, 10, 'ten strategies are declared');
     assert.deepEqual(Object.keys(signal.strategyDirections).sort(), [...STRATEGY_KEYS].sort(),
@@ -2865,7 +2938,7 @@ describe('the declared strategy set is the set the scanner scores', () => {
   });
 
   it('never leaves a declared strategy unweighted when it abstains', () => {
-    const klines = fakeKlines();
+    const klines = asClientReturns(fakeKlines());
     const signal = computeSignal(klines, klines.map(k => Number(k.baseVol)), 0);
     // A strategy that abstains contributes 0 but must still be reported, so the
     // scanner's breadth maths can see it existed and did not vote.
@@ -2895,5 +2968,214 @@ describe('the declared strategy set is the set the scanner scores', () => {
     // tool rather than agreeing that Ichimoku is already active.
     assert.ok(STRATEGY_KEYS.includes('ichimoku'), 'ICHIMOKU is the new strategy');
     assert.ok(!STRATEGY_KEYS.includes('adx'), 'ADX no longer scores');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The kline ordering regression.
+//
+// Bitunix returns GET /api/v1/futures/market/kline NEWEST-FIRST and client.js
+// normalises it to chronological order. Nothing broke loudly when that was
+// missed: every indicator took the array as given and walked it backwards in
+// time. A steady uptrend read bearish, ATR came out 70-300% wrong, ADX was a
+// different number. The suite stayed 299/299 green because EVERY kline fixture
+// in it was built ascending, i.e. it described a series the exchange has never
+// sent. These tests exist so the wire shape is the one under test.
+// ---------------------------------------------------------------------------
+describe('klines are normalised to chronological order', () => {
+  // Builds the payload exactly as the exchange sends it: index 0 is the NEWEST
+  // bar and `time` is a STRING, both confirmed against the live endpoint.
+  const wireKlines = (n = 8) => Array.from({ length: n }, (_, i) => {
+    const close = 100 + (n - 1 - i);              // newest bar has the highest close
+    return {
+      time: String(KLINE_EPOCH - i * KLINE_STEP), // index 0 => largest time => newest
+      open: String(close - 0.2), high: String(close + 0.6),
+      low: String(close - 0.6), close: String(close), baseVol: '1000',
+    };
+  });
+
+  const timesOf = bars => bars.map(bar => Number(bar.time));
+
+  it('returns oldest-first bars from a newest-first response', async () => {
+    stubFetch({ dataFor: () => wireKlines() });
+    const bars = await client().getKlines('BTCUSDT', '15m', 8);
+    const times = timesOf(bars);
+    assert.deepEqual(times, [...times].sort((a, b) => a - b),
+      `timestamps must ascend, got ${JSON.stringify(times)}`);
+    assert.ok(times[0] < times.at(-1), 'the first bar is the OLDEST and the last is the newest');
+    // Same bars, same count — the fix reorders, it does not drop or duplicate.
+    assert.equal(bars.length, 8);
+    assert.deepEqual([...bars].map(b => b.close).sort(), wireKlines().map(b => b.close).sort(),
+      'every bar survives the round trip');
+  });
+
+  it('is idempotent: an already-chronological response is left alone', async () => {
+    // The defensive sort exists so a future exchange-side ordering change is
+    // repaired rather than silently re-inverting. It must not double-reverse a
+    // payload that is already oldest-first, which is what would happen if the
+    // normalisation were a bare `.reverse()` with nothing to catch it.
+    const chronological = [...wireKlines()].reverse();
+    stubFetch({ dataFor: () => chronological });
+    const bars = await client().getKlines('BTCUSDT', '15m', 8);
+    assert.deepEqual(timesOf(bars), timesOf(chronological), 'order is preserved exactly');
+    assert.equal(toChronological(toChronological(chronological)).length, chronological.length);
+    assert.deepEqual(
+      timesOf(toChronological(toChronological(chronological))),
+      timesOf(chronological),
+      'normalising twice is the same as normalising once',
+    );
+  });
+
+  it('repairs a payload whose order is neither ascending nor descending', async () => {
+    // Defence in depth: the reverse assumes today's wire shape, the sort does
+    // not care what shape it was handed.
+    const scrambled = [5, 0, 7, 2, 6, 1, 4, 3].map(step => wireKlines()[step]);
+    const bars = toChronological(scrambled);
+    assert.deepEqual(timesOf(bars), [...timesOf(scrambled)].sort((a, b) => a - b));
+  });
+
+  it('sorts on the timestamp, not on the array position', async () => {
+    // `time` is a STRING on the wire. A bare `a.time - b.time` coerces to NaN
+    // for every pair, every comparison returns false, and the sort preserves
+    // the incoming (wrong) order — so this asserts the Number() coercion is
+    // load-bearing rather than incidental.
+    const asStrings = wireKlines().map(bar => ({ ...bar, time: bar.time }));
+    for (const bar of asStrings) assert.equal(typeof bar.time, 'string', 'the wire sends strings');
+    assert.deepEqual(timesOf(toChronological(asStrings)), [...timesOf(asStrings)].sort((a, b) => a - b));
+  });
+
+  it('does not throw on an empty or unusable response', async () => {
+    // defaultData() answers `[]` for the kline path, so the endpoint contract
+    // test drives getKlines with an empty series. The normalisation must pass
+    // it through rather than throwing on `.at(-1)` of nothing.
+    stubFetch({ dataFor: () => [] });
+    assert.deepEqual(await client().getKlines('BTCUSDT', '15m', 2), []);
+    assert.equal(toChronological(null), null, 'a non-array is returned untouched');
+    assert.deepEqual(toChronological([]), []);
+  });
+
+  it('does not mutate the array it was handed', async () => {
+    const wire = wireKlines();
+    const snapshot = [...wire];
+    toChronological(wire);
+    assert.deepEqual(wire, snapshot, 'the caller keeps its own array');
+  });
+
+  it('reads a steady uptrend as bullish end to end, through the real client', () => {
+    // The load-bearing regression. This drives a real BitunixClient against a
+    // stubbed fetch and feeds whatever it returns straight into computeSignal,
+    // exactly as scanner.js does — so if getKlines ever stops normalising, this
+    // goes bearish and fails. A test that called toChronological() itself
+    // instead would keep passing through that regression, because it would
+    // have been applying the fix rather than exercising it.
+    const wire = Array.from({ length: 200 }, (_, i) => {
+      const close = 100 + (199 - i);              // index 0 is the newest bar
+      return {
+        time: String(KLINE_EPOCH - i * KLINE_STEP),
+        open: String(close - 0.2), high: String(close + 0.6),
+        low: String(close - 0.6), close: String(close), baseVol: '1000',
+      };
+    });
+    stubFetch({ dataFor: () => wire });
+    return client().getKlines('BTCUSDT', '15m', 200).then(bars => {
+      const signal = computeSignal(bars, bars.map(k => Number(k.baseVol)), 0);
+      assert.equal(signal.direction, 'bullish',
+        'a market that only went up must not read bearish — this is the defect');
+    });
+  });
+});
+
+describe('a descending series is read backwards, and that is the whole bug', () => {
+  // A clean, strong uptrend in wire order (newest first).
+  const risingWire = () => newestFirst(Array.from({ length: 200 }, (_, i) => {
+    const base = 100 + i * 0.5;
+    return {
+      time: barTime(i, 200),
+      open: String(base - 0.2), high: String(base + 0.6),
+      low: String(base - 0.6), close: String(base), baseVol: '1000',
+    };
+  }));
+  const fallingWire = () => newestFirst(Array.from({ length: 200 }, (_, i) => {
+    const base = 200 - i * 0.5;
+    return {
+      time: barTime(i, 200),
+      open: String(base + 0.2), high: String(base + 0.6),
+      low: String(base - 0.6), close: String(base), baseVol: '1000',
+    };
+  }));
+
+  const signalFor = (wireBars, funding = 0) => {
+    const bars = asClientReturns(wireBars);
+    return computeSignal(bars, bars.map(k => Number(k.baseVol)), funding);
+  };
+
+  it('reads a steady uptrend as bullish', () => {
+    assert.equal(signalFor(risingWire()).direction, 'bullish',
+      'a market that only went up must not read bearish');
+  });
+
+  it('reads a steady downtrend as bearish', () => {
+    assert.equal(signalFor(fallingWire()).direction, 'bearish',
+      'a market that only went down must not read bullish');
+  });
+
+  it('inverts both readings when the series is handed over descending', () => {
+    // The assertion that would have caught the original defect. Before
+    // client.js normalised the order, computeSignal received exactly this
+    // array — the exchange's own payload — and every one of these numbers
+    // came out the wrong way round, silently.
+    const up = risingWire();
+    assert.equal(signalFor(up).direction, 'bullish', 'normalised: bullish');
+    assert.equal(computeSignal(up, up.map(k => Number(k.baseVol)), 0).direction, 'bearish',
+      'the same array read as-is (newest-first) is bearish — this is the bug');
+
+    const down = fallingWire();
+    assert.equal(signalFor(down).direction, 'bearish', 'normalised: bearish');
+    assert.equal(computeSignal(down, down.map(k => Number(k.baseVol)), 0).direction, 'bullish',
+      'and the mirror image inverts too');
+  });
+
+  it('reports ATR that differs between the two orders', () => {
+    // Reversal invariance is not a property these indicators have. efficiency()
+    // happens to be symmetric, which is why the new efficiency gate's NUMBER
+    // looked fine while the DIRECTION it gated was inverted — a good reminder
+    // that one invariant indicator proves nothing about the rest.
+    //
+    // The series needs per-bar noise for this to show: on a perfectly smooth
+    // ramp every bar has the same high-low range and the true ranges are
+    // symmetric, so ATR genuinely is invariant and the test would prove
+    // nothing. Real candles are not smooth, and neither is this one.
+    let seed = 20261009;
+    const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+    const noisyWire = () => newestFirst(Array.from({ length: 200 }, (_, i) => {
+      const base = 100 + i * 0.5 + rnd() * 1.5;
+      return {
+        time: barTime(i, 200),
+        open: String(base - 0.2), high: String(base + 0.6 + rnd()),
+        low: String(base - 0.6 - rnd()), close: String(base), baseVol: '1000',
+      };
+    }));
+
+    const atrOf = bars => calculateAtr(
+      bars.map(k => Number(k.high)), bars.map(k => Number(k.low)), bars.map(k => Number(k.close)), 14,
+    );
+    const chronological = asClientReturns(noisyWire());
+    const ascendingAtr = atrOf(chronological);
+    const descendingAtr = atrOf([...chronological].reverse());
+    assert.ok(Number.isFinite(ascendingAtr) && ascendingAtr > 0, 'ATR is a usable number ascending');
+    assert.ok(Math.abs(ascendingAtr - descendingAtr) / ascendingAtr > 0.001,
+      `ATR must be order-sensitive for this test to mean anything: ${ascendingAtr} vs ${descendingAtr}`);
+  });
+
+  it('routes every kline consumer through the same normalisation', async () => {
+    // The scanner derives volumes from the SAME array it passes to
+    // computeSignal, so price and volume stay aligned index-for-index. If a
+    // future caller passed a differently-ordered volume series the two would
+    // silently desync; assert the alignment the production path relies on.
+    const wire = risingWire();
+    const bars = asClientReturns(wire);
+    assert.equal(bars.length, wire.length);
+    assert.equal(bars.map(k => Number(k.baseVol)).length, bars.length);
+    assert.ok(bars.every(k => k.close && k.high && k.low), 'no bar was mangled by the reorder');
   });
 });

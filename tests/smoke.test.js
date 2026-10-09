@@ -18,7 +18,7 @@ import { parseThinkingLevel } from '../src/agent/thinking.js';
 import { CONFIG, parseBoolean, applySettingsFile } from '../src/config.js';
 import { createTraderCommands } from '../src/telegram-trader.js';
 import { PositionNotifier, closeMessage, normalizeSide, openMessage, positionRoiPct, sideLabel } from '../src/trader/notifier.js';
-import { BitunixClient } from '../src/bitunix/client.js';
+import { BitunixClient, toChronological } from '../src/bitunix/client.js';
 import Scanner from '../src/bitunix/scanner.js';
 import { liqDistanceOk } from '../src/bitunix/risk.js';
 import { Trader } from '../src/trader/trader.js';
@@ -51,6 +51,33 @@ afterEach(() => {
   setBitunixClient(null);
 });
 
+// ---------------------------------------------------------------------------
+// kline fixtures
+//
+// Bitunix returns GET /api/v1/futures/market/kline NEWEST-FIRST (verified live),
+// and client.js normalises that to chronological order before anything reads it.
+// The fixtures here used to be built ascending while production was descending —
+// which is exactly why this file stayed green while every indicator walked the
+// real series backwards in time. Fixtures are therefore built in WIRE ORDER and
+// routed through `asClientReturns`, the same normalisation getKlines applies.
+// ---------------------------------------------------------------------------
+
+// 2026-10-09T16:20:00Z and a 15m step: arbitrary but real-looking, so the
+// defensive timestamp sort has something to compare. `time` is a STRING on the
+// wire, which is why client.js coerces with Number() before sorting.
+const KLINE_EPOCH = 1791514800000;
+const KLINE_STEP = 900000;
+
+const newestFirst = bars => bars.reverse();
+
+// Bar i of a chronologically-built series of length n, once emitted newest-first.
+const barTime = (i, n) => String(KLINE_EPOCH - (n - 1 - i) * KLINE_STEP);
+
+// Everything downstream of the wire consumes CHRONOLOGICAL bars, because that is
+// what BitunixClient.getKlines returns. Routing fixtures through here means these
+// tests walk the path production does: newest-first wire -> getKlines -> consumer.
+const asClientReturns = toChronological;
+
 function fakePosition(overrides = {}) {
   return {
     symbol: 'BTCUSDT',
@@ -66,6 +93,11 @@ function fakePosition(overrides = {}) {
 }
 
 describe('indicators', () => {
+  // NOTE: the bare number arrays in this block are NOT kline fixtures and must
+  // stay ASCENDING. They are handed straight to ema/rsi/bollinger, which take a
+  // chronological series as their contract — getKlines is not in this path, so
+  // there is no wire order to mirror here. Reversing them would test the
+  // opposite of what each assertion claims (rsi(increasing) === 100, and so on).
   it('ema returns number for enough data', () => {
     const arr = Array.from({ length: 30 }, (_, i) => 100 + i);
     assert.ok(typeof ema(arr, 20) === 'number');
@@ -84,9 +116,12 @@ describe('indicators', () => {
   });
 
   it('computeSignal returns direction+confidence', () => {
-    const kl = Array.from({ length: 60 }, (_, i) => ({
+    // Wire order, then through the client's normalisation — the same path
+    // scanner.js:69 walks in production.
+    const kl = asClientReturns(newestFirst(Array.from({ length: 60 }, (_, i) => ({
+      time: barTime(i, 60),
       open: String(100 + i), high: String(101 + i), low: String(99 + i), close: String(100 + i),
-    }));
+    }))));
     const vols = Array.from({ length: 60 }, () => 10);
     const res = computeSignal(kl, vols, 0);
     assert.ok(['bullish', 'bearish', 'neutral'].includes(res.direction));
@@ -185,6 +220,8 @@ describe('safety configuration', () => {
 });
 
 describe('indicator correctness', () => {
+  // Same as above: these arrays bypass getKlines entirely and are chronological
+  // series by contract. `increasing` must read as an uptrend, not a downtrend.
   it('calculates directional RSI, MACD, Super Trend, and ATR breakout', () => {
     const increasing = Array.from({ length: 80 }, (_, index) => 100 + index * index);
     const highs = increasing.map(value => value + 1);
@@ -205,9 +242,14 @@ describe('indicator correctness', () => {
   });
 
   it('rejects malformed kline values', () => {
-    const klines = Array.from({ length: 60 }, (_, index) => ({ close: String(100 + index), high: 'NaN', low: '1' }));
+    // Wire order like every other kline fixture. The assertion is that a bad
+    // `high` throws regardless of order, but a fixture that looks unlike the
+    // exchange is a fixture that cannot catch a wire-shaped defect.
+    const klines = newestFirst(Array.from({ length: 60 }, (_, index) => ({
+      time: barTime(index, 60), close: String(100 + (59 - index)), high: 'NaN', low: '1',
+    })));
     const volumes = Array.from({ length: 60 }, () => 1);
-    assert.throws(() => computeSignal(klines, volumes, 0), /positive finite/);
+    assert.throws(() => computeSignal(asClientReturns(klines), volumes, 0), /positive finite/);
   });
 });
 
@@ -251,20 +293,29 @@ describe('exchange safety', () => {
     assert.equal(liqDistanceOk({ markPrice: 100, liqPrice: 50 }), true);
   });
 
+  // A steep parabolic rise, in WIRE order (newest bar first). getKlines returns
+  // chronological bars, so the stub below hands back what the client hands back.
+  const steepRise = () => newestFirst(Array.from({ length: 60 }, (_, index) => {
+    const price = 100 + index * index;
+    return {
+      time: barTime(index, 60),
+      close: String(price), high: String(price + 1), low: String(price - 1), baseVol: '10',
+    };
+  }));
+
   it('enforces minimum scanner confidence', async () => {
-    const klines = Array.from({ length: 60 }, (_, index) => ({ close: String(100 + index * index), high: String(101 + index * index), low: String(99 + index * index), baseVol: '10' }));
-    const scanner = new Scanner({ getKlines: async () => klines, getFundingRate: async () => ({ value: 0 }) });
+    const scanner = new Scanner({ getKlines: async () => asClientReturns(steepRise()), getFundingRate: async () => ({ value: 0 }) });
     Object.assign(CONFIG, { timeframes: ['1m'], min_agreeing_strategies: 1, tf_min_confidence: 0, min_confidence: 101 });
     const result = await scanner.scan('BTCUSDT');
     assert.equal(result.signal, 'hold');
   });
 
   it('uses the live ticker price, not a stale kline close, for lastPrice', async () => {
-    // The last kline's close (100 + 59*59 = 3581) is stale by up to a full
-    // bar; the real-time tickers endpoint is the source of truth for price.
-    const klines = Array.from({ length: 60 }, (_, index) => ({ close: String(100 + index * index), high: String(101 + index * index), low: String(99 + index * index), baseVol: '10' }));
+    // The newest kline's close is stale by up to a full bar; the real-time
+    // tickers endpoint is the source of truth for price.
+    const klines = steepRise();
     const scanner = new Scanner({
-      getKlines: async () => klines,
+      getKlines: async () => asClientReturns(klines),
       getFundingRate: async () => ({ value: 0 }),
       getTickers: async () => [{ symbol: 'BTCUSDT', lastPrice: '99999.5', markPrice: '99999.1' }],
     });
@@ -274,11 +325,21 @@ describe('exchange safety', () => {
   });
 
   it('falls back to the kline close if the ticker call fails', async () => {
-    const klines = Array.from({ length: 60 }, (_, index) => ({ close: String(100 + index * index), high: String(101 + index * index), low: String(99 + index * index), baseVol: '10' }));
-    const scanner = new Scanner({ getKlines: async () => klines, getFundingRate: async () => ({ value: 0 }) });
+    const klines = steepRise();
+    const scanner = new Scanner({ getKlines: async () => asClientReturns(klines), getFundingRate: async () => ({ value: 0 }) });
     Object.assign(CONFIG, { timeframes: ['1m'], min_agreeing_strategies: 1, tf_min_confidence: 0, min_confidence: 0 });
     const result = await scanner.scan('BTCUSDT');
-    assert.equal(result.lastPrice, klines.at(-1).close);
+    // The fallback must read the NEWEST bar. getKlines returns CHRONOLOGICAL
+    // bars, so after normalisation the newest candle is the LAST element. This
+    // assertion is index-coupled to the scanner deliberately: the value it
+    // pins (3581 = 100 + 59*59) is the top of a rising series, so it is only
+    // reachable from the newest bar. Reading `[0]` would return 100 — the
+    // OLDEST bar in the window — and that is the exact defect the inverted
+    // series caused before client.js started normalising.
+    assert.equal(result.lastPrice, asClientReturns(klines).at(-1).close);
+    assert.equal(result.lastPrice, '3581', 'and that is the newest close, 100 + 59*59');
+    assert.notEqual(result.lastPrice, asClientReturns(klines)[0].close,
+      'the oldest bar would be a different price, so this pins the newest');
   });
 
   it('does not order when auto-trade is disabled', async () => {
@@ -485,7 +546,7 @@ describe('exchange safety', () => {
     const calls = [];
     const client = {
       getPendingTPSL: async () => [],
-      getKlines: async () => Array.from({ length: 60 }, (_, i) => ({ high: String(101 + i), low: String(99 + i), close: String(100 + i) })),
+      getKlines: async () => asClientReturns(steepRise()),
       placeTPSL: async params => { calls.push(params); return { orderId: 'sl-1' }; },
     };
     const pm = new PositionManager(client, 'BTCUSDT', getTraderSettings(CONFIG));
@@ -584,6 +645,47 @@ describe('tool safety', () => {
     assert.equal(stringifyToolResult(undefined), '{"ok":true}');
   });
 
+  it('gives the kline agent tool the MOST RECENT bars, and says which end is recent', async () => {
+    // stringifyToolResult truncates at 4000 characters and a bar costs ~120 of
+    // them, so only ~32 of a 200-bar window ever reached the model. Which 32
+    // survived depended entirely on array order: the raw newest-first wire
+    // format happened to leave the newest bars, but once getKlines returns
+    // chronological data the same truncation would leave the OLDEST ones and
+    // the agent would be reasoning about a window that ended hours ago.
+    const wire = Array.from({ length: 200 }, (_, i) => ({
+      time: String(KLINE_EPOCH - i * KLINE_STEP),
+      open: String(100 + i), high: String(101 + i), low: String(99 + i),
+      close: String(100 + i), baseVol: '12.34', quoteVol: '1234.5',
+    }));
+    // A stand-in for the real client, so the tool sees what getKlines returns.
+    setBitunixClient({ getKlines: async () => asClientReturns(wire) });
+    const tool = bitunixTools.find(item => item.name === 'bitunix_get_kline');
+
+    const bars = await tool.handler({ symbol: 'BTCUSDT', interval: '15m' });
+    assert.equal(bars.length, 30, 'the tool returns a window that actually fits the 4000-char cap');
+    // Chronological order, so the newest bar is LAST. The wire sent the newest
+    // bar FIRST, so it must end up at the end of the returned window.
+    assert.equal(bars.at(-1).time, wire[0].time, 'the most recent bar is the one the wire sent first');
+    assert.ok(
+      bars.every((bar, i) => i === 0 || Number(bar.time) > Number(bars[i - 1].time)),
+      'the returned window is strictly chronological',
+    );
+    // The 30 bars must be the RECENT tail of the series, not the stale head:
+    // wire[0] is the newest on the wire, so every returned bar is one of the
+    // 30 most recent, and none of the 170 older ones leaked in.
+    assert.equal(bars.at(-1).time, wire[0].time, 'the newest bar is present');
+    assert.ok(!bars.some(bar => Number(bar.time) < Number(wire[29].time)),
+      'no bar older than the 30th-newest survived the slice');
+    // And what survives serialisation is the recent end, not the stale end.
+    const serialised = stringifyToolResult(bars);
+    assert.ok(serialised.includes(wire[0].time), 'the newest bar survives truncation');
+
+    const description = tool.description;
+    assert.ok(/LAST bar is the most recent/i.test(description),
+      `the model can only know the order from this string, got: ${description}`);
+    assert.ok(/OLDEST-FIRST/i.test(description));
+  });
+
 });
 
 describe('every entry carries a take-profit and a stop-loss', () => {
@@ -592,8 +694,15 @@ describe('every entry carries a take-profit and a stop-loss', () => {
   // placeOrder directly, so no exit existed until a human closed it. These
   // tests lock down every remaining path that can send an OPEN order.
   const pair = { symbol: 'BTCUSDT', basePrecision: 3, quotePrecision: 2, minTradeVolume: '0.001', maxMarketOrderVolume: '1000', maxLimitOrderVolume: '1000' };
-  const klines = Array.from({ length: 60 }, (_, index) => ({
-    high: String(101 + index), low: String(99 + index), close: String(100 + index), baseVol: '10',
+  // Wire order, like every other kline fixture here. `manualClient` returns this
+  // from its `getKlines` stub, so the stub normalises it exactly as the real
+  // client does before the ATR sizing sees it.
+  const klines = newestFirst(Array.from({ length: 60 }, (_, index) => {
+    const price = 100 + index;
+    return {
+      time: barTime(index, 60),
+      high: String(price + 1), low: String(price - 1), close: String(price), baseVol: '10',
+    };
   }));
 
   function manualClient(overrides = {}) {
@@ -602,7 +711,7 @@ describe('every entry carries a take-profit and a stop-loss', () => {
       calls,
       getAccount: async () => ({ available: '100' }),
       getTradingPairs: async () => [pair],
-      getKlines: async () => klines,
+      getKlines: async () => asClientReturns(klines),
       // Deliberately returns several symbols: the price must be matched by
       // symbol, not read off the first row.
       getTickers: async () => [

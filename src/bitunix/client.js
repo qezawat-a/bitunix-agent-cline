@@ -70,6 +70,41 @@ function validateOrder(params) {
   }
 }
 
+// Normalise a raw kline payload to chronological (OLDEST-FIRST) order.
+//
+// Every indicator in this codebase is written against a chronological series:
+// ema/atr/adx read `series.at(-1)` as "now", superTrend walks forward with
+// `closes[index - 1]` as the previous bar, efficiency compares `closes[0]` with
+// `closes[length - 1]`. None of them can tell which end of the array is which.
+//
+// Bitunix returns GET /api/v1/futures/market/kline NEWEST-FIRST. Verified live:
+// the first bar carried the largest `time` and the last the smallest, and
+// bar[0].open equalled bar[1].close. Handing that array straight to the
+// indicators walked every series backwards in time — a steady uptrend read as
+// bearish, ATR came out 70-300% wrong, ADX was simply a different number, and
+// the suite stayed green because its fixtures happened to be built ascending
+// while production was descending. The correction therefore lives here, in the
+// one function every consumer goes through, rather than at the call sites.
+//
+// The reverse is paired with a sort on the bar timestamp so the guarantee
+// survives an exchange-side ordering change rather than silently re-inverting.
+// The pair is idempotent: reverse-then-sort-ascending is ascending, so an
+// already-chronological response comes back untouched and a descending one is
+// repaired. `time` is a STRING on the wire, hence Number(); a bare `a.time -
+// b.time` would coerce to NaN for every pair and preserve the bad order. V8's
+// sort is stable and NaN comparisons return false, so rows lacking a usable
+// `time` keep their reversed relative order instead of throwing or scrambling.
+//
+// A non-array response (or an empty one) is returned as-is: callers own the
+// "no klines" error and must keep seeing the raw payload.
+export function toChronological(bars) {
+  if (!Array.isArray(bars)) return bars;
+  return bars
+    .slice()
+    .reverse()
+    .sort((a, b) => Number(a?.time) - Number(b?.time));
+}
+
 // The venue publishes the leverage band per symbol on /market/trading_pairs
 // (minLeverage..maxLeverage; the docs' BTCUSDT example is 1..125). The client
 // used to hard-code that same 1..125, which is right for BTCUSDT but wrong for
@@ -151,10 +186,24 @@ export class BitunixClient {
     return data;
   }
 
+  // EVERY indicator in this codebase is written against a chronological series:
+  // ema/atr/adx read `series.at(-1)` as "now", superTrend walks forward with
+  // `closes[index - 1]` as the previous bar, efficiency compares `closes[0]`
+  // with `closes[length - 1]`. None of them can tell which end is which.
+  //
+  // Bitunix returns this endpoint NEWEST-FIRST. Verified live against
+  // GET /api/v1/futures/market/kline: the first bar carried the largest `time`
+  // and the last the smallest, and bar[0].open equalled bar[1].close. Handing
+  // that array straight to the indicators walked the whole series backwards in
+  // time — a steady uptrend read as bearish, ATR came out 70-300% wrong, ADX
+  // was simply a different number. So the order is fixed in ONE place, here,
+  // rather than at each call site: one thing to reason about, and no way for a
+  // new caller to get it wrong by forgetting. See `toChronological` above.
   async getKlines(symbol, interval = '15m', limit = 200, startTime = 0, endTime = 0, type = 'LAST_PRICE') {
     const safeLimit = Math.max(1, Math.min(200, Number(limit) || 200));
     const query = { symbol, interval, limit: String(safeLimit), startTime: startTime || '', endTime: endTime || '', type };
-    return this.request('GET', '/api/v1/futures/market/kline', null, query, { signed: false });
+    const data = await this.request('GET', '/api/v1/futures/market/kline', null, query, { signed: false });
+    return toChronological(data);
   }
 
   async getTickers(symbol = '') {

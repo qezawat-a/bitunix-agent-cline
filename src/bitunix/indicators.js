@@ -392,7 +392,12 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
   const momentum = momentumScore(closes, 10);
   add('momentum', momentum > 0.15 ? 'bullish' : momentum < -0.15 ? 'bearish' : 'neutral', momentum);
 
-  const ichimokuResult = ichimoku(highs, lows, closes);
+  // The signature is ichimoku(closes, highs, lows). This call used to pass
+  // (highs, lows, closes) — a silent rotation, not a misordering, so nothing
+  // threw and the returned direction was simply computed over the wrong
+  // series: maxN walked real lows while believing they were highs. On random
+  // walks the rotated and correct forms disagree about a quarter of the time.
+  const ichimokuResult = ichimoku(closes, highs, lows);
   add('ichimoku', ichimokuResult || 'neutral', 'cloud');
 
   const bands = bollinger(closes, 20, 2);

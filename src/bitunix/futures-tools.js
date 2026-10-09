@@ -20,14 +20,36 @@ export const bitunixTools = [
   },
   {
     name: 'bitunix_get_kline',
-    description: 'Get kline data',
+    // The order is stated in the description because the model reads this
+    // string and nothing else: bars are OLDEST-FIRST, so the LAST bar is the
+    // most recent candle and the FIRST is the oldest. getKlines normalises the
+    // exchange's newest-first wire format (see client.js), so saying so here
+    // is what keeps the agent from reading "the latest bar" as the first
+    // element.
+    description: 'Get kline (candle) data. Bars are OLDEST-FIRST: the LAST bar is the most recent, the FIRST bar is the oldest. Only the most recent ~30 bars are returned (see limit).',
     parameters: {
       type: 'object',
-      properties: { symbol: { type: 'string' }, interval: { type: 'string' }, limit: { type: 'number' } },
+      properties: {
+        symbol: { type: 'string' },
+        interval: { type: 'string' },
+        limit: { type: 'number', description: 'How many of the most recent bars to return (default 30).' },
+      },
       required: ['symbol'],
     },
-    async handler({ symbol, interval = '15m', limit = 200 }) {
-      return requireClient().getKlines(symbol, interval, limit);
+    async handler({ symbol, interval = '15m', limit = 30 }) {
+      const klines = await requireClient().getKlines(symbol, interval, Math.max(1, Number(limit) || 30));
+      if (!Array.isArray(klines)) return klines;
+      // Keep only the MOST RECENT bars. The agent's result is serialised
+      // through stringifyToolResult, which truncates at 4000 characters — a
+      // typical bar costs ~120 of those, so only ~32 survive. Requesting the
+      // full 200-bar window therefore threw away 84% of the payload, and which
+      // 32 survived depended entirely on array order: with the raw newest-first
+      // wire format the survivors were the newest bars (accidentally right),
+      // but once getKlines returns chronological data they would be the
+      // OLDEST bars and the agent would be reading a window that ends hours in
+      // the past. Slicing here makes the visible window deliberately the
+      // recent one regardless of what the serialiser keeps.
+      return klines.slice(-Math.max(1, Number(limit) || 30));
     },
   },
   {
