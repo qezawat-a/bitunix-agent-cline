@@ -1,6 +1,6 @@
 import { CONFIG, parseBoolean } from './config.js';
 import { sendMessage, isOwner, esc, formatSignalReport } from './telegram-bot.js';
-import { applySettings, getTraderSettings, parseSettingValue, validateSettings } from './trader/settings.js';
+import { applySettings, getTraderSettings, parseSettingValue, resolveSettingKey, validateSettings, parseNaturalSetting } from './trader/settings.js';
 import { formatPositions } from './trader/notifier.js';
 import { parseThinkingLevel } from './agent/thinking.js';
 import { detectProviders } from './agent/config.js';
@@ -13,6 +13,28 @@ function usage(chatId, text) {
 
 function markCooldown(trader) {
   if (trader?.state) trader.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
+}
+
+// handleNaturalSetting(text, deps) -> reply string | null
+// A plain sentence that names a setting and a value ("set the margin risk to 30") takes the
+// same validated path as /set, so the model is never asked to arbitrate its own limits.
+// Returns null when the sentence is not a settings command, letting the caller fall through
+// to the agent chat exactly as before.
+export async function handleNaturalSetting(text, { client = null, persistSettings = null } = {}) {
+  const parsed = parseNaturalSetting(text);
+  if (!parsed) return null;
+  try {
+    if (parsed.key === 'symbol' && client && String(parsed.value).toUpperCase() !== CONFIG.symbol) {
+      const positions = await client.getPendingPositions(CONFIG.symbol);
+      if (Array.isArray(positions) && positions.length) return 'Cannot change symbol while positions are open.';
+    }
+    const applied = applySettings(CONFIG, { [parsed.key]: parsed.value });
+    if (persistSettings) await persistSettings();
+    const stored = applied[parsed.key];
+    return `Set <code>${esc(parsed.key)}</code> = <code>${esc(Array.isArray(stored) ? stored.join(',') : String(stored))}</code>`;
+  } catch (error) {
+    return `Error: ${esc(error.message)}`;
+  }
 }
 
 export function createTraderCommands({ client, scanner, trader, agent, tools = [], loadSession = null, saveSession = null, deleteSession = null, persistSettings = null, notifier = null }) {
@@ -70,9 +92,14 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
             const positions = await client.getPendingPositions(CONFIG.symbol);
             if (!Array.isArray(positions) || positions.length) return usage(chatId, 'Cannot change symbol while positions are open.');
           }
-          applySettings(CONFIG, { [key]: value });
+          const applied = applySettings(CONFIG, { [key]: value });
           await save();
-          await sendMessage(chatId, `Set <code>${esc(key)}</code> = <code>${esc(String(value))}</code>`);
+          // Quote what is actually stored, not what was asked for. applySettings resolves
+          // the alias and the validator may coerce the value, so echoing the request can
+          // confirm a write that never landed.
+          const canonical = resolveSettingKey(key);
+          const stored = applied[canonical];
+          await sendMessage(chatId, `Set <code>${esc(canonical)}</code> = <code>${esc(Array.isArray(stored) ? stored.join(',') : String(stored))}</code>`);
           return true;
         }
         case 'get': {

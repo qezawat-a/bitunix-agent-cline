@@ -189,6 +189,59 @@ export function normalizeSettings(s = {}) {
   };
 }
 
+// The single source of truth for every numeric setting boundary. validateSettings()
+// enforces exactly this table and describeSettingBounds() renders the same table into
+// the agent's system prompt, so the agent can never be told a different limit than the
+// code enforces. The optional third tuple element means "whole number".
+export const SETTING_RANGES = Object.freeze({
+  min_confidence: [0, 100],
+  tf_min_confidence: [0, 100],
+  min_agreeing_strategies: [1, 100, true],
+  min_eligible_timeframes: [1, 20, true],
+  // 0 disables the gate, so the lower bound is 0 rather than >0. The score margin is a
+  // mean per qualifying timeframe, so its ceiling is one timeframe's whole book weight
+  // — see the note on netScore in scanner.js.
+  min_efficiency: [0, 100],
+  min_adx: [0, 100],
+  min_score_margin: [0, 146],
+  signal_confirm_scans: [1, 100, true],
+  cooldown_minutes: [0, 1440, true],
+  max_positions: [1, 100, true],
+  scan_interval_sec: [5, 86400, true],
+  guard_interval_sec: [5, 86400, true],
+  breakeven_threshold_pct: [0, 1000],
+  trailing_trigger_roi_pct: [0, 10000],
+  trailing_atr_multiple: [0.01, 100],
+  trailing_atr_strength_reduction: [0, 1],
+  sl_liquidation_safety: [0.01, 1],
+  reversal_confidence: [0, 100],
+  report_interval_sec: [5, 86400, true],
+  mid_manage_interval_sec: [5, 86400, true],
+  // There is no allocation ceiling. This is the entire bound. A stricter prose limit
+  // once lived in soul/SOUL.md ("25% of account capital"), which made the agent refuse
+  // values this validator accepts — so the prompt renders this table and nothing else.
+  position_sizing_margin_pct: [0.01, 100],
+  trailing_callback_pct: [0.1, 90],
+  // 0 disables the account-level side, so the lower bound is 0 rather than >0.
+  account_tp_roi_pct: [0, 10000],
+  account_sl_roi_pct: [0, 10000],
+});
+
+// describeSettingBounds() -> the authoritative table, rendered for the agent prompt.
+// State what is enforced, never what you think should be enforced.
+export function describeSettingBounds() {
+  const lines = Object.entries(SETTING_RANGES).map(([key, [min, max, integer]]) =>
+    `- ${key}: ${min} to ${max}${integer ? ' (whole number)' : ''}`);
+  lines.push('- leverage: any positive integer. The accepted band is published per symbol by the exchange and enforced by the venue, not by a limit in this table.');
+  for (const [key, values] of Object.entries(ENUMS)) lines.push(`- ${key}: ${values.join(' | ')}`);
+  lines.push('- symbol: 5-32 uppercase letters or digits');
+  lines.push('- timeframes: interval strings such as 1m, 5m, 15m, 1h, 1d — non-empty and unique');
+  lines.push(`- boolean settings: ${[...BOOLEAN_KEYS].join(', ')}`);
+  lines.push('- partial_tp_fractions: 1-10 numbers, each greater than 0 and at most 1, totalling at most 1');
+  lines.push('- partial_tp_roi_steps: 1-10 positive numbers, strictly increasing, same length as partial_tp_fractions');
+  return lines.join('\n');
+}
+
 export function validateSettings(s) {
   if (!isPlainObject(s)) return ['settings must be an object'];
   const errors = [];
@@ -209,34 +262,10 @@ export function validateSettings(s) {
   if (!validNumber(s.leverage) || s.leverage < 1 || !Number.isInteger(s.leverage)) {
     errors.push('leverage must be a positive integer');
   }
-  addRangeError(errors, 'min_confidence', s.min_confidence, 0, 100);
-  addRangeError(errors, 'tf_min_confidence', s.tf_min_confidence, 0, 100);
-  addRangeError(errors, 'min_agreeing_strategies', s.min_agreeing_strategies, 1, 100, true);
-  addRangeError(errors, 'min_eligible_timeframes', s.min_eligible_timeframes, 1, 20, true);
-  // 0 disables the gate, so the lower bound is 0 rather than >0. The score
-  // margin is a mean per qualifying timeframe, so its ceiling is one
-  // timeframe's whole book weight — see the note on netScore in scanner.js.
-  addRangeError(errors, 'min_efficiency', s.min_efficiency, 0, 100);
-  addRangeError(errors, 'min_adx', s.min_adx, 0, 100);
-  addRangeError(errors, 'min_score_margin', s.min_score_margin, 0, 146);
-  addRangeError(errors, 'signal_confirm_scans', s.signal_confirm_scans, 1, 100, true);
-  addRangeError(errors, 'cooldown_minutes', s.cooldown_minutes, 0, 1440, true);
-  addRangeError(errors, 'max_positions', s.max_positions, 1, 100, true);
-  addRangeError(errors, 'scan_interval_sec', s.scan_interval_sec, 5, 86400, true);
-  addRangeError(errors, 'guard_interval_sec', s.guard_interval_sec, 5, 86400, true);
-  addRangeError(errors, 'breakeven_threshold_pct', s.breakeven_threshold_pct, 0, 1000);
-  addRangeError(errors, 'trailing_trigger_roi_pct', s.trailing_trigger_roi_pct, 0, 10000);
-  addRangeError(errors, 'trailing_atr_multiple', s.trailing_atr_multiple, 0.01, 100);
-  addRangeError(errors, 'trailing_atr_strength_reduction', s.trailing_atr_strength_reduction, 0, 1);
-  addRangeError(errors, 'sl_liquidation_safety', s.sl_liquidation_safety, 0.01, 1);
-  addRangeError(errors, 'reversal_confidence', s.reversal_confidence, 0, 100);
-  addRangeError(errors, 'report_interval_sec', s.report_interval_sec, 5, 86400, true);
-  addRangeError(errors, 'mid_manage_interval_sec', s.mid_manage_interval_sec, 5, 86400, true);
-  addRangeError(errors, 'position_sizing_margin_pct', s.position_sizing_margin_pct, 0.01, 100);
-  addRangeError(errors, 'trailing_callback_pct', s.trailing_callback_pct, 0.1, 90);
-  // 0 disables the account-level side, so the lower bound is 0 rather than >0.
-  addRangeError(errors, 'account_tp_roi_pct', s.account_tp_roi_pct, 0, 10000);
-  addRangeError(errors, 'account_sl_roi_pct', s.account_sl_roi_pct, 0, 10000);
+  // Enforced from SETTING_RANGES so the prompt and the validator can never disagree.
+  for (const [key, [min, max, integer]] of Object.entries(SETTING_RANGES)) {
+    addRangeError(errors, key, s[key], min, max, integer);
+  }
 
   // Partial TP/SL ladder: the two arrays must line up, every step must be
   // positive, ROI steps must strictly increase, and the fractions must not
@@ -357,4 +386,51 @@ export function parseSettingValue(key, raw) {
     return value;
   }
   return raw;
+}
+
+// --- Natural-language settings routing --------------------------------------------------
+// "set the margin risk to 30" arrived as chat text, went to the model, and was refused
+// with an invented ceiling — while the alias table already held the words the owner used
+// (margin_risk_pct). Nothing routed a sentence to it. parseNaturalSetting() matches a
+// plain sentence to an alias so it takes the identical validated path as /set.
+const NL_PHRASES = {
+  'margin risk pct': 'margin_risk_pct',
+  'margin risk percentage': 'margin_risk_pct',
+  'margin risk': 'margin_risk_pct',
+  'margin percentage': 'margin_risk_pct',
+  'margin amount': 'margin_risk_pct',
+  'risk per trade': 'position_sizing_margin_pct',
+  'position sizing': 'position_sizing_margin_pct',
+  'position size': 'position_sizing_margin_pct',
+  'position margin': 'position_sizing_margin_pct',
+  'min confidence': 'min_confidence',
+  'confidence': 'min_confidence',
+  'efficiency': 'min_efficiency',
+  'adx': 'min_adx',
+  'score margin': 'min_score_margin',
+  'cooldown': 'cooldown_minutes',
+  'max positions': 'max_positions',
+};
+
+// parseNaturalSetting(text) -> { key, value } | null
+// Only an explicit imperative counts; anything else stays a question for the agent.
+export function parseNaturalSetting(text) {
+  const raw = String(text || '').trim();
+  if (!raw || raw.startsWith('/')) return null;
+  if (!/^(please\s+)?(set|change|update|adjust|make|put|raise|increase|lower|reduce|switch|use|set\s+the)\b/i.test(raw)) return null;
+
+  const normalized = raw.toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+  // Longest phrase wins, so "position sizing" beats a bare "sizing".
+  const phrase = Object.keys(NL_PHRASES)
+    .filter(p => normalized.includes(p))
+    .sort((a, b) => b.length - a.length)[0];
+  if (!phrase) return null;
+
+  // Prefer a number after the value preposition ("to", "at", "="), else the last one.
+  const tail = normalized.split(/\b(?:to|at|=|as)\b/).pop() || '';
+  const found = tail.match(/\d+(?:\.\d+)?/g) || normalized.match(/\d+(?:\.\d+)?/g);
+  if (!found || !found.length) return null;
+
+  const canonical = resolveSettingKey(NL_PHRASES[phrase]);
+  return { key: canonical, value: parseSettingValue(canonical, found[found.length - 1]) };
 }

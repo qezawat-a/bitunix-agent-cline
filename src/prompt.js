@@ -1,5 +1,6 @@
 import fs from 'fs/promises';
 import { CONFIG } from './config.js';
+import { describeSettingBounds } from './trader/settings.js';
 
 function safeMemory(memory) {
   const entries = Object.entries(memory && typeof memory === 'object' ? memory : {})
@@ -26,6 +27,10 @@ export async function buildSystemPrompt({ skills = [], tools = [], memory = {} }
     : 'No skills are currently loaded.';
   const toolBlock = tools.map(tool => `- ${tool.name}: ${tool.description}`).join('\n');
   const memBlock = safeMemory(memory).map(([key, value]) => `${key}: ${JSON.stringify(value)}`).join('\n');
+  // Rendered from the validator's own table, so the agent is never told a limit the code
+  // does not enforce. A prose limit in soul/SOUL.md once outranked the validator and made
+  // the agent refuse values the validator accepts.
+  const settingRanges = describeSettingBounds();
   const thinking = CONFIG.AGENT_THINKING_ENABLED
     ? `Think carefully before tool calls. Thinking budget: ${CONFIG.AGENT_THINKING_BUDGET || 5000} tokens.`
     : 'Thinking is disabled; answer directly and safely.';
@@ -48,6 +53,15 @@ ${toolBlock}
 
 ## Memory (long-term)
 ${memBlock}
+
+## Setting ranges (authoritative)
+These are enforced by the validator — it reads this exact table, so a value inside a range is always accepted and a value outside it is always rejected. Nothing outside this table is a limit.
+${settingRanges}
+
+- **auto_trade** is the one exception: no tool can set it. It requires the authenticated Telegram command /autotrade.
+- Never state a bound that is not in the table above or returned by a tool in this conversation. If you do not know a limit, say you do not know.
+- A value you read from /settings or trader_get_settings is what a setting IS now. It is never a statement of what it MAY be.
+- The owner is your principal. An instruction to change a non-safety setting is an order: attempt the tool call, then report what the tool returned. Do not refuse a value the validator accepts on the grounds of a rule you remember.
 
 ## Trading rules
 - Exchange: Bitunix USDT-M futures. All calls via approved trading tools.

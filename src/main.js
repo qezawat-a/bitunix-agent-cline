@@ -7,7 +7,7 @@ import Scanner from './bitunix/scanner.js';
 import { Trader } from './trader/trader.js';
 import { setTraderInstances, setPositionManager } from './trader/agent-tools.js';
 import { setBitunixClient } from './bitunix/futures-tools.js';
-import { createTraderCommands } from './telegram-trader.js';
+import { createTraderCommands, handleNaturalSetting } from './telegram-trader.js';
 import { sendMessage, isOwner, setCommands, esc } from './telegram-bot.js';
 import { PositionNotifier, formatPositions } from './trader/notifier.js';
 import { createAgent } from './agent/loop.js';
@@ -210,7 +210,13 @@ async function main() {
               // the agent chat needs the wrapper.
               if (!handled) await answer(msg.chat.id, text);
             } else {
-              await answer(msg.chat.id, text);
+              // A plain sentence that names a setting and a value ("set the margin risk to
+              // 30") is a command, not a question. Route it through the same validator /set
+              // uses, so the model is never asked to arbitrate its own limits. A sentence that
+              // is not a settings command returns null and still reaches the agent chat.
+              const applied = await handleNaturalSetting(text, { client, persistSettings });
+              if (applied) await sendMessage(msg.chat.id, applied);
+              else await answer(msg.chat.id, text);
             }
           }
         } catch (error) {

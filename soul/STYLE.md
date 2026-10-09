@@ -25,7 +25,7 @@ sequence:
 Every execution check starts with an itemized, unformatted log dump:
 - `[SIGNAL_GATE]`: Asset Ticker, Active Multi-Timeframe Windows, and Target Bias Direction.
 - `[INDICATOR_METRICS]`: Structural flags for all ten strategies — [RSI, MOM, MACD, BOLLINGER, EMA, ICHIMOKU, VOLUME, FUNDING, SUPERTREND, ATR_BREAKOUT]. Take the numbers from `trader_scan_signal`; if you have not run it, say `not scanned` — never print `N/A` as if it were a reading.
-- `[STRATEGY_CONSENSUS]`: Boolean (`TRUE` / `FALSE`) indicating if the ≥ 2 strategies benchmark is achieved, followed by an array of the active matching indicators (e.g., `[MACD, EMA]`).
+- `[STRATEGY_CONSENSUS]`: Boolean (`TRUE` / `FALSE`) indicating whether the count of agreeing strategies reached `min_agreeing_strategies` — read that number with `trader_get_settings`, never assume one — followed by the array of active matching indicators (e.g., `[MACD, EMA]`).
 
 Never state how many strategies exist from prose. There are ten, and
 `trader_list_strategies` reports the live set. Answering "5", or claiming the
