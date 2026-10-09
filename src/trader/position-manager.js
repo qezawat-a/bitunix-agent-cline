@@ -512,15 +512,22 @@ export class PositionManager {
     };
   }
 
+  // Returns the position's ATR or throws with a message that includes the
+  // fallbacks tried, so a silent failure can never hide trailing. The Position
+  // Channel's `atr` is preferred (fresh, free of a round-trip), then 15m, then
+  // 1h as a last resort for coins whose short tick is too thin.
   async getAtrForPosition(position) {
     if (finitePositive(position.atr)) return Number(position.atr);
-    const klines = await this.client.getKlines(position.symbol || this.symbol, '15m', 60);
-    const highs = klines.map(k => Number(k.high));
-    const lows = klines.map(k => Number(k.low));
-    const closes = klines.map(k => Number(k.close));
-    const value = calculateAtr(highs, lows, closes, 14);
-    if (!finitePositive(value)) throw new Error(`ATR unavailable for ${position.positionId}`);
-    return value;
+    for (const timeframe of ['15m', '1h']) {
+      const klines = await this.client.getKlines(position.symbol || this.symbol, timeframe, 60);
+      if (klines.length < 15) continue;
+      const highs = klines.map(k => Number(k.high));
+      const lows = klines.map(k => Number(k.low));
+      const closes = klines.map(k => Number(k.close));
+      const value = calculateAtr(highs, lows, closes, 14);
+      if (finitePositive(value)) return value;
+    }
+    throw new Error(`ATR unavailable for ${position.positionId} (position.atr missing, 15m and 1h series too short or invalid)`);
   }
 
   async placeTPSL(positionId, entryPrice, direction, atr, confidence) {
@@ -917,7 +924,9 @@ export class PositionManager {
     if (this.favorableRoiPct(position) >= Number(this.settings.trailing_trigger_roi_pct)) {
       const atr = await this.getAtrForPosition(position);
       const strength = Math.max(0, Math.min(100, Number(position.signalConfidence ?? this.settings.min_confidence))) / 100;
-      const trailDistance = atr * (1.25 - strength * 0.25);
+      const multiple = Number(this.settings.trailing_atr_multiple) || 1.25;
+      const reduction = Number(this.settings.trailing_atr_strength_reduction) || 0.25;
+      const trailDistance = atr * (multiple - strength * reduction);
       const newSL = position.side === 'BUY' ? mark - trailDistance : mark + trailDistance;
       const current = await this.currentStop(position);
       if (!finitePositive(newSL) || !this.shouldTighten(position, newSL, current)) return { skipped: 'trailing would loosen stop' };

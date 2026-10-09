@@ -17,6 +17,8 @@ export const DEFAULTS = {
   guard_interval_sec: 15,
   breakeven_threshold_pct: 20,
   trailing_trigger_roi_pct: 25,
+  trailing_atr_multiple: 1.25,
+  trailing_atr_strength_reduction: 0.25,
   sl_liquidation_safety: 0.60,
   on_tpsl_failure: 'close',
   reversal_enabled: true,
@@ -203,6 +205,8 @@ export function validateSettings(s) {
   addRangeError(errors, 'guard_interval_sec', s.guard_interval_sec, 5, 86400, true);
   addRangeError(errors, 'breakeven_threshold_pct', s.breakeven_threshold_pct, 0, 1000);
   addRangeError(errors, 'trailing_trigger_roi_pct', s.trailing_trigger_roi_pct, 0, 10000);
+  addRangeError(errors, 'trailing_atr_multiple', s.trailing_atr_multiple, 0.01, 100);
+  addRangeError(errors, 'trailing_atr_strength_reduction', s.trailing_atr_strength_reduction, 0, 1);
   addRangeError(errors, 'sl_liquidation_safety', s.sl_liquidation_safety, 0.01, 1);
   addRangeError(errors, 'reversal_confidence', s.reversal_confidence, 0, 100);
   addRangeError(errors, 'report_interval_sec', s.report_interval_sec, 5, 86400, true);
