@@ -1732,13 +1732,18 @@ describe('signal confidence separates agreement from breadth', async () => {
       direction, alignedWeight, opposedWeight, activeWeight,
       sideAgreement: activeWeight === 0 ? 0
         : Math.round((direction === 'bullish' ? alignedWeight : opposedWeight) / activeWeight * 100),
+      // agreement now measures the direction that actually won, not a fixed
+      // bullish frame — this is why the helper matches computeSignal exactly.
+      agreement: direction === 'neutral' || activeWeight === 0 ? 0
+        : (direction === 'bullish' ? alignedWeight : opposedWeight) / activeWeight,
     };
   };
 
-  // confidence = agreement x breadth-scaling, with 146 total weight and a 40%
-  // breadth floor. Duplicated here rather than imported because the constants
-  // live inside computeSignal; if either moves, the expectations below fail
-  // loudly instead of drifting.
+  // confidence = winning-side agreement x breadth-scaling, with 146 total
+  // weight and a 40% breadth floor. Duplicated here rather than imported
+  // because the constants live inside computeSignal; if either moves, the
+  // expectations below fail loudly instead of drifting. First param is the
+  // weight backing the direction that won (bullish or bearish).
   const confidenceFor = (aligned, opposed) => {
     const totalWeight = 146, breadthFloor = 0.4;
     const activeWeight = aligned + opposed;
@@ -1756,13 +1761,14 @@ describe('signal confidence separates agreement from breadth', async () => {
 
   // The reported line was "1m: bearish 0% 0/88w (6/10)": six of ten strategies
   // bearish, zero bullish, and the confidence printed beside "bearish" was 0%.
-  // confidence is measured on the bullish frame, so a one-sided bearish reading
-  // — the entire speaking book bearish — rendered as "no opinion".
+  // That was the old buggy output, measured on a fixed bullish frame. The fix
+  // measures agreement on the direction that actually won, so a one-sided
+  // bearish reading now reports 100% instead of 0%.
   it('reports the agreement of the direction that actually won', () => {
     const result = scores(downtrend());
     assert.equal(result.direction, 'bearish');
     assert.equal(result.alignedWeight, 0, 'nothing bullish fired');
-    assert.equal(result.agreement, 0, 'the bullish-frame agreement is genuinely 0');
+    assert.equal(result.agreement, 100, 'the winning side (bearish) is unanimous');
     assert.ok(result.opposedWeight > 0, 'but plenty did fire, all bearish');
     assert.equal(result.sideAgreement, 100, 'so the winning side is unanimous');
     // And the number printed next to a bullish reading is still bullish-frame.
@@ -1770,7 +1776,7 @@ describe('signal confidence separates agreement from breadth', async () => {
   });
 
   it('keeps a split reading honest on both sides', () => {
-    const split = { bullish: ['ema', 'macd', 'supertrend'], bearish: ['rsi', 'momentum', 'adx'] };
+    const split = { bullish: ['ema', 'macd', 'supertrend'], bearish: ['rsi', 'momentum', 'ichimoku'] };
     const result = scoresFrom(split);
     assert.ok(result.sideAgreement > 40 && result.sideAgreement < 60,
       `a genuinely split book must not read as one-sided, got ${result.sideAgreement}`);
@@ -1925,6 +1931,7 @@ describe('the /signal report renders a real scan result', () => {
         confidence: 62,
         alignedWeight: 3,
         activeWeight: 5,
+        sideAgreement: 60,
         strategyDirections: { macd: 'bullish', ema: 'bullish', rsi: 'bearish', vwap: 'bullish', atr: 'neutral' },
       },
       '1h': {
@@ -1932,6 +1939,7 @@ describe('the /signal report renders a real scan result', () => {
         confidence: 41,
         alignedWeight: 1,
         activeWeight: 5,
+        sideAgreement: 80,
         strategyDirections: { macd: 'bearish', ema: 'bullish', rsi: 'bearish', vwap: 'neutral', atr: 'neutral' },
       },
     },
@@ -1947,13 +1955,13 @@ describe('the /signal report renders a real scan result', () => {
   it('counts the strategies that ran rather than assuming ten', () => {
     // A strategy with no usable series is absent from the map, so a hardcoded
     // "/10" would report a denominator wider than the ones that produced it.
-    const res = scan({ tfSignals: { '5m': { direction: 'bullish', confidence: 90, alignedWeight: 2, activeWeight: 2, strategyDirections: { macd: 'bullish', ema: 'bullish' } } } });
+    const res = scan({ tfSignals: { '5m': { direction: 'bullish', confidence: 90, alignedWeight: 2, activeWeight: 2, sideAgreement: 100, strategyDirections: { macd: 'bullish', ema: 'bullish' } } } });
     assert.match(formatSignalReport(res), /\(2\/2\)/);
   });
 
   it('survives a timeframe with no strategy detail at all', () => {
     for (const missing of [{}, { strategyDirections: null }, { strategyDirections: undefined }]) {
-      const res = scan({ tfSignals: { '5m': { direction: 'neutral', confidence: 0, alignedWeight: 0, activeWeight: 0, ...missing } } });
+      const res = scan({ tfSignals: { '5m': { direction: 'neutral', confidence: 0, alignedWeight: 0, activeWeight: 0, sideAgreement: 0, ...missing } } });
       const html = formatSignalReport(res);
       assert.match(html, /\(0\/0\)/, JSON.stringify(missing));
     }
@@ -1963,7 +1971,7 @@ describe('the /signal report renders a real scan result', () => {
     const html = formatSignalReport(scan());
     assert.match(html, /HOLD because/);
     assert.match(html, /min_confidence/, 'raw confidence below the gate must be shown');
-    assert.match(html, /timeframes split 1\/1/, 'the timeframe quorum failure must be shown');
+    assert.match(html, /only 1 of 2 timeframes cleared/, 'the timeframe quorum failure must be shown');
   });
 });
 
@@ -2264,7 +2272,7 @@ describe('every message the bot sends is valid Telegram HTML', () => {
     agreeingStrategies: 3, lastPrice: 2.3205,
     tfSignals: {
       '15m': { direction: 'bullish', confidence: 62, alignedWeight: 3, activeWeight: 5,
-        strategyDirections: { macd: 'bullish', ema: 'bullish', rsi: 'bearish', vwap: 'bullish', atr: 'neutral' } },
+        sideAgreement: 60, strategyDirections: { macd: 'bullish', ema: 'bullish', rsi: 'bearish', vwap: 'bullish', atr: 'neutral' } },
     },
     ...over,
   });
@@ -2289,7 +2297,7 @@ describe('every message the bot sends is valid Telegram HTML', () => {
   it('stays valid when a symbol or direction carries angle brackets', () => {
     const hostile = scan({
       symbol: '<script>', rawDirection: '<b>', lastPrice: '<999>',
-      tfSignals: { '15m': { direction: '<i>', confidence: 1, alignedWeight: 0, activeWeight: 0, strategyDirections: {} } },
+      tfSignals: { '15m': { direction: '<i>', confidence: 1, alignedWeight: 0, activeWeight: 0, sideAgreement: 0, strategyDirections: {} } },
     });
     assertValid(formatSignalReport(hostile), 'formatSignalReport (hostile input)');
   });
@@ -2325,13 +2333,13 @@ describe('the signal report explains every hold', () => {
   // reason is the one output the operator cannot act on.
   const oneEligible = {
     symbol: 'MOVRUSDT', signal: 'hold', rawDirection: 'bullish', rawConfidence: 93,
-    eligibleTimeframes: 1, timeframesAgree: true, alignedTimeframes: 1,
+    eligibleTimeframes: 1, timeframesAgree: false, alignedTimeframes: 1,
     agreeingStrategies: 5, lastPrice: 2.4092,
     tfSignals: {
-      '1m': { direction: 'bearish', confidence: 0, alignedWeight: 0, activeWeight: 70, strategyDirections: {} },
-      '3m': { direction: 'bearish', confidence: 18, alignedWeight: 18, activeWeight: 98, strategyDirections: {} },
-      '5m': { direction: 'bullish', confidence: 93, alignedWeight: 82, activeWeight: 88, strategyDirections: {} },
-      '15m': { direction: 'bearish', confidence: 18, alignedWeight: 18, activeWeight: 102, strategyDirections: {} },
+      '1m': { direction: 'bearish', confidence: 0, alignedWeight: 0, activeWeight: 70, sideAgreement: 100, strategyDirections: {} },
+      '3m': { direction: 'bearish', confidence: 18, alignedWeight: 18, activeWeight: 98, sideAgreement: 82, strategyDirections: {} },
+      '5m': { direction: 'bullish', confidence: 93, alignedWeight: 82, activeWeight: 88, sideAgreement: 93, strategyDirections: {} },
+      '15m': { direction: 'bearish', confidence: 18, alignedWeight: 18, activeWeight: 102, sideAgreement: 82, strategyDirections: {} },
     },
   };
 
@@ -2365,7 +2373,7 @@ describe('the signal report explains every hold', () => {
       ...oneEligible,
       rawDirection: 'neutral', rawConfidence: 40, agreeingStrategies: 0, timeframesAgree: false,
     });
-    for (const expected of ['weighted vote is neutral', 'timeframes split', 'confidence 40 below', 'strategies', 'timeframes cleared tf_min_confidence']) {
+    for (const expected of ['weighted vote is neutral', 'confidence 40 below', 'strategies', 'timeframes cleared tf_min_confidence']) {
       assert.match(html, new RegExp(expected), `missing reason: ${expected}`);
     }
   });
@@ -2680,20 +2688,20 @@ describe('the declared strategy set is the set the scanner scores', () => {
     assert.equal(described.length, 10);
     assert.deepEqual(
       described.map(s => s.name),
-      ['EMA', 'RSI', 'MACD', 'VOLUME', 'MOM', 'ADX', 'BBB', 'FUNDING', 'SUPERTREND', 'ATR_BREAKOUT'],
+      ['EMA', 'RSI', 'MACD', 'VOLUME', 'MOM', 'ICHIMOKU', 'BOLLINGER', 'FUNDING', 'SUPERTREND', 'ATR_BREAKOUT'],
     );
     // The names the agent was told about by name.
-    for (const expected of ['EMA', 'RSI', 'MACD', 'SUPERTREND', 'MOM', 'BBB', 'VOLUME', 'ATR_BREAKOUT', 'FUNDING']) {
+    for (const expected of ['EMA', 'RSI', 'MACD', 'SUPERTREND', 'MOM', 'BOLLINGER', 'VOLUME', 'ATR_BREAKOUT', 'FUNDING', 'ICHIMOKU']) {
       assert.ok(described.some(s => s.name === expected), `${expected} is in the set`);
     }
   });
 
-  it('does not silently contain ICHIMOKU, which was asked for but never implemented', () => {
-    // The user asked to set EMA,RSI,MACD,SUPERTREND,MOMENTUM,ICHIMOKU,BOLLINGER,
-    // VOLUME,ATR_BREAKOUT,FUNDING_RATE. Ichimoku is not implemented; ADX is the
+  it('does not silently contain ADX, which was replaced by ICHIMOKU', () => {
+    // The user asked for EMA,RSI,MACD,SUPERTREND,MOMENTUM,ICHIMOKU,BOLLINGER,
+    // VOLUME,ATR_BREAKOUT,FUNDING_RATE. ICHIMOKU is now implemented; ADX is the
     // strategy that list missed. The agent must be able to see that from the
     // tool rather than agreeing that Ichimoku is already active.
-    assert.ok(!STRATEGY_KEYS.includes('ichimoku'));
-    assert.ok(STRATEGY_KEYS.includes('adx'));
+    assert.ok(STRATEGY_KEYS.includes('ichimoku'), 'ICHIMOKU is the new strategy');
+    assert.ok(!STRATEGY_KEYS.includes('adx'), 'ADX no longer scores');
   });
 });

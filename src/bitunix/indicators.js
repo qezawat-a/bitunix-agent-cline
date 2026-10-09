@@ -25,8 +25,8 @@ export const STRATEGIES = Object.freeze([
   { key: 'macd', label: 'MACD', weight: 18, reads: 'MACD 12/26/9 histogram + signal cross' },
   { key: 'volume', label: 'VOLUME', weight: 10, reads: 'volume expansion confirmed by the candle' },
   { key: 'momentum', label: 'MOM', weight: 14, reads: 'MOM(10) velocity and velocity shift' },
-  { key: 'adx', label: 'ADX', weight: 14, reads: 'ADX(14) trend strength and +DI/-DI bias' },
-  { key: 'bollinger', label: 'BBB', weight: 12, reads: 'Bollinger(20,2) band pierce / squeeze' },
+  { key: 'ichimoku', label: 'ICHIMOKU', weight: 14, reads: 'Ichimoku Kinko Hyo cloud, Tenkan/Kijun cross, Chikou' },
+  { key: 'bollinger', label: 'BOLLINGER', weight: 12, reads: 'Bollinger(20,2) band pierce / squeeze' },
   { key: 'funding', label: 'FUNDING', weight: 6, reads: 'funding rate crowding' },
   { key: 'supertrend', label: 'SUPERTREND', weight: 18, reads: 'SuperTrend(10,3) flip side' },
   { key: 'atr_breakout', label: 'ATR_BREAKOUT', weight: 22, reads: 'ATR(14) channel breakout' },
@@ -285,6 +285,43 @@ export function adxDirection(highs, lows, closes, period = 14) {
   return { value, direction: value < 25 ? 'neutral' : plusD > minusD ? 'bullish' : minusD > plusD ? 'bearish' : 'neutral', recent };
 }
 
+// Ichimoku Kinko Hyo: Tenkan-sen (9), Kijun-sen (26), Senkou spans A/B (26/52
+// projected 26 ahead), Chikou Span (shifted back 26). Three independent factors
+// decide: close above both cloud spans, Tenkan > Kijun, and Chikou above the
+// close from 26 periods ago. Two or more of three bullish -> bullish; bearish
+// -> bearish; otherwise neutral.
+function maxN(arr, n) {
+  let m = -Infinity;
+  for (let i = arr.length - n; i < arr.length; i++) m = Math.max(m, arr[i]);
+  return m;
+}
+
+function minN(arr, n) {
+  let m = Infinity;
+  for (let i = arr.length - n; i < arr.length; i++) m = Math.min(m, arr[i]);
+  return m;
+}
+
+export function ichimoku(closes, highs, lows) {
+  if (!validSeries(closes) || !validSeries(highs) || !validSeries(lows) || closes.length < 53) return 'neutral';
+  const tenkan = (maxN(highs, 9) + minN(lows, 9)) / 2;
+  const kijun = (maxN(highs, 26) + minN(lows, 26)) / 2;
+  const spanA = (tenkan + kijun) / 2;
+  const spanB = (maxN(highs, 52) + minN(lows, 52)) / 2;
+  const close = closes.at(-1);
+  const chikouIdx = closes.length - 1 - 26;
+  const chikou = chikouIdx >= 0 ? closes[chikouIdx] : close;
+  const chikouPastHigh = chikouIdx >= 0 ? highs[chikouIdx] : close;
+  let bullish = 0, bearish = 0;
+  if (close > spanA && close > spanB) bullish++;
+  else if (close < spanA && close < spanB) bearish++;
+  if (tenkan > kijun) bullish++;
+  else if (tenkan < kijun) bearish++;
+  if (chikou > chikouPastHigh) bullish++;
+  else if (chikou < chikouPastHigh) bearish++;
+  return bullish > bearish ? 'bullish' : bearish > bullish ? 'bearish' : 'neutral';
+}
+
 export function computeSignal(symbolKlines, volumes, fundingRate) {
   if (!Array.isArray(symbolKlines) || symbolKlines.length < 60) throw new Error('at least 60 valid klines are required');
   if (!validSeries(volumes) || volumes.length < symbolKlines.length || volumes.length < 20) throw new Error('valid volume for every kline is required');
@@ -324,8 +361,8 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
   const momentum = momentumScore(closes, 10);
   add('momentum', momentum > 0.15 ? 'bullish' : momentum < -0.15 ? 'bearish' : 'neutral', momentum);
 
-  const adxResult = adxDirection(highs, lows, closes, 14);
-  add('adx', adxResult.direction, adxResult.value);
+  const ichimokuResult = ichimoku(highs, lows, closes);
+  add('ichimoku', ichimokuResult || 'neutral', 'cloud');
 
   const bands = bollinger(closes, 20, 2);
   add('bollinger', bands && last > bands.upper ? 'bullish' : bands && last < bands.lower ? 'bearish' : 'neutral', bands);
@@ -359,29 +396,29 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
   const totalWeight = Object.values(weights).reduce((sum, value) => sum + value, 0);
   const activeWeight = alignedWeight + opposedWeight;
   const direction = score > 0 ? 'bullish' : score < 0 ? 'bearish' : 'neutral';
-  const agreement = direction === 'neutral' || activeWeight === 0 ? 0 : alignedWeight / activeWeight;
+  const agreement = direction === 'neutral' || activeWeight === 0
+    ? 0
+    : (direction === 'bullish' ? alignedWeight : opposedWeight) / activeWeight;
   // How much of the speaking book backs the direction that actually won.
   //
-  // `agreement` above is measured in the fixed bullish frame — it is aligned
-  // (bullish) weight over active weight — so on a bearish timeframe it reads
-  // 0% even when every strategy that spoke is bearish. Printing that next to
-  // the word "bearish" made a one-sided reading look like nothing was
-  // happening: "1m: bearish 0% 0/88w (6/10)" was six of ten strategies bearish
-  // and 100% of the speaking weight bearish, reported as 0%.
+  // agreement, sideAgreement, and confidence now all describe the same thing:
+  // the weight backing the direction that actually won, and they cannot lie
+  // about a one-sided reading anymore.
   //
-  // This is the same fraction taken on the winning side, so a row's headline
-  // number describes the direction printed beside it.
+  //   agreement  — of the active (speaking) weight, how much backed the
+  //                winning direction? (alignedWeight / activeWeight)
+  //   sideAgreement — agreement expressed as a round percentage, the number
+  //                 printed next to the direction in the /signal row.
+  //   confidence — agreement scaled by breadth (activeWeight / totalWeight),
+  //                floored at a 0.4 breadth so a thin consensus does not pass
+  //                as a broad one, then capped at 100.
   //
-  // It is NOT the number the gates read. On a bearish timeframe sideAgreement
-  // can be 100% while confidence is 0%: nothing bullish fired, so the
-  // bullish-frame agreement is zero, and no gate can ever be satisfied by a
-  // one-sided bearish reading. Printing only sideAgreement produced
-  // "3m: bearish 100% 0/102w (7/10)" on the same screen as "only 0 of 4
-  // timeframes cleared tf_min_confidence" — two different numbers presented as
-  // one, which reads as a contradiction. Both are now shown side by side.
-  const sideAgreement = activeWeight === 0
-    ? 0
-    : Math.round((direction === 'bullish' ? alignedWeight : opposedWeight) / activeWeight * 100);
+  // A one-sided bullish reading now reports 100% (all active weight agrees);
+  // a one-sided bearish reading reports 100% on the bearish side too —
+  // opposedWeight is just alignedWeight viewed from the other direction. No
+  // fixed frame, no dead gates, no contradiction between the row and the
+  // confidence gate that clears it.
+  const sideAgreement = activeWeight === 0 ? 0 : Math.round(agreement * 100);
   const breadth = totalWeight === 0 ? 0 : activeWeight / totalWeight;
   const confidence = direction === 'neutral' || totalWeight === 0
     ? 0
@@ -398,9 +435,6 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
     opposedWeight,
     agreement: Math.round(agreement * 100),
     sideAgreement,
-    // The bullish-frame agreement the gates actually read, named for what it is
-    // so a report can print it beside sideAgreement without confusing the two.
-    bullishAgreement: Math.round(agreement * 100),
     breadth: Math.round(breadth * 100),
     // Exposed so the scanner report can show how much of the strategy set
     // actually voted, instead of a confidence number that hides the abstentions.
@@ -409,7 +443,6 @@ export function computeSignal(symbolKlines, volumes, fundingRate) {
     atr: atr(highs, lows, closes, 14),
     last,
     rsi: rsiValue,
-    adx: adxResult.value,
     momentum,
     volumeRatio: volumeValue,
   };

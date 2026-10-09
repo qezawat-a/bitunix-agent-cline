@@ -142,20 +142,19 @@ export function formatSignalReport(res) {
     .map(([tf, s]) => {
       const names = Object.keys(s.strategyDirections || {});
       const agreeing = Object.values(s.strategyDirections || {}).filter(d => d === s.direction).length;
-      // Two numbers, because they answer different questions and printing only
-      // one made this screen contradict itself.
+      // Two numbers, because they answer different questions:
       //
       //   agreement — the share of the speaking book backing THIS row's
       //               direction. "bearish 100%" means every strategy that fired
-      //               was bearish.
-      //   conf      — the gate number, measured on the bullish frame. It is 0%
-      //               on any one-sided bearish reading, because no bullish
-      //               weight fired, so no gate can be cleared on that row.
+      //               was bearish. It now measures the winning side, so a
+      //               one-sided bearish reading reports 100% instead of 0%.
+      //   conf      — the gate number: agreement scaled by breadth
+      //               (activeWeight / totalWeight) and capped at 100. No
+      //               timeframe can clear this unless enough of the book voted.
       //
-      // Showing only the first produced "3m: bearish 100% 0/102w (7/10)" above
-      // "only 0 of 4 timeframes cleared tf_min_confidence": the 100% is real and
-      // the 0 of 4 is real, they are just different measurements.
-      const shown = s.sideAgreement ?? s.confidence;
+      // The headline number now matches the direction printed beside it, and
+      // the confidence gate that sits below is the same number the row used.
+      const shown = s.sideAgreement;
       return `${esc(tf)}: ${esc(s.direction)} <code>${esc(String(shown))}</code>% `
         + `(<code>${esc(String(s.confidence))}</code>% conf) `
         + `<code>${esc(String(s.alignedWeight))}</code>/<code>${esc(String(s.activeWeight))}</code>w `
@@ -167,14 +166,15 @@ export function formatSignalReport(res) {
   const reasons = [];
   if (res.rawDirection === 'neutral') reasons.push('weighted vote is neutral');
   if (!res.timeframesAgree) {
-    // "0/0" on its own is unreadable: it looks like a counter that failed to
-    // run. It means no timeframe cleared tf_min_confidence at all, so the vote
-    // had nothing to weigh — say that instead.
-    reasons.push(
-      (res.eligibleTimeframes || 0) === 0
-        ? `no timeframe cleared tf_min_confidence ${esc(String(CONFIG.tf_min_confidence))}, so no timeframe was eligible to vote`
-        : `timeframes split ${esc(String(res.alignedTimeframes))}/${esc(String(res.eligibleTimeframes))}`,
-    );
+    const minTimeframes = Math.max(1, Number(CONFIG.min_eligible_timeframes) || 1);
+    const eligible = res.eligibleTimeframes || 0;
+    if (eligible === 0) {
+      reasons.push(`no timeframe cleared tf_min_confidence ${esc(String(CONFIG.tf_min_confidence))}, so no timeframe was eligible to vote`);
+    } else if (eligible < minTimeframes) {
+      reasons.push(`only ${esc(String(eligible))} of ${esc(String(Object.keys(res.tfSignals || {}).length))} timeframes cleared tf_min_confidence, min_eligible_timeframes is ${esc(String(minTimeframes))}`);
+    } else {
+      reasons.push(`timeframes split ${esc(String(res.alignedTimeframes))}/${esc(String(eligible))}`);
+    }
   }
   // res.confidence is 0 for a rejected signal, so the raw reading is what has
   // to be compared against the gate — reporting the 0 is what made a healthy
@@ -190,15 +190,6 @@ export function formatSignalReport(res) {
   }
   if ((res.agreeingStrategies || 0) < CONFIG.min_agreeing_strategies) {
     reasons.push(`${esc(String(res.agreeingStrategies))} strategies, min_agreeing_strategies is ${esc(String(CONFIG.min_agreeing_strategies))}`);
-  }
-  // The timeframe-count gate is the one that decides a hold most of the time
-  // and it was missing here, so the report printed "All gates passed" next to
-  // "Direction: hold" — the only gate that had actually failed was the one
-  // nobody was shown. It is derived from the same fields the header prints, so
-  // no new field is needed to explain the hold.
-  const minTimeframes = Math.max(1, Number(CONFIG.min_eligible_timeframes) || 1);
-  if ((res.eligibleTimeframes || 0) < minTimeframes) {
-    reasons.push(`only ${esc(String(res.eligibleTimeframes))} of ${esc(String(Object.keys(res.tfSignals || {}).length))} timeframes cleared tf_min_confidence, min_eligible_timeframes is ${esc(String(minTimeframes))}`);
   }
   // The gate text is what the operator reads when nothing trades, so it has to
   // agree with the direction printed above it. Deriving the verdict the same way
