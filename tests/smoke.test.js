@@ -1279,7 +1279,7 @@ describe('telegram settings persistence and autotrade', () => {
   it('persists the store after /set, /leverage and /symbol', async () => {
     const saves = [];
     const { handleCommand } = createTraderCommands({
-      client: { getPendingPositions: async () => [], changeLeverage: async () => ({}) },
+      client: { getPendingPositions: async () => [], changeLeverage: async () => ({}), getTradingPairs: async symbol => [{ symbol, symbolStatus: 'OPEN' }] },
       scanner: {}, trader: {}, agent: {},
       persistSettings: async () => { saves.push({ ...CONFIG }); },
     });

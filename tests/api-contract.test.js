@@ -1472,7 +1472,8 @@ describe('moving the stop never deletes the take-profit', () => {
     // The take-profit must survive the stop move, or break-even deletes it.
     assert.equal(modifies[0].tpPrice, '120');
     assert.equal(modifies[0].tpStopType, 'MARK_PRICE');
-    assert.equal(modifies[0].tpOrderType, 'MARKET');
+    // modify_position_tp_sl_order documents no tpOrderType, so it must not be sent.
+    assert.equal('tpOrderType' in modifies[0], false);
   });
 
   it('preserves the take-profit across a trailing stop move too', async () => {

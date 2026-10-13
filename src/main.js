@@ -235,6 +235,15 @@ async function main() {
 
   let stopping = false;
   let scanTimer = null;
+  // Entry refusals and failures used to go to the console only, so a tradeable
+  // signal with no position looked like a bot that was ignoring you.
+  const tradeNotices = new Map();
+  async function noticeTrade(key, text) {
+    const now = Date.now();
+    if (now - (tradeNotices.get(key) || 0) < 600000) return;
+    tradeNotices.set(key, now);
+    if (CONFIG.ALLOWED_USER_ID) await sendMessage(CONFIG.ALLOWED_USER_ID, text).catch(() => {});
+  }
   async function runScanCycle() {
     if (stopping) return;
     try {
@@ -248,13 +257,24 @@ async function main() {
           // a separate step, and it has to happen here: without this call the
           // autonomous loop reports signals to Telegram but never trades, so
           // /autotrade on appears to do nothing.
-          if (CONFIG.auto_trade && ['bullish', 'bearish'].includes(signal.signal)) {
-            const result = await trader.executeSignal(signal);
-            if (result?.executed) {
-              console.log(`[trade] ${CONFIG.symbol} ${signal.signal} @ ${result.price}`);
-            } else if (result?.reason) {
-              console.log(`[trade] skipped: ${result.reason}`);
+          const tradeable = ['bullish', 'bearish'].includes(signal.signal);
+          if (CONFIG.auto_trade && tradeable) {
+            try {
+              const result = await trader.executeSignal(signal);
+              if (result?.executed) {
+                console.log(`[trade] ${CONFIG.symbol} ${signal.signal} @ ${result.price}`);
+              } else if (result?.reason) {
+                console.log(`[trade] skipped: ${result.reason}`);
+                if (!['cooldown', 'confirmation_pending', 'entry_in_flight'].includes(result.reason)) {
+                  await noticeTrade(`skip:${result.reason}`, `⚠️ <b>Entry skipped</b> <code>${esc(CONFIG.symbol)}</code> ${esc(signal.signal)}: <code>${esc(result.reason)}</code>`);
+                }
+              }
+            } catch (error) {
+              console.error('[trade] entry failed:', error.message);
+              await noticeTrade(`err:${error.message}`, `⚠️ <b>Entry failed</b> <code>${esc(CONFIG.symbol)}</code> ${esc(signal.signal)}:\n<code>${esc(error.message)}</code>`);
             }
+          } else if (tradeable) {
+            await noticeTrade('autotrade-off', `ℹ️ Tradeable ${esc(signal.signal)} signal on <code>${esc(CONFIG.symbol)}</code> ignored: auto_trade is OFF. Use /autotrade on.`);
           }
           if (reportState.reportOn && CONFIG.ALLOWED_USER_ID) {
             // The report used to be a bare signal line, so "what am I holding

@@ -15,6 +15,15 @@ function gateThreshold(raw) {
   return Number.isFinite(value) ? value : null;
 }
 
+// Kline intervals from the get_kline docs: 1m 5m 15m 30m 1h 2h 4h 6h 8h 12h 1d 3d 1w 1M
+// (3m is accepted by the exchange too, and is used by this bot).
+export function intervalMs(interval) {
+  const match = /^(\d+)([mhdwM])$/.exec(String(interval ?? '').trim());
+  if (!match) return null;
+  const unit = { m: 60000, h: 3600000, d: 86400000, w: 604800000, M: 2592000000 }[match[2]];
+  return Number(match[1]) * unit;
+}
+
 class Scanner {
   client;
 
@@ -27,12 +36,16 @@ class Scanner {
     for (const timeframe of timeframes) {
       const klines = await this.client.getKlines(symbol, timeframe, 200);
       if (!Array.isArray(klines) || klines.length < 60) throw new Error(`invalid ${timeframe} kline response for ${symbol}`);
-      // The newest bar is still FORMING (bars are chronological, see client.js).
-      // Its close/high/low/volume change every tick, so indicators computed on it
-      // repaint and a signal can appear and vanish inside one candle - worst on
-      // 1m/3m. Score closed candles only; the live price still comes from the
-      // ticker. Keep the bar when the series is too short to spare it.
-      output[timeframe] = klines.length > 60 ? klines.slice(0, -1) : klines;
+      // Score closed candles only: a forming bar repaints every tick. The official
+      // get_kline page says "Only closed candles are returned; the candle that is
+      // still forming is not included", so blindly dropping the newest bar threw
+      // away a real closed candle and made every signal one candle stale. `time`
+      // is the candle OPEN time, so a bar is still forming only while
+      // time + interval is in the future; drop it in that case only.
+      const span = intervalMs(timeframe);
+      const openTime = Number(klines.at(-1)?.time);
+      const forming = span !== null && Number.isFinite(openTime) && openTime + span > Date.now();
+      output[timeframe] = forming && klines.length > 60 ? klines.slice(0, -1) : klines;
     }
     return output;
   }

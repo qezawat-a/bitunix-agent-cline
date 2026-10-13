@@ -6,6 +6,7 @@ import { parseThinkingLevel } from './agent/thinking.js';
 import { detectProviders } from './agent/config.js';
 import { listOpenAiModels } from './agent/brain.js';
 import { storeStatus } from './store/persist.js';
+import { assertSymbolTradable } from './bitunix/symbols.js';
 
 function usage(chatId, text) {
   return sendMessage(chatId, text).then(() => true);
@@ -91,6 +92,7 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           if (key === 'symbol' && String(value).toUpperCase() !== CONFIG.symbol) {
             const positions = await client.getPendingPositions(CONFIG.symbol);
             if (!Array.isArray(positions) || positions.length) return usage(chatId, 'Cannot change symbol while positions are open.');
+            await assertSymbolTradable(client, value);
           }
           const applied = applySettings(CONFIG, { [key]: value });
           await save();
@@ -237,9 +239,17 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           if (!/^[A-Z0-9]{5,32}$/.test(symbol)) return usage(chatId, 'Invalid symbol.');
           const positions = await client.getPendingPositions(CONFIG.symbol);
           if (!Array.isArray(positions) || positions.length) return usage(chatId, 'Cannot change symbol while positions are open.');
+          await assertSymbolTradable(client, symbol);
           applySettings(CONFIG, { symbol });
           await save();
-          await sendMessage(chatId, `symbol <code>${esc(CONFIG.symbol)}</code>`);
+          // The exchange keeps leverage / margin mode per symbol. A mismatch makes
+          // every entry fail, so say so now instead of at the first signal.
+          let warn = '';
+          try {
+            const current = await trader?.readAccountSettings?.();
+            if (current?.mismatches?.length) warn = `\n⚠️ ${current.mismatches.map(esc).join('; ')} — /autotrade on aligns the exchange.`;
+          } catch { /* advisory only */ }
+          await sendMessage(chatId, `symbol <code>${esc(CONFIG.symbol)}</code>${warn}`);
           return true;
         }
         case 'models': {

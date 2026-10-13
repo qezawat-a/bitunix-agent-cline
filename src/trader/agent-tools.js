@@ -3,6 +3,7 @@ import { applySettings, getTraderSettings, resolveSettingKey } from './settings.
 import { convert, positionSizeFromUnit } from '../bitunix/order-units.js';
 import { STRATEGIES, TOTAL_STRATEGY_WEIGHT, describeStrategies } from '../bitunix/indicators.js';
 import { describeTpslMethods } from './tpsl.js';
+import { assertSymbolTradable } from '../bitunix/symbols.js';
 
 let sharedTrader = null;
 let sharedClient = null;
@@ -107,6 +108,7 @@ export const traderTools = [
         const client = requireClient();
         const positions = await client.getPendingPositions(CONFIG.symbol);
         if (!Array.isArray(positions) || positions.length) throw new Error('cannot change symbol while positions are open');
+        await assertSymbolTradable(client, value);
       }
       const settings = applySettings(CONFIG, { [key]: value });
       // applySettings keys the result canonically, so resolve the alias to echo

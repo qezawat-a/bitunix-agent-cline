@@ -410,9 +410,16 @@ export class Trader {
     // 1/leverage minus a maintenance-margin buffer (0.5%, above the 0.4% tier-1
     // rate in the tiers docs, so the estimate errs on the safe side).
     const stopDistance = Math.abs(entryPrice - Number(body.slPrice)) / entryPrice;
-    const liqDistance = 1 / CONFIG.leverage - 0.005;
+    // 1/leverage is the liquidation distance of an ISOLATED position. In CROSS
+    // margin the whole balance backs the position, so the distance is 1/(leverage x
+    // the share of the balance used as margin): 25% margin at 20x liquidates ~20%
+    // away (the exchange showed 0.18848 on a 0.236 entry), not 4.5%. Using 1/leverage
+    // there refused every entry whose ATR stop was wider than 4.5%.
+    const isolated = String(CONFIG.position_type).toLowerCase() === 'isolated';
+    const marginShare = isolated ? 1 : Math.min(1, Math.max(Number(CONFIG.position_sizing_margin_pct) / 100 || 1, 1e-6));
+    const liqDistance = Math.min(1, 1 / (CONFIG.leverage * marginShare) - 0.005);
     if (!(stopDistance < liqDistance)) {
-      throw new Error(`stop ${(stopDistance * 100).toFixed(2)}% from entry is beyond liquidation (~${(liqDistance * 100).toFixed(2)}% at ${CONFIG.leverage}x); refusing entry`);
+      throw new Error(`stop ${(stopDistance * 100).toFixed(2)}% from entry is beyond liquidation (~${(liqDistance * 100).toFixed(2)}% at ${CONFIG.leverage}x${isolated ? ' isolated' : `, ${(marginShare * 100).toFixed(0)}% of balance as cross margin`}); refusing entry`);
     }
     let order;
     try {

@@ -36,11 +36,17 @@ describe('scanner scores closed candles only', () => {
     const { CONFIG } = await import('../src/config.js');
     const Scanner = (await import('../src/bitunix/scanner.js')).default;
     const seen = [];
-    const bars = Array.from({ length: 200 }, (_, i) => ({ time: String(i), open: '100', high: '101', low: '99', close: '100', baseVol: '10' }));
-    const scanner = new Scanner({ getKlines: async () => bars });
-    const out = await scanner.getKlinesFor(CONFIG.symbol, ['15m']);
+    const span = 15 * 60000;
+    const make = lastOpen => Array.from({ length: 200 }, (_, i) => ({ time: String(lastOpen - (199 - i) * span), open: '100', high: '101', low: '99', close: '100', baseVol: '10' }));
+    // Newest bar opened a minute ago: still forming, so it is dropped.
+    const forming = make(Date.now() - 60000);
+    const out = await new Scanner({ getKlines: async () => forming }).getKlinesFor(CONFIG.symbol, ['15m']);
     seen.push(out['15m']);
     assert.equal(seen[0].length, 199);
-    assert.equal(seen[0].at(-1).time, '198');
+    assert.equal(seen[0].at(-1).time, forming[198].time);
+    // Newest bar opened a full interval ago: closed (the docs say only closed bars are returned), so it is kept.
+    const closed = make(Date.now() - span - 1000);
+    const kept = await new Scanner({ getKlines: async () => closed }).getKlinesFor(CONFIG.symbol, ['15m']);
+    assert.equal(kept['15m'].length, 200);
   });
 });

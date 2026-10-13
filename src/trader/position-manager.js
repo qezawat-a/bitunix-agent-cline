@@ -649,7 +649,6 @@ export class PositionManager {
       slPrice: armed.sl && existing && finitePositive(existing.slPrice) ? String(existing.slPrice) : levels.slPrice,
       slStopType: (existing && existing.slStopType) || levels.slStopType,
     };
-    if (existing?.tpOrderType) params.tpOrderType = existing.tpOrderType;
     const result = await this.client.modifyTPSL(params);
     // The tick cache still describes the half-armed pair we just replaced.
     this.resetTpslCache();
@@ -721,7 +720,6 @@ export class PositionManager {
     const row = positionLevel || rows[0];
     const preserved = { tpPrice: String(row.tpPrice) };
     if (row.tpStopType) preserved.tpStopType = row.tpStopType;
-    if (row.tpOrderType) preserved.tpOrderType = row.tpOrderType;
     return preserved;
   }
 
