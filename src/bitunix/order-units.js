@@ -197,6 +197,27 @@ export function positionSizeFromUnit({ available, unit, price, leverage, marginP
 
   const minVolume = numeric(pair?.minTradeVolume);
   if (Number.isFinite(minVolume) && minVolume > 0 && qty < minVolume) {
+    // The exchange minimum is a LOT-size floor on this pair, not a notional
+    // floor: a trade below it is refused outright, and a trade just above it
+    // commits a few extra cents of margin. When the account can cover that
+    // difference the order should be sized UP to the minimum instead of being
+    // thrown away — the alternative is what happened on TRUTHUSDT: a thinned-out
+    // balance computed ~347 units against a 700-unit minimum on every single
+    // signal, so the entry failed forever and the position was never opened.
+    const costOfMin = minVolume * mark / lev;
+    if (Number.isFinite(costOfMin) && costOfMin <= balance) {
+      const minQty = roundQty(minVolume, pair);
+      if (minQty >= minVolume) {
+        return {
+          ...result,
+          ok: true,
+          qty: minQty,
+          marginCost: tidy(minQty * mark / lev, MONEY_DECIMALS),
+          nominalValue: tidy(minQty * mark, MONEY_DECIMALS),
+          warnings: [...warnings, `qty floored up to the Bitunix minimum ${minVolume} from ${qty}`],
+        };
+      }
+    }
     warnings.push(`qty ${qty} is below the Bitunix minimum ${minVolume}`);
     return { ...result, reason: 'below_min_trade_volume' };
   }
