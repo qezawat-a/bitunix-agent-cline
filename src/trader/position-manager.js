@@ -42,6 +42,11 @@ function legQuantity(row) {
 
 const positionQtyOf = (position) => position?.qty ?? position?.size ?? null;
 
+// Fraction of the liquidation price a clamped stop keeps as working room. A
+// stop sitting exactly on liquidation races the exchange's own engine and can
+// still lose, so a small margin is kept on the fillable side of it.
+const LIQ_STOP_PADDING = 0.002;
+
 // A position's size is a magnitude. get_pending_positions documents `qty` only
 // as "position amount", and the exchange reports a short with a negative or
 // side-signed quantity depending on the endpoint, while a TP/SL row's
@@ -490,7 +495,13 @@ export class PositionManager {
     return tiers;
   }
 
-  computeTPSL(entryPrice, direction, atr, confidence, quotePrecision = 8) {
+  // Levels for the position/partial methods. `liqPrice` (when known) is the
+  // floor the stop is never placed below: for a long, a stop under the
+  // liquidation price is decorative — price reaches the liquidation first and
+  // the position is force-closed at the maintenance-margin rate instead of at
+  // the level we chose. Passing it is what lets a high-leverage trade arm a
+  // stop the exchange will never get to fill.
+  computeTPSL(entryPrice, direction, atr, confidence, quotePrecision = 8, liqPrice = null) {
     if (!finitePositive(entryPrice)) throw new Error('entryPrice must be positive');
     if (!['bullish', 'bearish'].includes(direction)) throw new Error('direction must be bullish or bearish');
     const normalizedConfidence = Math.max(0, Math.min(100, Number(confidence) || 0));
@@ -501,18 +512,23 @@ export class PositionManager {
     const atrDist = this.getAtr(entryPrice, atr);
     const tpDist = atrDist * targetMultiple;
     const slDist = atrDist * stopMultiple;
+    const isLong = direction === 'bullish';
 
-    if (direction === 'bullish') {
-      return {
-        tpPrice: formatPrice(entryPrice + tpDist, quotePrecision),
-        slPrice: formatPrice(entryPrice - slDist, quotePrecision),
-        tpStopType: 'MARK_PRICE',
-        slStopType: 'MARK_PRICE',
-      };
+    let slPrice = isLong ? entryPrice - slDist : entryPrice + slDist;
+
+    // The liquidation price is the real boundary of the trade; a stop beyond it
+    // is unreachable. Clamp the stop to just inside it so the order is actually
+    // live and the position still has a working exit at 50x. This never widens
+    // the stop, only pulls it back to somewhere it can fill.
+    const liq = Number(liqPrice);
+    if (finitePositive(liq) && finitePositive(slPrice)) {
+      if (isLong && slPrice <= liq) slPrice = liq * (1 + LIQ_STOP_PADDING);
+      if (!isLong && slPrice >= liq) slPrice = liq * (1 - LIQ_STOP_PADDING);
     }
+
     return {
-      tpPrice: formatPrice(entryPrice - tpDist, quotePrecision),
-      slPrice: formatPrice(entryPrice + slDist, quotePrecision),
+      tpPrice: formatPrice(isLong ? entryPrice + tpDist : entryPrice - tpDist, quotePrecision),
+      slPrice: formatPrice(slPrice, quotePrecision),
       tpStopType: 'MARK_PRICE',
       slStopType: 'MARK_PRICE',
     };
@@ -536,8 +552,8 @@ export class PositionManager {
     throw new Error(`ATR unavailable for ${position.positionId} (position.atr missing, 15m and 1h series too short or invalid)`);
   }
 
-  async placeTPSL(positionId, entryPrice, direction, atr, confidence) {
-    const levels = this.computeTPSL(entryPrice, direction, atr, confidence, await this.getQuotePrecision());
+  async placeTPSL(positionId, entryPrice, direction, atr, confidence, liqPrice = null) {
+    const levels = this.computeTPSL(entryPrice, direction, atr, confidence, await this.getQuotePrecision(), liqPrice);
     return this.client.placeTPSL({
       symbol: this.symbol,
       positionId,
@@ -626,8 +642,8 @@ export class PositionManager {
   // tpPrice or slPrice is required" and a position with no stop at all is never
   // acceptable.
   // https://www.bitunix.com/api-docs/futures/tp_sl/place_position_tp_sl_order.html
-  async placeTPSLStop(positionId, entryPrice, direction, atr, confidence) {
-    const { slPrice, slStopType } = this.computeTPSL(entryPrice, direction, atr, confidence, await this.getQuotePrecision());
+  async placeTPSLStop(positionId, entryPrice, direction, atr, confidence, liqPrice = null) {
+    const { slPrice, slStopType } = this.computeTPSL(entryPrice, direction, atr, confidence, await this.getQuotePrecision(), liqPrice);
     return this.client.placeTPSL({
       symbol: this.symbol,
       positionId,
@@ -1172,6 +1188,7 @@ export class PositionManager {
       const atr = await this.getAtrForPosition(position);
       const confidence = position.signalConfidence ?? this.settings.min_confidence;
       const entryPrice = Number(position.avgPrice);
+      const liqPrice = position.liqPrice ?? position.liq ?? null;
       // Method dispatch: 'partial' replaces the single all-in TP with an
       // order-level ladder; 'trailing' and 'account' keep the position-level
       // pair because that is the only pair that exits the whole position at
@@ -1185,7 +1202,7 @@ export class PositionManager {
         return { placed: true, result: ladder };
       }
       if (method === 'trailing' || method === 'account') {
-        const result = await this.placeTPSLStop(position.positionId, entryPrice, direction, atr, confidence);
+        const result = await this.placeTPSLStop(position.positionId, entryPrice, direction, atr, confidence, liqPrice);
         this.resetTpslCache();
         this.breakEvenApplied.delete(String(position.positionId));
         return { placed: true, result, method };
@@ -1200,7 +1217,7 @@ export class PositionManager {
         this.breakEvenApplied.delete(String(position.positionId));
         return { placed: true, result, repaired: true };
       }
-      const result = await this.placeTPSL(position.positionId, entryPrice, direction, atr, confidence);
+      const result = await this.placeTPSL(position.positionId, entryPrice, direction, atr, confidence, liqPrice);
       this.resetTpslCache();
       this.breakEvenApplied.delete(String(position.positionId));
       return { placed: true, result };
