@@ -44,6 +44,10 @@ import {
 import { formatSignalReport, splitHtml } from '../src/telegram-bot.js';
 import { formatPositions, positionStatus } from '../src/trader/notifier.js';
 
+// These suites pin the stop to the exact entry price; the break-even fee buffer has its own test.
+PositionManager.BREAKEVEN_BUFFER_PCT = 0;
+PositionManager.ATR_SIZED_TRIGGERS = false;
+
 // computeTPSL is an instance method but is pure, so it is exercised through a
 // client-less PositionManager rather than a network double.
 const computeTpsl = (entryPrice, direction, atr, confidence) =>

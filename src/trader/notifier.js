@@ -379,7 +379,12 @@ export class PositionNotifier {
     try {
       const pending = await this.client.getPendingTPSL(CONFIG.symbol);
       if (!Array.isArray(pending)) return null;
-      return pending.find(row => String(row.positionId) === String(positionId)) || null;
+      // The exchange may list the take-profit and the stop as separate rows, so
+      // the first match alone printed "SL: -" on a position that had one.
+      const rows = pending.filter(row => String(row.positionId) === String(positionId));
+      if (!rows.length) return null;
+      const pick = key => rows.map(row => row?.[key]).find(value => positive(value) !== null);
+      return { ...rows[0], tpPrice: pick('tpPrice') ?? rows[0].tpPrice, slPrice: pick('slPrice') ?? rows[0].slPrice };
     } catch {
       return null;
     }

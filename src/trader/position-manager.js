@@ -89,6 +89,12 @@ export class PositionManager {
   // with the timeout as a backstop for a close that never registered.
   closedRecently = new Map();
   static CLOSE_DEDUPE_MS = 60000;
+  // Break-even stop sits this far (percent of price) beyond the entry, on the
+  // profit side, so a break-even exit covers taker fees instead of losing them.
+  static BREAKEVEN_BUFFER_PCT = 0.15;
+  // Size the break-even / trailing ROI triggers against the ATR stop and target.
+  static ATR_SIZED_TRIGGERS = true;
+  triggerAtrCache = new Map();
   // When break-even was last applied to a position, and at which stop price.
   //
   // checkBreakeven could re-fire forever on a position it had already fixed. It
@@ -679,15 +685,22 @@ export class PositionManager {
   // null when the exchange has no stop armed for the position.
   async currentStop(position) {
     const value = position.slPrice ?? position.stopPrice ?? position.stopLossPrice;
-    const stop = Number(value);
-    if (finitePositive(stop)) return stop;
+    const own = Number(value);
     // The most protective stop among ALL of the position's rows (an order-level
     // stop and a position-level one can coexist), not whichever came first.
+    //
+    // The stop on the position object is only a within-tick hint and can be stale.
+    // It used to be returned alone, so once break-even had been applied every later
+    // tick compared a trailing level against the old break-even price instead of
+    // the stop the exchange really held, and a retrace dragged the stop BACK DOWN
+    // (a long's stop went 102.95 -> 102.45 -> 101.45 as price fell). The exchange
+    // rows are always consulted too, and the tighter of the two wins.
     const key = String(position.positionId);
     const stops = (await this.loadPendingTPSL())
       .filter(item => String(item?.positionId) === key)
       .map(item => Number(item?.slPrice ?? item?.stopPrice))
       .filter(finitePositive);
+    if (finitePositive(own)) stops.push(own);
     if (stops.length) return position.side === 'SELL' ? Math.min(...stops) : Math.max(...stops);
     const tpsl = await this.positionTPSL(position.positionId, positionMagnitude(position));
     const pendingStop = Number(tpsl?.slPrice ?? tpsl?.stopPrice);
@@ -862,6 +875,43 @@ export class PositionManager {
     return result;
   }
 
+  breakEvenPrice(entry, side) {
+    const buffer = PositionManager.BREAKEVEN_BUFFER_PCT / 100;
+    return side === 'SELL' ? entry * (1 - buffer) : entry * (1 + buffer);
+  }
+
+  // The configured ROI triggers are leveraged percentages while the stop and
+  // target are ATR distances, so the two drift apart with leverage: at 10x a 20%
+  // trigger is usually beyond the take-profit and never fires, at 40-50x it is
+  // inside the stop distance and moves the stop on noise. The configured value is
+  // kept, but clamped to [floorR x stop distance, ceilTp x target distance].
+  async effectiveTriggerRoi(position, configured, floorR = 1, ceilTp = 0.85) {
+    const configuredRoi = Number(configured);
+    if (!Number.isFinite(configuredRoi) || !PositionManager.ATR_SIZED_TRIGGERS) return configuredRoi;
+    try {
+      const entry = Number(position.avgPrice);
+      const leverage = finitePositive(position.leverage)
+        ? Number(position.leverage)
+        : finitePositive(this.settings.leverage) ? Number(this.settings.leverage) : 1;
+      const key = String(position.positionId);
+      let atr;
+      const cached = this.triggerAtrCache.get(key);
+      if (cached && Date.now() - cached.at < 60000) atr = cached.value;
+      else {
+        atr = await this.getAtrForPosition(position);
+        this.triggerAtrCache.set(key, { value: atr, at: Date.now() });
+      }
+      const { stopMultiple, targetMultiple } = atrMultiples(position.signalConfidence ?? this.settings.min_confidence);
+      const toRoi = distance => (distance / entry) * 100 * leverage;
+      const floor = toRoi(atr * stopMultiple) * floorR;
+      const ceiling = toRoi(atr * targetMultiple) * ceilTp;
+      if (!(floor > 0) || !(ceiling >= floor)) return configuredRoi;
+      return Math.min(Math.max(configuredRoi, floor), ceiling);
+    } catch {
+      return configuredRoi;
+    }
+  }
+
   async checkBreakeven(position) {
     const entry = Number(position.avgPrice);
     if (!finitePositive(entry)) throw new Error('position entry price must be positive');
@@ -873,20 +923,25 @@ export class PositionManager {
     // "where is the stop now?" lookup kept failing to see the move we had just
     // made. A tolerance is used so the same entry price re-sent at a different
     // quotePrecision is still recognised as the same level.
+    const target = this.breakEvenPrice(entry, position.side);
     const applied = this.breakEvenApplied.get(key);
-    if (applied && samePrice(applied.slPrice, entry, applied.precision)) {
+    if (applied && samePrice(applied.slPrice, target, applied.precision)) {
       return { skipped: 'break-even already applied', slPrice: String(applied.slPrice) };
     }
-    if (this.favorableRoiPct(position) >= Number(this.settings.breakeven_threshold_pct)) {
+    if (this.favorableRoiPct(position) >= await this.effectiveTriggerRoi(position, this.settings.breakeven_threshold_pct, 1, 0.6)) {
       const current = await this.currentStop(position);
-      if (current && position.side === 'BUY' && entry <= current) return { skipped: 'stop already favorable' };
-      if (current && position.side === 'SELL' && entry >= current) return { skipped: 'stop already favorable' };
-      const result = await this.moveSLToEntry(position.positionId, entry, positionMagnitude(position), position.side);
+      if (current && position.side === 'BUY' && target <= current) return { skipped: 'stop already favorable' };
+      if (current && position.side === 'SELL' && target >= current) return { skipped: 'stop already favorable' };
+      const markNow = Number(position.markPrice);
+      if (finitePositive(markNow) && (position.side === 'BUY' ? target >= markNow : target <= markNow)) {
+        return { skipped: 'break-even buffer not yet covered by price' };
+      }
+      const result = await this.moveSLToEntry(position.positionId, target, positionMagnitude(position), position.side);
       // Recorded only once the move actually reached the exchange, so a failed
       // modify is retried on the next tick rather than being remembered as done.
-      this.breakEvenApplied.set(key, { slPrice: entry, precision: await this.getQuotePrecision() });
-      this.reportStopMove?.(position, 'breakeven', entry);
-      return { ...result, slPrice: formatPrice(entry) };
+      this.breakEvenApplied.set(key, { slPrice: target, precision: await this.getQuotePrecision() });
+      this.reportStopMove?.(position, 'breakeven', target);
+      return { ...result, slPrice: formatPrice(target, await this.getQuotePrecision()) };
     }
     return { skipped: 'threshold not reached' };
   }
@@ -919,7 +974,7 @@ export class PositionManager {
   async checkTrailing(position) {
     const mark = Number(position.markPrice);
     if (!finitePositive(mark)) throw new Error('position mark price must be positive');
-    if (this.favorableRoiPct(position) >= Number(this.settings.trailing_trigger_roi_pct)) {
+    if (this.favorableRoiPct(position) >= await this.effectiveTriggerRoi(position, this.settings.trailing_trigger_roi_pct, 1.25, 0.85)) {
       const atr = await this.getAtrForPosition(position);
       const strength = Math.max(0, Math.min(100, Number(position.signalConfidence ?? this.settings.min_confidence))) / 100;
       const multiple = Number(this.settings.trailing_atr_multiple) || 1.25;
@@ -1151,8 +1206,22 @@ export class PositionManager {
       return { placed: true, result };
     } catch (error) {
       if (this.settings.on_tpsl_failure === 'close') {
-        this.noteClose(position.positionId, 'tpsl_failure');
+        // A failed PLACE does not prove the position is naked: the entry order
+        // already carries its TP/SL, and the pending list can lag behind it. Ask the
+        // exchange once more and keep a position that has a live stop.
+        try {
+          const fresh = await this.readPositionStops(position.positionId);
+          if (fresh.some(row => finitePositive(Number(row?.slPrice ?? row?.stopPrice)))) {
+            return { skipped: 'stop confirmed on the exchange after a failed placement', verified: true, error: error.message };
+          }
+        } catch {
+          // Could not re-check: fall through to the safety close.
+        }
         const closeResult = await this.client.closePosition(this.symbol, position.positionId, position);
+        // Recorded only once the close really went out. Noting it first left a
+        // stale "TP/SL failure" label behind when the close failed, and the next
+        // genuine exit of that position was announced under it.
+        this.noteClose(position.positionId, 'tpsl_failure');
         return { closed: true, result: closeResult, error: error.message };
       }
       throw new Error(`TP/SL protection failed: ${error.message}`);
@@ -1212,9 +1281,9 @@ export class PositionManager {
 
         // Profit-side management only once the position is known to be safe.
         const breakeven = await this.checkBreakeven(position);
-        if (breakeven?.slPrice) position.slPrice = breakeven.slPrice;
+        if (breakeven?.slPrice && !breakeven.skipped) position.slPrice = breakeven.slPrice;
         const trailing = await this.checkTrailing(position);
-        if (trailing?.slPrice) position.slPrice = trailing.slPrice;
+        if (trailing?.slPrice && !trailing.skipped) position.slPrice = trailing.slPrice;
         // Method 3: the peak/callback exit only runs under the trailing method;
         // the ATR stop tightening above stays on as the hard backstop. Skipped
         // when the liquidation guard already closed this position, otherwise the

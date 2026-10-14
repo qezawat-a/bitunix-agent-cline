@@ -2,6 +2,10 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { PositionManager } from '../src/trader/position-manager.js';
 
+// These suites pin the stop to the exact entry price; the break-even fee buffer has its own test.
+PositionManager.BREAKEVEN_BUFFER_PCT = 0;
+PositionManager.ATR_SIZED_TRIGGERS = false;
+
 // Regression: the entry order carries its stop attached, which is an ORDER-level
 // TP/SL row. /tpsl/position/modify_order answers code 0 for it and changes
 // nothing, so break-even / trailing "moved" a stop that never moved and the

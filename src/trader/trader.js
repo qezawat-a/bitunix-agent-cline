@@ -432,9 +432,13 @@ export class Trader {
       }
       order = reconciled;
     }
-    const positions = await this.reconcilePositions();
+    await this.reconcilePositions();
     try {
-      for (const position of positions) await this.positionManager.ensureProtection(position);
+      // reconcilePositions() returns a trimmed view (no qty, avgPrice or liqPrice).
+      // Protection has to be checked against the FULL rows from get_pending_positions,
+      // otherwise a position that already carries its TP/SL could not be sized for a
+      // re-arm or a safety close, which surfaced as "position ... has no valid size".
+      for (const position of this.positionManager.state.positions) await this.positionManager.ensureProtection(position);
     } catch (error) {
       this.state.orderUnknownUntil = Date.now() + Math.max(Number(CONFIG.cooldown_minutes) * 60000, 300000);
       throw error;
@@ -576,7 +580,7 @@ export class Trader {
     // only verifies the exchange really has it. ensureProtection() applies the
     // configured on_tpsl_failure behaviour (close) if the check fails.
     const protection = [];
-    for (const position of positions) {
+    for (const position of this.positionManager.state.positions) {
       protection.push(await this.positionManager.ensureProtection(position));
     }
     return {
