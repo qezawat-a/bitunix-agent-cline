@@ -67,6 +67,10 @@ async function main() {
   const client = new BitunixClient();
   const scanner = new Scanner(client);
   const trader = new Trader(client);
+  // Timestamp of the last "permanent" entry failure notice (a pair minimum
+  // the size can never reach, a delisted symbol). The scan loop backs off for
+  // 30 minutes after one instead of re-announcing it on every tick.
+  let lastEntryFailureNotice = 0;
   setTraderInstances(trader, client);
   setPositionManager(trader.positionManager);
   setBitunixClient(client);
@@ -271,7 +275,17 @@ async function main() {
               }
             } catch (error) {
               console.error('[trade] entry failed:', error.message);
-              await noticeTrade(`err:${error.message}`, `⚠️ <b>Entry failed</b> <code>${esc(CONFIG.symbol)}</code> ${esc(signal.signal)}:\n<code>${esc(error.message)}</code>`);
+              // The same permanent refusal (a pair minimum the size can never
+              // reach, a delisted symbol) would otherwise spam a failure notice
+              // on every single scan. Back off for 30 minutes after one so the
+              // operator hears it once, not twice a minute.
+              const permanent = /below the Bitunix minimum|not tradable|leverage must be/i.test(error.message);
+              if (permanent && Date.now() - lastEntryFailureNotice > 30 * 60000) {
+                lastEntryFailureNotice = Date.now();
+                await noticeTrade(`err:${error.message}`, `⚠️ <b>Entry failed</b> <code>${esc(CONFIG.symbol)}</code> ${esc(signal.signal)}:\n<code>${esc(error.message)}</code>\n\nBacking off for 30 minutes — change symbol or top up the balance.`);
+              } else if (!permanent) {
+                await noticeTrade(`err:${error.message}`, `⚠️ <b>Entry failed</b> <code>${esc(CONFIG.symbol)}</code> ${esc(signal.signal)}:\n<code>${esc(error.message)}</code>`);
+              }
             }
           } else if (tradeable) {
             await noticeTrade('autotrade-off', `ℹ️ Tradeable ${esc(signal.signal)} signal on <code>${esc(CONFIG.symbol)}</code> ignored: auto_trade is OFF. Use /autotrade on.`);
