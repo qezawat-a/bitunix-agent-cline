@@ -31,26 +31,13 @@ async function attempt(atrValue, opts = {}) {
   } finally { CONFIG.auto_trade = prior.auto; CONFIG.leverage = prior.lev; CONFIG.symbol = prior.sym; CONFIG.position_type = prior.type; CONFIG.position_sizing_margin_pct = prior.pct; }
 }
 
-it('refuses a stop beyond liquidation at 30x isolated (1m-sized ATR, ~6% stop)', async () => {
-  const { err, placed } = await attempt(0.0055 * 1.5);
-  assert.ok(err && /beyond liquidation/.test(err.message), `expected refusal, got ${err?.message}`);
-  assert.equal(placed.length, 0);
-});
-
-it('allows a stop inside liquidation at 30x (small ATR, ~1% stop)', async () => {
-  const { err, placed } = await attempt(0.0011);
-  assert.equal(err, null, `unexpected refusal: ${err?.message}`);
-  assert.equal(placed.length, 1);
-});
-
-it('cross margin: liquidation sits at 1/(leverage x margin share), so a ~6% stop at 30x with 2% margin is allowed', async () => {
-  const { err, placed } = await attempt(0.0055 * 1.5, { type: 'crossed', pct: 2 });
-  assert.equal(err, null, `unexpected refusal: ${err?.message}`);
-  assert.equal(placed.length, 1);
-});
-
-it('cross margin with ~all the balance as margin still refuses a stop beyond liquidation', async () => {
-  const { err, placed } = await attempt(0.0055 * 1.5, { type: 'crossed', pct: 100 });
-  assert.ok(err && /beyond liquidation/.test(err.message), `expected refusal, got ${err?.message}`);
-  assert.equal(placed.length, 0);
-});
+// The bot no longer second-guesses the exchange with its own liquidation estimate:
+// the official docs give no pre-trade formula, and the post-entry guards read the
+// exchange's own liqPrice. A wide ATR stop is therefore not refused at entry.
+for (const [name, opts] of [['isolated', { type: 'isolated', pct: 2 }], ['cross', { type: 'crossed', pct: 45 }], ['cross, all balance', { type: 'crossed', pct: 100 }]]) {
+  it(`does not refuse a wide (~6%) stop at entry: ${name}`, async () => {
+    const { err, placed } = await attempt(0.0055 * 1.5, opts);
+    assert.equal(err, null, `unexpected refusal: ${err?.message}`);
+    assert.equal(placed.length, 1);
+  });
+}
