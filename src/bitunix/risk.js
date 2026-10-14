@@ -36,7 +36,10 @@ export function liqDistanceOk({ markPrice, liqPrice }) {
   if (!positiveNumber(markPrice)) return false;
   if (liqPrice === undefined || liqPrice === null || liqPrice === '') return false;
   const liquidation = Number(liqPrice);
-  if (!Number.isFinite(liquidation) || liquidation <= 0) return true;
+  // A zero/invalid liquidation price cannot be verified, so it fails closed
+  // like the missing-data case above — not open, which would let a guard that
+  // trusts it skip a position sitting on top of its liquidation price.
+  if (!Number.isFinite(liquidation) || liquidation <= 0) return false;
   const distance = Math.abs(Number(markPrice) - liquidation) / Number(markPrice);
   const minimum = Number(CONFIG.sl_liquidation_safety) / 100;
   return Number.isFinite(distance) && Number.isFinite(minimum) && distance >= minimum;

@@ -286,10 +286,10 @@ describe('exchange safety', () => {
     await assert.rejects(() => client.getAccount('USDT'), /USDT not found/);
   });
 
-  it('fails closed when liquidation data is missing', () => {
+  it('fails closed when liquidation data is missing or invalid', () => {
     assert.equal(liqDistanceOk({ markPrice: 100, liqPrice: undefined }), false);
     assert.equal(liqDistanceOk({ markPrice: 0, liqPrice: 50 }), false);
-    assert.equal(liqDistanceOk({ markPrice: 100, liqPrice: 0 }), true);
+    assert.equal(liqDistanceOk({ markPrice: 100, liqPrice: 0 }), false);
     assert.equal(liqDistanceOk({ markPrice: 100, liqPrice: 50 }), true);
   });
 

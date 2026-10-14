@@ -67,10 +67,12 @@ async function main() {
   const client = new BitunixClient();
   const scanner = new Scanner(client);
   const trader = new Trader(client);
-  // Timestamp of the last "permanent" entry failure notice (a pair minimum
-  // the size can never reach, a delisted symbol). The scan loop backs off for
-  // 30 minutes after one instead of re-announcing it on every tick.
-  let lastEntryFailureNotice = 0;
+  // Last "permanent" entry-failure notice per symbol. The scan loop would
+  // otherwise re-announce the same refusal (a pair minimum the size can never
+  // reach, a delisted symbol) on every tick. Keyed on the symbol so that a /set
+  // symbol switch does not inherit the old symbol's backoff window and stay
+  // silent for up to 30 minutes on the new symbol's own failures.
+  const lastEntryFailureNoticeBySymbol = new Map();
   setTraderInstances(trader, client);
   setPositionManager(trader.positionManager);
   setBitunixClient(client);
@@ -280,9 +282,19 @@ async function main() {
               // on every single scan. Back off for 30 minutes after one so the
               // operator hears it once, not twice a minute.
               const permanent = /below the Bitunix minimum|not tradable|leverage must be/i.test(error.message);
-              if (permanent && Date.now() - lastEntryFailureNotice > 30 * 60000) {
-                lastEntryFailureNotice = Date.now();
-                await noticeTrade(`err:${error.message}`, `⚠️ <b>Entry failed</b> <code>${esc(CONFIG.symbol)}</code> ${esc(signal.signal)}:\n<code>${esc(error.message)}</code>\n\nBacking off for 30 minutes — change symbol or top up the balance.`);
+              const failureKey = `${CONFIG.symbol}:${error.message}`;
+              if (permanent && Date.now() - (lastEntryFailureNoticeBySymbol.get(failureKey) ?? 0) > 30 * 60000) {
+                lastEntryFailureNoticeBySymbol.set(failureKey, Date.now());
+                // The matched errors have different fixes:
+                // - "below the Bitunix minimum": size can never reach it at this balance/leverage — change symbol or top up the balance.
+                // - "not tradable size" / "exceeds maximum volume": recoverable by adjusting leverage, order_unit, or margin_pct — say so instead of the wrong advice.
+                // - "leverage must be an integer": fix is /leverage, not symbol or balance.
+                const advice = /below the Bitunix minimum/i.test(error.message)
+                  ? 'change symbol or top up the balance'
+                  : /leverage must be/i.test(error.message)
+                    ? 'change /leverage to a value within the pair\'s published range'
+                    : 'adjust /leverage, /order_unit, or /margin_pct to a tradable size';
+                await noticeTrade(`err:${error.message}`, `⚠️ <b>Entry failed</b> <code>${esc(CONFIG.symbol)}</code> ${esc(signal.signal)}:\n<code>${esc(error.message)}</code>\n\nBacking off for 30 minutes — ${advice}.`);
               } else if (!permanent) {
                 await noticeTrade(`err:${error.message}`, `⚠️ <b>Entry failed</b> <code>${esc(CONFIG.symbol)}</code> ${esc(signal.signal)}:\n<code>${esc(error.message)}</code>`);
               }

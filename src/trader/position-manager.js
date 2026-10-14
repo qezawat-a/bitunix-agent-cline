@@ -242,6 +242,11 @@ export class PositionManager {
       for (const key of this.wsTpslDisarmed) {
         if (!live.has(key)) this.wsTpslDisarmed.delete(key);
       }
+      // The cached ATR trigger belongs to one position: a positionId that later
+      // reappears is a different trade that must not inherit the prior ATR.
+      for (const key of this.triggerAtrCache.keys()) {
+        if (!live.has(key)) this.triggerAtrCache.delete(key);
+      }
       for (const [key, at] of this.closedRecently) {
         // Dropped as soon as the id stops being listed (a genuinely reopened
         // position carries a new id, so it is free to close immediately), with
