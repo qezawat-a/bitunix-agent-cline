@@ -30,4 +30,15 @@ describe('ROI triggers are sized against the ATR stop and target', () => {
   it('keeps the configured value when no ATR can be read', async () => {
     assert.equal(await make().effectiveTriggerRoi({ ...position, atr: undefined }, 4, 1, 0.6), 4);
   });
+
+  // WALUSDT-like: 25x leverage, stop at 4.5% of price, target at 12%. The
+  // ATR stop is therefore 112% on margin and the target 300% on margin.
+  const lowLevPosition = { positionId: 'p2', symbol: 'WALUSDT', avgPrice: '0.05265', leverage: 25, atr: 0.0023, signalConfidence: 80 };
+
+  it('caps the break-even trigger inside the take-profit band instead of letting it fire at the target ROI', async () => {
+    // One stop distance = 112% on margin; half the target band = 150%. The
+    // break-even trigger must sit between them so it fires on real progress,
+    // not on noise, and not above where the target will close the position.
+    near(await make().effectiveTriggerRoi(lowLevPosition, 4, 1, 0.6), 150);
+  });
 });

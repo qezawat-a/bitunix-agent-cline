@@ -303,10 +303,6 @@ async function main() {
             await noticeTrade('autotrade-off', `ℹ️ Tradeable ${esc(signal.signal)} signal on <code>${esc(CONFIG.symbol)}</code> ignored: auto_trade is OFF. Use /autotrade on.`);
           }
           if (reportState.reportOn && CONFIG.ALLOWED_USER_ID) {
-            // The report used to be a bare signal line, so "what am I holding
-            // right now" meant a separate /positions. Now every report carries
-            // the open positions with their TP/SL, unrealized PnL and status —
-            // the operator sees PnL and protection without a second command.
             const headline = `<b>${esc(CONFIG.AGENT_NAME)}</b> signal <b>${esc(signal.signal)}</b> <code>${esc(signal.symbol)}</code> @ <code>${esc(String(signal.price ?? signal.lastPrice ?? '-'))}</code>`;
             try {
               // tickers supplies markPrice, which get_pending_positions does
@@ -324,6 +320,14 @@ async function main() {
             }
           }
         }
+        // Breakeven / trailing / liq-guard must run on every cycle even when
+        // scanning is active — the old code only ran them in the else branch,
+        // so a live open position's stop never moved while /scan was on.
+        // It also had to sit OUTSIDE the `if (signal)` block: a `hold` signal
+        // (no actionable direction) must not stop mid management of an open
+        // position.
+        await Promise.allSettled([trader.guard(), trader.midManage()]);
+        await notifier.sync().catch(() => {});
       } else {
         await Promise.allSettled([trader.guard(), trader.midManage(), trader.report()]);
         // Exits still need reporting when scanning is off, e.g. a stop or a

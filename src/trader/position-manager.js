@@ -99,6 +99,11 @@ export class PositionManager {
   static BREAKEVEN_BUFFER_PCT = 0.15;
   // Size the break-even / trailing ROI triggers against the ATR stop and target.
   static ATR_SIZED_TRIGGERS = true;
+  // A break-even trigger must land somewhere the position can actually reach
+  // before its target: at low leverage the take-profit's ROI is below one stop
+  // distance, so no ATR-sized break-even trigger exists and the configured
+  // value is used instead.
+  static ATR_SIZED_BE_CEIL = 0.5;
   triggerAtrCache = new Map();
   // When break-even was last applied to a position, and at which stop price.
   //
@@ -925,8 +930,15 @@ export class PositionManager {
       const { stopMultiple, targetMultiple } = atrMultiples(position.signalConfidence ?? this.settings.min_confidence);
       const toRoi = distance => (distance / entry) * 100 * leverage;
       const floor = toRoi(atr * stopMultiple) * floorR;
-      const ceiling = toRoi(atr * targetMultiple) * ceilTp;
+      let ceiling = toRoi(atr * targetMultiple) * ceilTp;
       if (!(floor > 0) || !(ceiling >= floor)) return configuredRoi;
+      if (floorR === 1 && ceilTp === 0.6) {
+        // Break-even only: hold the trigger back from the last half of the
+        // take-profit band so it fires on real progress toward the target,
+        // not on noise between the stop and the target.
+        ceiling = toRoi(atr * targetMultiple) * PositionManager.ATR_SIZED_BE_CEIL;
+        if (ceiling < floor) ceiling = floor;
+      }
       return Math.min(Math.max(configuredRoi, floor), ceiling);
     } catch {
       return configuredRoi;
