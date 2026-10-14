@@ -505,6 +505,45 @@ export class PositionManager {
     return tiers;
   }
 
+  // Estimate the liquidation price for a position that has not been opened yet.
+  // Uses the tiered maintenance-margin table (get_position_tiers) and the
+  // official formula from Bitunix's liquidation-mechanism doc:
+  //   https://support.bitunix.com/hc/en-us/articles/32152530856601
+  //
+  //   ISOLATED  LONG:  liq = entry × (1 − 1/lev + MMR)
+  //   ISOLATED  SHORT: liq = entry × (1 + 1/lev − MMR)
+  //   CROSS     LONG:  liq = entry × (1 + MMR) − balance / qty
+  //   CROSS     SHORT: liq = entry × (1 − MMR) + balance / qty
+  //
+  // MMR is tiered by notional (entry × qty). When the tiers endpoint is
+  // unreachable the method falls back to 0.004 (the tier-1 rate the doc
+  // publishes for small notionals), which is the safest (closest) estimate.
+  async estimateLiqPrice(entryPrice, side, qty, balance, leverage) {
+    if (!finitePositive(entryPrice) || !finitePositive(qty)) return null;
+    const notional = entryPrice * qty;
+    const tiers = await this.getPositionTiers();
+    let mmr = 0.004; // tier-1 fallback from the docs
+    if (Array.isArray(tiers) && tiers.length) {
+      for (const row of tiers) {
+        const end = Number(row?.endValue ?? row?.end_value);
+        const rate = Number(row?.maintenanceMarginRate ?? row?.maintenance_margin_rate);
+        if (Number.isFinite(end) && Number.isFinite(rate) && notional <= end) { mmr = rate; break; }
+      }
+    }
+    const isLong = side === 'BUY' || side === 'LONG';
+    const cross = String(this.settings?.position_type ?? 'crossed').toLowerCase().includes('cross');
+    if (cross) {
+      const bal = finitePositive(balance) ? Number(balance) : 0;
+      return isLong
+        ? entryPrice * (1 + mmr) - bal / qty
+        : entryPrice * (1 - mmr) + bal / qty;
+    }
+    const lev = finitePositive(leverage) ? Number(leverage) : 1;
+    return isLong
+      ? entryPrice * (1 - 1 / lev + mmr)
+      : entryPrice * (1 + 1 / lev - mmr);
+  }
+
   // Levels for the position/partial methods. `liqPrice` (when known) is the
   // floor the stop is never placed below: for a long, a stop under the
   // liquidation price is decorative — price reaches the liquidation first and

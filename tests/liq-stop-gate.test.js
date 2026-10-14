@@ -4,12 +4,16 @@ import { CONFIG } from '../src/config.js';
 import { Trader } from '../src/trader/trader.js';
 
 const pair = { symbol: 'STRKUSDT', minTradeVolume: '8', basePrecision: 1, quotePrecision: 5, minLeverage: 1, maxLeverage: 50 };
+// Fixed tier so the liquidation estimate is deterministic: one top tier with the
+// tier-1 maintenance margin rate the docs publish for small notionals.
+const TIERS = [{ endValue: 1e9, maintenanceMarginRate: 0.004 }];
 function make(atrValue) {
   const placed = [];
   const client = {
     placeOrder: async b => { placed.push(b); return { orderId: '1' }; },
     getTradingPairs: async () => [pair],
     getAccount: async () => ({ available: '1000' }),
+    getPositionTiers: async () => TIERS,
     getLeverageAndMarginMode: async () => ({ leverage: CONFIG.leverage, marginMode: CONFIG.position_type === 'isolated' ? 'ISOLATION' : 'CROSS' }),
     getPositionMode: async () => ({ positionMode: 'HEDGE' }),
     getPendingPositions: async () => [], getPendingOrders: async () => [],
@@ -31,29 +35,38 @@ async function attempt(atrValue, opts = {}) {
   } finally { CONFIG.auto_trade = prior.auto; CONFIG.leverage = prior.lev; CONFIG.symbol = prior.sym; CONFIG.position_type = prior.type; CONFIG.position_sizing_margin_pct = prior.pct; }
 }
 
-// The bot no longer second-guesses the exchange with its own liquidation estimate:
-// the official docs give no pre-trade formula, and the post-entry guards read the
-// exchange's own liqPrice. A wide ATR stop is therefore not refused at entry.
-//
-// `position_type` is validated against ['crossed', 'isolated'] in settings.js,
-// so use those values here. The ATR stop is (1.55 - strength*0.45) times ATR,
-// strength = confidence/100; at confidence 90 that is 1.145 x ATR, and ATR
-// here is 0.0055 * 1.5 = 8.25% of the 0.12 entry, so the stop lands at
-// 0.12 - 1.145 * 0.00825.
-for (const [name, opts] of [['isolated', { type: 'isolated', pct: 2 }], ['cross', { type: 'crossed', pct: 45 }], ['cross, all balance', { type: 'crossed', pct: 100 }]]) {
-  it(`does not refuse a wide (~8.25%) ATR stop at entry: ${name}`, async () => {
+// A wide ATR stop is still placed (never refused) — but it is clamped inside
+// the estimated liquidation price so the exchange cannot force-close before the
+// stop gets a chance to fill. The stop that lands on the entry order is the
+// tighter of the raw ATR distance and "just inside the liq estimate".
+// ATR stop = entry - (1.55 - strength*0.45)*ATR; strength = 0.9 at conf 90,
+// ATR = 0.0055*1.5, so raw stop = 0.12 - 1.145*0.00825 = 0.11055.
+const MMR = 0.004;
+function estLiq(entry, side, lev, qty, balance, cross, pct) {
+  if (!cross) return entry * (1 - 1 / lev + MMR);
+  // cross: budget = available*pct/100 margin; qty = budget*lev/entry (basePrec 1 -> floor)
+  const budget = 1000 * pct / 100;
+  const q = Math.floor(budget * lev / entry);
+  return side === 'long' ? entry * (1 + MMR) - 1000 / q : entry * (1 - MMR) + 1000 / q;
+}
+for (const [name, opts, cross, pct] of [
+  ['isolated', { type: 'isolated', pct: 2 }, false, 2],
+  ['cross', { type: 'crossed', pct: 45 }, true, 45],
+  ['cross, all balance', { type: 'crossed', pct: 100 }, true, 100],
+]) {
+  it(`places (never refuses) the wide stop, clamped inside liquidation: ${name}`, async () => {
     const atrValue = 0.0055 * 1.5;
     const { err, placed } = await attempt(atrValue, opts);
     assert.equal(err, null, `unexpected refusal: ${err?.message}`);
     assert.equal(placed.length, 1);
-    // The wide ATR stop is what we are exercising: assert it actually landed on
-    // the entry order, not just that a single order was placed.
-    assert.ok(placed[0], 'expected an entry order to be placed');
-    assert.ok(placed[0].slPrice, 'entry order must carry a stop-loss price');
-    const expectedStop = 0.12 - (1.55 - 0.9 * 0.45) * atrValue; // 1.145x ATR at confidence 90
-    // The entry order snaps its stop to the pair's quotePrecision (5 here), so
-    // compare the rounded value rather than the exact one.
+    assert.ok(placed[0]?.slPrice, 'entry order must carry a stop-loss price');
+    const rawStop = 0.12 - (1.55 - 0.9 * 0.45) * atrValue; // 0.11055
+    const liq = cross ? estLiq(0.12, 'long', 30, null, 1000, true, pct) : estLiq(0.12, 'long', 30, null, null, false, pct);
+    // expected stop = the raw ATR stop unless it falls on/below the liq price,
+    // in which case it is clamped to just inside it (LIQ_STOP_PADDING 0.002).
+    const expected = rawStop <= liq ? liq * 1.002 : rawStop;
     const rounded = Math.round(Number(placed[0].slPrice) * 10 ** pair.quotePrecision) / 10 ** pair.quotePrecision;
-    assert.equal(rounded, Math.round(expectedStop * 10 ** pair.quotePrecision) / 10 ** pair.quotePrecision, 'ATR stop must be on the entry order');
+    const want = Math.round(expected * 10 ** pair.quotePrecision) / 10 ** pair.quotePrecision;
+    assert.equal(rounded, want, `stop ${rounded} should sit just inside liq ${liq}`);
   });
 }

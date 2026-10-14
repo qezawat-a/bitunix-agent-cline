@@ -372,8 +372,19 @@ export class Trader {
     this.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
     this.state.confirmations.delete(symbol);
 
-    const { qty, pair } = await this.computePositionSize(entryPrice, 'MARKET');
+    const { qty, pair, available } = await this.computePositionSize(entryPrice, 'MARKET');
     const clientId = `jrock-open-${symbol}-${Date.now()}`;
+    // Estimate the liquidation price BEFORE the position exists so the stop
+    // that rides on the entry order sits inside it. A stop beyond the
+    // liquidation price never fires — the exchange force-closes first.
+    // This is the fix for the "SL 0.05881 behind Liq 0.05915" loss.
+    const estLiqPrice = await this.positionManager.estimateLiqPrice(
+      entryPrice,
+      direction === 'bullish' ? 'BUY' : 'SELL',
+      qty,
+      available,
+      CONFIG.leverage,
+    );
     // The reference price is snapped to the pair's quotePrecision BEFORE the
     // TP/SL is derived, so the levels all sit on ticks the exchange will
     // actually accept. Bitunix answers a price carrying more decimals than
@@ -396,6 +407,7 @@ export class Trader {
       atr: atr ?? await this.computeAtr(symbol),
       confidence: signalConfidence,
       clientId,
+      liqPrice: estLiqPrice,
     });
 
     if (!CONFIG.auto_trade) throw new Error('auto_trade was disabled before order submission');
@@ -441,7 +453,7 @@ export class Trader {
   // along on the very same order. That matters because protection is otherwise
   // attached a moment later, and a position filled in that gap has no defined
   // exit: it only closes when a human notices.
-  buildProtectedOrderBody({ symbol, side, qty, price, orderType, pair, atr, confidence, clientId = null }) {
+  buildProtectedOrderBody({ symbol, side, qty, price, orderType, pair, atr, confidence, clientId = null, liqPrice = null }) {
     // Snap to quotePrecision first, then derive the levels from the snapped
     // price, so limit price and stops all land on ticks Bitunix accepts.
     const entryPrice = roundPrice(price, pair);
@@ -451,7 +463,9 @@ export class Trader {
     if (!direction) throw new Error('order side must be BUY or SELL');
     // computeTPSL throws when ATR is missing rather than falling back to a
     // fixed percentage: an entry without a real stop distance is not tradable.
-    const levels = this.positionManager.computeTPSL(entryPrice, direction, atr, confidence ?? CONFIG.min_confidence, quotePrecision);
+    // liqPrice (when supplied) clamps the stop inside the liquidation price so
+    // the exchange never force-closes before the stop gets a chance to fill.
+    const levels = this.positionManager.computeTPSL(entryPrice, direction, atr, confidence ?? CONFIG.min_confidence, quotePrecision, liqPrice);
     const body = {
       symbol,
       side,
@@ -632,7 +646,7 @@ export class Trader {
           : 'is not a tradable size';
       throw new Error(`position size ${sized.qty} ${detail}`);
     }
-    return { qty: sized.qty, pair };
+    return { qty: sized.qty, pair, available };
   }
 
   async guard() {
