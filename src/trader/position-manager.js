@@ -102,8 +102,10 @@ export class PositionManager {
   // A break-even trigger must land somewhere the position can actually reach
   // before its target: at low leverage the take-profit's ROI is below one stop
   // distance, so no ATR-sized break-even trigger exists and the configured
-  // value is used instead.
-  static ATR_SIZED_BE_CEIL = 0.5;
+  // value is used instead. Quarter the target band: at the midpoint the trigger
+  // only fires after half the profit band is already on the table, which on a
+  // tight ATR stop is effectively the same tick the target would fill.
+  static ATR_SIZED_BE_CEIL = 0.25;
   triggerAtrCache = new Map();
   // When break-even was last applied to a position, and at which stop price.
   //
@@ -972,9 +974,10 @@ export class PositionManager {
       let ceiling = toRoi(atr * targetMultiple) * ceilTp;
       if (!(floor > 0) || !(ceiling >= floor)) return configuredRoi;
       if (floorR === 1 && ceilTp === 0.6) {
-        // Break-even only: hold the trigger back from the last half of the
-        // take-profit band so it fires on real progress toward the target,
-        // not on noise between the stop and the target.
+        // Break-even only: hold the trigger back to the first quarter of the
+        // take-profit band so it fires on real progress toward the target —
+        // a midpoint trigger only engages on the last ticks before the
+        // target fills, which is no protection at all on a tight stop.
         ceiling = toRoi(atr * targetMultiple) * PositionManager.ATR_SIZED_BE_CEIL;
         if (ceiling < floor) ceiling = floor;
       }
