@@ -942,6 +942,21 @@ export class PositionManager {
     return result;
   }
 
+  // A stop move that would sit on the far side of the liquidation price buys
+  // nothing: the exchange force-closes at liquidation before our stop ever
+  // fills, converting "hold at break-even" into a full loss. Refuse to move a
+  // stop across its own liquidation price — for a long the stop stays above
+  // liq, for a short it stays below liq. A missing liqPrice cannot be
+  // verified, so it fails closed like the risk gate does.
+  liqDistanceOk(position, candidateStop) {
+    if (!Number.isFinite(candidateStop) || candidateStop <= 0) return false;
+    const liq = Number(position.liqPrice);
+    if (!Number.isFinite(liq) || liq <= 0) return false;
+    if (position.side === 'BUY') return candidateStop > liq;
+    if (position.side === 'SELL') return candidateStop < liq;
+    return true;
+  }
+
   breakEvenPrice(entry, side) {
     const buffer = PositionManager.BREAKEVEN_BUFFER_PCT / 100;
     return side === 'SELL' ? entry * (1 - buffer) : entry * (1 + buffer);
@@ -1011,7 +1026,11 @@ export class PositionManager {
       if (finitePositive(markNow) && (position.side === 'BUY' ? target >= markNow : target <= markNow)) {
         return { skipped: 'break-even buffer not yet covered by price' };
       }
-      const result = await this.moveSLToEntry(position.positionId, target, positionMagnitude(position), position.side);
+      // The buffer side keeps the exchange liquidating before the stop can
+      // fill: a stop on the far side of its own liquidation price buys
+      // nothing, so the move is skipped instead of sent.
+      if (!this.liqDistanceOk(position, target)) return { skipped: 'break-even would sit inside the liquidation distance' };
+    const result = await this.moveSLToEntry(position.positionId, target, positionMagnitude(position), position.side);
       // Recorded only once the move actually reached the exchange, so a failed
       // modify is retried on the next tick rather than being remembered as done.
       this.breakEvenApplied.set(key, { slPrice: target, precision: await this.getQuotePrecision() });
@@ -1056,8 +1075,13 @@ export class PositionManager {
       const reduction = Number(this.settings.trailing_atr_strength_reduction) || 0.25;
       const trailDistance = atr * (multiple - strength * reduction);
       const newSL = position.side === 'BUY' ? mark - trailDistance : mark + trailDistance;
+      if (!finitePositive(newSL)) return { skipped: 'trailing stop not positive' };
+      // A stop on the wrong side of the mark has already filled: never send it.
+      if (position.side === 'BUY' && newSL >= mark) return { skipped: 'trailing stop above mark price' };
+      if (position.side === 'SELL' && newSL <= mark) return { skipped: 'trailing stop below mark price' };
       const current = await this.currentStop(position);
-      if (!finitePositive(newSL) || !this.shouldTighten(position, newSL, current)) return { skipped: 'trailing would loosen stop' };
+      if (!this.shouldTighten(position, newSL, current)) return { skipped: 'trailing would loosen stop' };
+      if (!this.liqDistanceOk(position, newSL)) return { skipped: 'trailing would sit inside the liquidation distance' };
       const result = await this.updateTrailingSL(position.positionId, newSL, positionMagnitude(position), position.side);
       this.reportStopMove?.(position, 'trailing', newSL);
       return { ...result, slPrice: formatPrice(newSL, await this.getQuotePrecision()) };

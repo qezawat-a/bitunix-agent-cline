@@ -23,6 +23,9 @@ const settings = () => ({
 });
 
 // A short, entry 100, now 98 (+20% ROI at 10x), stop still wide at 103.
+// A short's liquidation price sits ABOVE the entry (the loss side is up), so
+// liqPrice 150 keeps the guard far from interfering with the confirmation
+// cases below: candidate stop 100 < liq 150.
 const short = (over = {}) => ({
   positionId: 'p1', symbol: 'BTCUSDT', side: 'SELL', qty: '1',
   avgPrice: '100', markPrice: '98', liqPrice: '150', ...over,
@@ -103,5 +106,81 @@ describe('confirmed stop moves', () => {
     assert.equal(result.closed, true);
     assert.deepEqual(client.calls.filter(call => call.startsWith('close:')), ['close:p1']);
     assert.equal(pm.softStops.size, 0);
+  });
+});
+
+describe('the stop never moves inside the liquidation distance', () => {
+  // The live bug: a position whose stop sits barely above its liquidation price
+  // had its break-even / trailing stop pushed all the way down to liquidation,
+  // so the exchange force-closed it (full loss) instead of our stop filling.
+  // The candidate stop must stay sl_liquidation_safety away from the mark AND
+  // clear of the liquidation price itself; otherwise the move is skipped.
+
+  const settings = () => ({
+    symbol: 'WALUSDT', leverage: 25, min_confidence: 80, tpsl_method: 'position',
+    breakeven_threshold_pct: 5, trailing_trigger_roi_pct: 25, trailing_callback_pct: 5,
+    sl_liquidation_safety: 0.6, cooldown_minutes: 1, on_tpsl_failure: 'close', max_positions: 3,
+    account_tp_roi_pct: 0, account_sl_roi_pct: 0,
+    partial_tp_fractions: [0.3, 0.4, 0.3], partial_tp_roi_steps: [1, 2, 3],
+  });
+
+  const close = async () => { throw new Error('unexpected close'); };
+  const rows = [];
+  const client = {
+    getPendingTPSL: async () => rows.map(row => ({ ...row })),
+    modifyTPSL: async (params) => {
+      rows.push({ id: 'att-1', positionId: 'w1', slPrice: params.slPrice, slQty: '38' });
+      return { orderId: 'att-1' };
+    },
+    closePosition: close,
+    getTradingPairs: async () => [{ symbol: 'WALUSDT', quotePrecision: 5, basePrecision: 1 }],
+  };
+
+  // Mirror of the 25x WALUSDT loss: entry 0.06116, liq 0.0591. ATR is pinned on
+  // the position so the guard paths never reach the klines fetch.
+  const tight = (over = {}) => ({
+    positionId: 'w1', symbol: 'WALUSDT', side: 'BUY', qty: '38',
+    avgPrice: '0.06116', markPrice: '0.062', liqPrice: '0.0591', atr: 0.00226, ...over,
+  });
+
+  // A stop that would land beyond its own liquidation price is useless: the
+  // exchange force-closes at liq before the stop fills. For a long the stop
+  // must stay ABOVE liq.
+  it('break-even refuses to move the stop across the liquidation price', async () => {
+    // liq 0.0620 is ABOVE the candidate 0.06125: a long whose stop would sit
+    // below liquidation. The guard refuses instead of sending the modify.
+    const pm = new PositionManager(client, 'WALUSDT', settings());
+    const result = await pm.checkBreakeven(tight({ liqPrice: '0.0620' }));
+    assert.equal(result.skipped, 'break-even would sit inside the liquidation distance');
+    assert.equal(client.calls?.length ?? 0, 0, 'no modify was sent to the exchange');
+  });
+
+  it('break-even moves the stop when it stays clear of liquidation', async () => {
+    rows.length = 0;
+    // liq 0.0591 sits below the candidate 0.06116: a healthy long. The guard
+    // passes and the modify reaches the exchange, confirmed by the read-back.
+    const pm = new PositionManager(client, 'WALUSDT', settings());
+    const result = await pm.checkBreakeven(tight());
+    assert.notEqual(result?.skipped, 'break-even would sit inside the liquidation distance');
+    assert.equal(result?.skipped, undefined, 'the move completed, not skipped');
+  });
+
+  it('trailing refuses to ratchet the stop across the liquidation price', async () => {
+    rows.length = 0;
+    rows.push({ id: 's1', positionId: 'w1', slPrice: '0.05925', slQty: '38' });
+    const pm = new PositionManager(client, 'WALUSDT', settings());
+    // Trailing trigger at 25 ROI: mark 0.0619 gives 30.2% on margin, clears it.
+    // Candidate = mark - atr*1.05 = 0.0619 - 0.002373 = 0.059527, which sits
+    // BELOW liq 0.0596: the exchange would liquidate before the stop fills, so
+    // the move is refused.
+    const result = await pm.checkTrailing(tight({ markPrice: '0.0619', liqPrice: '0.0596' }));
+    assert.equal(result?.skipped, 'trailing would sit inside the liquidation distance');
+  });
+
+  it('a missing liqPrice fails closed', async () => {
+    rows.length = 0;
+    const pm = new PositionManager(client, 'WALUSDT', settings());
+    const result = await pm.checkBreakeven(tight({ liqPrice: undefined }));
+    assert.equal(result?.skipped, 'break-even would sit inside the liquidation distance');
   });
 });

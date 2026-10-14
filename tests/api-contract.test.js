@@ -1530,7 +1530,7 @@ describe('moving the stop never deletes the take-profit', () => {
     // stop" instead of "the stop is 5 above entry".
     const result = await pm.checkBreakeven({
       positionId: 'p1', symbol: 'BTCUSDT', side: 'SELL', qty: '-2',
-      avgPrice: '100', markPrice: '98', liqPrice: '50',
+      avgPrice: '100', markPrice: '98', liqPrice: '120',
     });
     assert.equal(result.skipped, undefined, 'the move must actually be attempted');
     assert.equal(modifies.length, 1);

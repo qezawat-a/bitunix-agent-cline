@@ -3,7 +3,7 @@ import { CONFIG } from '../config.js';
 export const DEFAULTS = {
   symbol: 'BTCUSDT',
   leverage: 10,
-  position_type: 'crossed',
+  position_type: 'isolated',
   timeframes: ['1m', '3m', '5m', '15m', '1h'],
   min_confidence: 80,
   tf_min_confidence: 60,

@@ -16,7 +16,8 @@ describe('break-even covers fees', () => {
 
 describe('ROI triggers are sized against the ATR stop and target', () => {
   // OGNUSDT-like: 15m ATR is 3.6% of price, 50x leverage.
-  const position = { positionId: 'p1', symbol: 'OGNUSDT', avgPrice: '0.03881', leverage: 50, atr: 0.0014 };
+  const position = { positionId: "p1", symbol: "OGNUSDT", avgPrice: "0.03881", leverage: 50, atr: 0.0014 };
+const positionTrailing = { positionId: "p2", symbol: "OGNUSDT", avgPrice: "0.03881", leverage: 50, atr: 0.0014, signalConfidence: 80 };
 
   it('lifts a trigger that sits inside normal noise (4% ROI at 50x is 0.08% of price) to one stop distance', async () => {
     near(await make().effectiveTriggerRoi(position, 4, 1, 0.6), 214.6);
@@ -49,5 +50,32 @@ describe('ROI triggers are sized against the ATR stop and target', () => {
     // Trailing (floorR 1.25) may trail above the take-profit band: the callback
     // owns the exit, the stop just holds it in. 1.25 x 130 = 162.5.
     near(await make().effectiveTriggerRoi(lowLevPosition, 6, 1.25, 0.85), 162.5);
+  });
+});
+
+describe('stop moves keep at least sl_liquidation_safety away from the liquidation price', () => {
+  const settings = { symbol: 'OGNUSDT', leverage: 50, min_confidence: 80, sl_liquidation_safety: 20 };
+  const make = () => new PositionManager({}, 'OGNUSDT', settings);
+
+  it('allows a long stop that is comfortably above its liquidation price', () => {
+    const pm = make();
+    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 12), true);
+  });
+  it('refuses a long stop that would sit on or below liquidation', () => {
+    const pm = make();
+    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 10), false);
+    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 9), false);
+  });
+  it('mirrors the rule for shorts: the stop stays below the liquidation price', () => {
+    const pm = make();
+    assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 7), true);
+    assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 9), false);
+    assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 11), false);
+  });
+  it('fails closed when the liquidation price is missing or invalid', () => {
+    const pm = make();
+    assert.equal(pm.liqDistanceOk({ side: 'BUY' }, 12), false);
+    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '0' }, 12), false);
+    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: undefined }, 12), false);
   });
 });
