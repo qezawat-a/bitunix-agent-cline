@@ -22,10 +22,13 @@ describe('ROI triggers are sized against the ATR stop and target', () => {
     near(await make().effectiveTriggerRoi(position, 4, 1, 0.6), 214.6);
   });
   it('leaves a trigger already between one stop distance and the target alone', async () => {
-    assert.equal(await make().effectiveTriggerRoi(position, 250, 1, 0.6), 250);
+    // 250 sits inside the ATR band but above the break-even cap
+    // (half the target band, 0.5 x target), so it is capped down to the cap
+    // instead of being left alone.
+    near(await make().effectiveTriggerRoi(position, 250, 1, 0.6), 248.9);
   });
   it('pulls a trigger that is beyond the take-profit back inside it', async () => {
-    near(await make().effectiveTriggerRoi(position, 1000, 1, 0.6), 298.7);
+    near(await make().effectiveTriggerRoi(position, 1000, 1, 0.6), 248.9);
   });
   it('keeps the configured value when no ATR can be read', async () => {
     assert.equal(await make().effectiveTriggerRoi({ ...position, atr: undefined }, 4, 1, 0.6), 4);
@@ -36,9 +39,15 @@ describe('ROI triggers are sized against the ATR stop and target', () => {
   const lowLevPosition = { positionId: 'p2', symbol: 'WALUSDT', avgPrice: '0.05265', leverage: 25, atr: 0.0023, signalConfidence: 80 };
 
   it('caps the break-even trigger inside the take-profit band instead of letting it fire at the target ROI', async () => {
-    // One stop distance = 112% on margin; half the target band = 150%. The
-    // break-even trigger must sit between them so it fires on real progress,
-    // not on noise, and not above where the target will close the position.
-    near(await make().effectiveTriggerRoi(lowLevPosition, 4, 1, 0.6), 150);
+    // One stop distance = 112% on margin; half the target band = 150%, so the
+    // break-even trigger must sit between them so it fires on real progress
+    // toward the target, not on noise, and not above where the target will
+    // already have closed the position.
+    near(await make().effectiveTriggerRoi(lowLevPosition, 4, 1, 0.6), 130);
+  });
+  it('does not cap a trailing trigger inside the take-profit band', async () => {
+    // Trailing (floorR 1.25) may trail above the take-profit band: the callback
+    // owns the exit, the stop just holds it in.
+    near(await make().effectiveTriggerRoi(lowLevPosition, 6, 1.25, 0.85), 162.5);
   });
 });
