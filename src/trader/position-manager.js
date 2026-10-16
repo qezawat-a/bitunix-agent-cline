@@ -1089,17 +1089,25 @@ export class PositionManager {
     return this.confirmedStopMove(params, positionId, positionQty, side);
   }
 
-  // The stop ladder (stop_step_roi_pct, in ROI-on-margin percent — the same
-  // unit trailing_trigger_roi_pct is quoted in): a rung fires every time the
+  // The stop ladder rides trailing_trigger_roi_pct (ROI-on-margin percent, the
+  // same unit the trailing trigger is quoted in): a rung fires every time the
   // favourable ROI crosses the next multiple of the spacing — e.g. spacing
   // 100 gives the 100 / 200 / 300 ladder. Each rung ratchets the stop up to
   // the PRIOR rung's line: the rung 1 stop sits at the entry (the break-even
   // line, which is what fires it early instead of waiting for the ATR
   // trigger), the rung 2 stop one spacing into the profit, rung 3 two. The
   // stop therefore always lags the price by one rung, so a pullback fills it
-  // inside the profit instead of round-tripping the move. 0 disables.
+  // inside the profit instead of round-tripping the move. 0 disables trailing,
+  // and with it the ladder.
   async checkStopStep(position) {
-    const spacing = Number(this.settings.stop_step_roi_pct) || 0;
+    // The stop ladder: the rungs ride the EXISTING trailing_trigger_roi_pct,
+    // the same ROI-on-margin unit the trailing trigger already uses. Rung 1
+    // fires at that trigger and lands the stop on the break-even line, so
+    // break-even arms at the trailing trigger instead of waiting for the ATR
+    // trigger; every later multiple of the trigger adds one more rung, each
+    // holding the stop one trigger-step (trigger/leverage percent of price)
+    // ahead of entry. 0 disables trailing, and with it the ladder.
+    const spacing = Number(this.settings.trailing_trigger_roi_pct) || 0;
     if (!(spacing > 0)) return { skipped: 'stop ladder disabled' };
     const move = this.favorableRoiPct(position);
     if (!Number.isFinite(move)) return { skipped: 'stop ladder: ROI not readable' };
@@ -1531,7 +1539,7 @@ export class PositionManager {
         const breakeven = await this.checkBreakeven(position);
         if (breakeven?.slPrice && !breakeven.skipped) position.slPrice = breakeven.slPrice;
         // Rung 1 of the ladder lands the stop at the entry; rungs above 1
-        // hold it a trailing_callback_pct offset into the profit.
+        // hold it one trigger-step ahead of entry each.
         const stopStep = await this.checkStopStep(position);
         if (stopStep?.slPrice && !stopStep.skipped) position.slPrice = stopStep.slPrice;
         const trailing = await this.checkTrailing(position);

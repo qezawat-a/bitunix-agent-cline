@@ -104,7 +104,6 @@ export const CONFIG = {
   trailing_trigger_roi_pct: Number(S('trailing_trigger_roi_pct', 6)),
   trailing_atr_multiple: Number(S('trailing_atr_multiple', 1.25)),
   trailing_atr_strength_reduction: Number(S('trailing_atr_strength_reduction', 0.25)),
-  stop_step_roi_pct: Number(S('stop_step_roi_pct', 0)),
   sl_liquidation_safety: Number(S('sl_liquidation_safety', 0.60)),
   on_tpsl_failure: S('on_tpsl_failure', 'close'),
   reversal_enabled: B(S('reversal_enabled', 'true'), true, 'reversal_enabled'),

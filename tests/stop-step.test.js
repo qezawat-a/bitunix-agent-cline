@@ -2,19 +2,19 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { PositionManager } from '../src/trader/position-manager.js';
 
-// The stop ladder (stop_step_roi_pct, ROI on margin): a rung fires every time
-// the favorable ROI crosses the next multiple of the spacing — 100 -> the
-// 100 / 200 / 300 ladder on a 25x pair — and ratchets the stop up to the
-// PRIOR rung's line, lagging the price by one rung.
+// The stop ladder: a rung fires every time the favorable ROI crosses the next
+// multiple of trailing_trigger_roi_pct — e.g. trigger 4 -> the 4 / 8 / 12
+// ladder — and ratchets the stop up to the PRIOR rung's line, lagging the
+// price by one rung. It rides the EXISTING trigger setting; 0 disables.
 
 PositionManager.STOP_VERIFY_DELAY_MS = 0;
 PositionManager.ATR_SIZED_TRIGGERS = false;
 PositionManager.BREAKEVEN_BUFFER_PCT = 0; // pin the buffer so levels are exact
 
-const settings = (spacing) => ({
+const settings = (trigger) => ({
   symbol: 'BTCUSDT', leverage: 10, min_confidence: 80, tpsl_method: 'position',
-  breakeven_threshold_pct: 5, trailing_trigger_roi_pct: 25, trailing_callback_pct: 5,
-  stop_step_roi_pct: spacing, sl_liquidation_safety: 10,
+  breakeven_threshold_pct: 5, trailing_trigger_roi_pct: trigger, trailing_callback_pct: 5,
+  sl_liquidation_safety: 10,
   cooldown_minutes: 1, on_tpsl_failure: 'close', max_positions: 3,
   account_tp_roi_pct: 0, account_sl_roi_pct: 0,
   partial_tp_fractions: [0.3, 0.4, 0.3], partial_tp_roi_steps: [1, 2, 3],
@@ -44,8 +44,8 @@ function exchange({ work = false } = {}) {
   return client;
 }
 
-describe('stop ladder (stop_step_roi_pct)', () => {
-  it('is a no-op when disabled', async () => {
+describe('stop ladder (trailing_trigger_roi_pct)', () => {
+  it('is a no-op when the trailing trigger is 0', async () => {
     const client = exchange();
     const pm = new PositionManager(client, 'BTCUSDT', settings(0));
     const result = await pm.checkStopStep(long({ markPrice: '200' }));
@@ -56,7 +56,7 @@ describe('stop ladder (stop_step_roi_pct)', () => {
   it('fires at the first rung and lands the stop on the break-even line', async () => {
     const client = exchange({ work: true });
     const pm = new PositionManager(client, 'BTCUSDT', settings(40));
-    // +4% price at 10x = 40 ROI: clears the rung-1 threshold.
+    // +4% price at 10x = 40 ROI: clears the trigger-40 rung-1 threshold.
     const result = await pm.checkStopStep(long());
     assert.equal(result.rung, 1);
     assert.equal(result.slPrice, '100', 'rung 1 is the entry/break-even line');
@@ -115,23 +115,9 @@ describe('stop ladder (stop_step_roi_pct)', () => {
   });
 
   it('waits while the price has not covered the rung line', async () => {
-    // +5.5% price = 55 ROI clears rung 2's 80-ROI threshold? No — 55 < 80.
-    // Use a mark that clears ROI 80 but not the price line 104: mark 108
-    // (80 ROI) with liq 90, candidate 104, line 104 < mark 108 — actually
-    // covered. The uncovered case is: mark 103.9 (39 ROI), threshold not
-    // reached. So this fixture tests threshold-not-reached, which is already
-    // covered above. To exercise the price-line guard specifically: mark
-    // 104.1 (40.1 ROI < 80) still below threshold. The guard only bites
-    // when ROI >= threshold AND candidate >= mark, i.e. when spacing is so
-    // large that the next line overshoots the mark that triggered it —
-    // a case that cannot arise because the threshold itself guarantees
-    // mark >= entry * (1 + nextRung*spacing/100/lev) = candidate for a
-    // forward long. For shorts the symmetry holds. This guard is
-    // therefore unreachable in practice; keep it as a defensive check and
-    // assert the threshold path with the fixture that does reach it.
+    // +3.9% price = 39 ROI: under the 40-ROI rung threshold — not reached.
     const client = exchange();
     const pm = new PositionManager(client, 'BTCUSDT', settings(40));
-    pm.stepApplied.set('p1', { rung: 1, slPrice: '100' });
     const result = await pm.checkStopStep(long({ markPrice: '103.9' }));
     assert.equal(result.skipped, 'stop ladder threshold not reached');
     assert.equal(client.calls.length, 0);
