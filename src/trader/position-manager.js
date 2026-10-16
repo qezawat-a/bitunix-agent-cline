@@ -44,7 +44,8 @@ const positionQtyOf = (position) => position?.qty ?? position?.size ?? null;
 
 // Fraction of the liquidation price a clamped stop keeps as working room. A
 // stop sitting exactly on liquidation races the exchange's own engine and can
-// still lose, so a small margin is kept on the fillable side of it.
+// still lose, so a small margin is kept on the fillable side of it. A module
+// constant so it can be read or overridden in tests via PositionManager.LIQ_STOP_PADDING.
 const LIQ_STOP_PADDING = 0.002;
 
 // A position's size is a magnitude. get_pending_positions documents `qty` only
@@ -106,6 +107,10 @@ export class PositionManager {
   // only fires after half the profit band is already on the table, which on a
   // tight ATR stop is effectively the same tick the target would fill.
   static ATR_SIZED_BE_CEIL = 0.25;
+  // Working room kept between a clamped stop and its own liquidation price.
+  // A stop sitting exactly on liquidation races the exchange's own engine,
+  // so it is held this fraction of the liq price on the fillable side.
+  static LIQ_STOP_PADDING = LIQ_STOP_PADDING;
   triggerAtrCache = new Map();
   // When break-even was last applied to a position, and at which stop price.
   //
@@ -122,6 +127,10 @@ export class PositionManager {
   // modify cannot improve on that. If the stop is later genuinely lost, the
   // ensureProtection/repair path re-arms it, which clears the marker.
   breakEvenApplied = new Map();
+  // Stop-ladder rungs applied per position: positionId -> { rung, slPrice }.
+  // A rung fires once and is remembered, so a stop is never re-sent at the
+  // same level and the ladder only ever ratchets forward.
+  stepApplied = new Map();
   // Stops the exchange refused to move: positionId -> { side, slPrice }. The bot
   // enforces them itself (checkSoftStop) until a move is finally confirmed.
   softStops = new Map();
@@ -520,6 +529,12 @@ export class PositionManager {
   // MMR is tiered by notional (entry × qty). When the tiers endpoint is
   // unreachable the method falls back to 0.004 (the tier-1 rate the doc
   // publishes for small notionals), which is the safest (closest) estimate.
+  //
+  // Note: Bitunix's margin mode is per-exchange, not per-order. If the account
+  // is actually running in ISOLATED mode, the cross-margin estimate here is
+  // wrong — but it is still the best available pre-entry estimate, and the
+  // liquidation guard + tiered maintenance-margin check will catch any
+  // divergence once the position is live.
   async estimateLiqPrice(entryPrice, side, qty, balance, leverage) {
     if (!finitePositive(entryPrice) || !finitePositive(qty)) return null;
     const notional = entryPrice * qty;
@@ -573,8 +588,8 @@ export class PositionManager {
     // the stop, only pulls it back to somewhere it can fill.
     const liq = Number(liqPrice);
     if (finitePositive(liq) && finitePositive(slPrice)) {
-      if (isLong && slPrice <= liq) slPrice = liq * (1 + LIQ_STOP_PADDING);
-      if (!isLong && slPrice >= liq) slPrice = liq * (1 - LIQ_STOP_PADDING);
+      if (isLong && slPrice <= liq) slPrice = liq * (1 + PositionManager.LIQ_STOP_PADDING);
+      if (!isLong && slPrice >= liq) slPrice = liq * (1 - PositionManager.LIQ_STOP_PADDING);
     }
 
     return {
@@ -767,8 +782,16 @@ export class PositionManager {
       .filter(item => String(item?.positionId) === key)
       .map(item => Number(item?.slPrice ?? item?.stopPrice))
       .filter(finitePositive);
-    if (finitePositive(own)) stops.push(own);
+    // The exchange rows own the answer whenever any live stop exists; the
+    // position payload's slPrice is a within-tick hint that may be STALE —
+    // midManage() writes it from the last confirmed move, and a retracing
+    // mark can carry that old level back into the next tick. Folding the
+    // hint in by max() dragged a long's stop BACK DOWN on the very next tick
+    // (102.95 -> 102.45 -> 101.45 as price fell), so a confirmed move looked
+    // undone to every later check. The hint is used only when the exchange
+    // reports no stop at all.
     if (stops.length) return position.side === 'SELL' ? Math.min(...stops) : Math.max(...stops);
+    if (finitePositive(own)) return own;
     const tpsl = await this.positionTPSL(position.positionId, positionMagnitude(position));
     const pendingStop = Number(tpsl?.slPrice ?? tpsl?.stopPrice);
     return finitePositive(pendingStop) ? pendingStop : null;
@@ -952,8 +975,9 @@ export class PositionManager {
     if (!Number.isFinite(candidateStop) || candidateStop <= 0) return false;
     const liq = Number(position.liqPrice);
     if (!Number.isFinite(liq) || liq <= 0) return false;
-    if (position.side === 'BUY') return candidateStop > liq;
-    if (position.side === 'SELL') return candidateStop < liq;
+    const pad = PositionManager.LIQ_STOP_PADDING;
+    if (position.side === 'BUY') return candidateStop > liq * (1 + pad);
+    if (position.side === 'SELL') return candidateStop < liq * (1 - pad);
     return true;
   }
 
@@ -1059,6 +1083,81 @@ export class PositionManager {
       symbol: this.symbol,
       positionId,
       slPrice: formatPrice(entryPrice, quotePrecision),
+      slStopType: 'MARK_PRICE',
+    };
+    Object.assign(params, existing);
+    return this.confirmedStopMove(params, positionId, positionQty, side);
+  }
+
+  // The stop ladder (stop_step_roi_pct, in ROI-on-margin percent — the same
+  // unit trailing_trigger_roi_pct is quoted in): a rung fires every time the
+  // favourable ROI crosses the next multiple of the spacing — e.g. spacing
+  // 100 gives the 100 / 200 / 300 ladder. Each rung ratchets the stop up to
+  // the PRIOR rung's line: the rung 1 stop sits at the entry (the break-even
+  // line, which is what fires it early instead of waiting for the ATR
+  // trigger), the rung 2 stop one spacing into the profit, rung 3 two. The
+  // stop therefore always lags the price by one rung, so a pullback fills it
+  // inside the profit instead of round-tripping the move. 0 disables.
+  async checkStopStep(position) {
+    const spacing = Number(this.settings.stop_step_roi_pct) || 0;
+    if (!(spacing > 0)) return { skipped: 'stop ladder disabled' };
+    const move = this.favorableRoiPct(position);
+    if (!Number.isFinite(move)) return { skipped: 'stop ladder: ROI not readable' };
+    const key = String(position.positionId);
+    const rungApplied = Number(this.stepApplied.get(key)?.rung) || 0;
+    const nextRung = rungApplied + 1;
+    if (move < nextRung * spacing) return { skipped: 'stop ladder threshold not reached' };
+    const entry = Number(position.avgPrice);
+    if (!finitePositive(entry)) throw new Error('entry price must be positive');
+    const sign = position.side === 'BUY' ? 1 : -1;
+    // Rung nextRung places the stop on the rungApplied line — the lag, above.
+    // The break-even line carries the fee buffer; later lines sit one rung
+    // spacing ahead of entry each. A ROI-on-margin unit scales with leverage:
+    // a +X% price move is X*L ROI on margin, so one spacing unit of ROI is
+    // spacing/L percent of price (both read as percentages).
+    const leverage = finitePositive(position.leverage)
+      ? Number(position.leverage)
+      : finitePositive(this.settings.leverage) ? Number(this.settings.leverage) : 1;
+    const spacingPricePct = spacing / leverage;
+    // The break-even line carries the fee buffer; later lines sit one rung
+    // spacing ahead of entry each.
+    const buffer = rungApplied === 0
+      ? PositionManager.BREAKEVEN_BUFFER_PCT
+      : rungApplied * spacingPricePct;
+    const candidate = entry * (1 + sign * (buffer / 100));
+    // A rung only ever ratchets the stop forward: if the stop already sits
+    // at or ahead of this rung's line, re-sending the identical or a
+    // looser level is noise.
+    const current = await this.currentStop(position);
+    if (current !== null && !this.shouldTighten(position, candidate, current)) {
+      return { skipped: 'stop ladder already at or ahead of this rung' };
+    }
+    // The stop still sits behind the rung's line: fire it.
+    const markNow = Number(position.markPrice);
+    if (finitePositive(markNow) && (position.side === 'BUY' ? candidate >= markNow : candidate <= markNow)) {
+      return { skipped: 'stop ladder line not yet covered by price' };
+    }
+    if (!this.liqDistanceOk(position, candidate)) return { skipped: 'stop ladder would sit inside the liquidation distance' };
+    const result = await this.moveSLToStep(position.positionId, candidate, positionMagnitude(position), position.side);
+    this.stepApplied.set(key, { rung: nextRung, slPrice: String(candidate) });
+    // The first rung IS the break-even line, so claim it in the break-even
+    // record too: checkBreakeven then reads it as already applied instead of
+    // re-sending the identical modify on every later tick.
+    if (rungApplied === 0) {
+      this.breakEvenApplied.set(key, { slPrice: candidate, precision: await this.getQuotePrecision() });
+    }
+    this.reportStopMove?.(position, `stop_step_${nextRung}`, candidate);
+    return { ...result, rung: nextRung, slPrice: formatPrice(candidate, await this.getQuotePrecision()) };
+  }
+
+  async moveSLToStep(positionId, slPrice, positionQty = null, side = null) {
+    // The whole-pair replace rule is the same as moveSLToEntry: carry the
+    // take-profit or it is deleted by the stop-only modify.
+    const existing = await this.preserveTakeProfit(positionId, positionQty);
+    const params = {
+      symbol: this.symbol,
+      positionId,
+      slPrice: formatPrice(slPrice, await this.getQuotePrecision()),
       slStopType: 'MARK_PRICE',
     };
     Object.assign(params, existing);
@@ -1176,6 +1275,49 @@ export class PositionManager {
     // The peaks belonged to positions that no longer exist.
     this.trailingState.clear();
     return { triggered, roi, totalPnl, totalMargin };
+  }
+
+  // A stop sitting within LIQ_STOP_PADDING of its liquidation price is not a
+  // usable stop: the exchange force-closes at liquidation before the stop
+  // fills. After a break-even or trailing move, pull the stop back to at least
+  // the padding distance from liquidation. Runs in the same mid-manage pass,
+  // so a stop that got too close (e.g. because the liqPrice shifted after
+  // opening, or because the move was to a level close to liq) gets re-armed.
+  async rearmStopIfInsideLiq(position) {
+    const liq = Number(position.liqPrice);
+    if (!Number.isFinite(liq) || liq <= 0) return null;
+    const current = await this.currentStop(position);
+    if (!Number.isFinite(current) || current <= 0) return null;
+    const pad = PositionManager.LIQ_STOP_PADDING;
+    let target = null;
+    if (position.side === 'BUY' && current <= liq * (1 + pad)) target = liq * (1 + pad);
+    else if (position.side === 'SELL' && current >= liq * (1 - pad)) target = liq * (1 - pad);
+    if (target === null) return null;
+    const mark = Number(position.markPrice);
+    if (Number.isFinite(mark) && mark > 0) {
+      if (position.side === 'BUY' && target >= mark) return { skipped: 'rearm would put stop above mark' };
+      if (position.side === 'SELL' && target <= mark) return { skipped: 'rearm would put stop below mark' };
+    }
+    const qty = positionMagnitude(position);
+    const result = await this.updateTrailingSL(position.positionId, target, qty, position.side);
+    if (result && result.slPrice !== undefined) {
+      this.breakEvenApplied.delete(String(position.positionId));
+      this.reportStopMove?.(position, 'liq-rearm', target);
+    }
+    return { rearm: true, target, ...(result || {}) };
+  }
+
+  async moveSLToEntry(positionId, entryPrice, positionQty = null, side = null) {
+    const quotePrecision = await this.getQuotePrecision();
+    const existing = await this.preserveTakeProfit(positionId, positionQty);
+    const params = {
+      symbol: this.symbol,
+      positionId,
+      slPrice: formatPrice(entryPrice, quotePrecision),
+      slStopType: 'MARK_PRICE',
+    };
+    Object.assign(params, existing);
+    return this.confirmedStopMove(params, positionId, positionQty, side);
   }
 
   async checkLiquidationGuard(position) {
@@ -1373,6 +1515,12 @@ export class PositionManager {
         // Tiered risk limit: the exchange's own maintenance-margin trigger.
         const marginGuard = await this.checkMaintenanceMargin(position);
         if (marginGuard?.closed) continue;
+        // Keep the stop a working distance away from its own liquidation
+        // price: a stop that sits inside the liq padding is decorative, the
+        // exchange force-closes first. This runs after the guards (they own
+        // the "already too close, close it" decision) so it only ever moves a
+        // still-open position's stop back into the fillable zone.
+        await this.rearmStopIfInsideLiq(position);
 
         // A stop the exchange refused to move is enforced here, before any
         // further profit-side management.
@@ -1382,6 +1530,10 @@ export class PositionManager {
         // Profit-side management only once the position is known to be safe.
         const breakeven = await this.checkBreakeven(position);
         if (breakeven?.slPrice && !breakeven.skipped) position.slPrice = breakeven.slPrice;
+        // Rung 1 of the ladder lands the stop at the entry; rungs above 1
+        // hold it a trailing_callback_pct offset into the profit.
+        const stopStep = await this.checkStopStep(position);
+        if (stopStep?.slPrice && !stopStep.skipped) position.slPrice = stopStep.slPrice;
         const trailing = await this.checkTrailing(position);
         if (trailing?.slPrice && !trailing.skipped) position.slPrice = trailing.slPrice;
         // Method 3: the peak/callback exit only runs under the trailing method;

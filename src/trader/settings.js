@@ -57,6 +57,10 @@ export const DEFAULTS = {
   account_tp_roi_pct: 0,
   account_sl_roi_pct: 0,
   position_sizing_margin_pct: 2,
+  // Stop ladder: ROI-on-margin percent per rung (e.g. 100 -> rungs at
+  // 100/200/300). Each rung ratchets the stop up to the prior rung's line.
+  // 0 disables.
+  stop_step_roi_pct: 0,
   auto_trade: false,
   // Telegram notifications. The position lifecycle was silent: the bot only
   // reported signals, so an entry or an exit happened with no message at all.
@@ -215,6 +219,7 @@ export const SETTING_RANGES = Object.freeze({
   guard_interval_sec: [5, 86400, true],
   breakeven_threshold_pct: [0, 1000],
   trailing_trigger_roi_pct: [0, 10000],
+  stop_step_roi_pct: [0, 10000],
   trailing_atr_multiple: [0.01, 100],
   trailing_atr_strength_reduction: [0, 1],
   sl_liquidation_safety: [0.01, 1],

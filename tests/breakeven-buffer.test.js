@@ -56,21 +56,28 @@ const positionTrailing = { positionId: "p2", symbol: "OGNUSDT", avgPrice: "0.038
 describe('stop moves keep at least sl_liquidation_safety away from the liquidation price', () => {
   const settings = { symbol: 'OGNUSDT', leverage: 50, min_confidence: 80, sl_liquidation_safety: 20 };
   const make = () => new PositionManager({}, 'OGNUSDT', settings);
+  const PAD = PositionManager.LIQ_STOP_PADDING;
 
   it('allows a long stop that is comfortably above its liquidation price', () => {
     const pm = make();
     assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 12), true);
   });
-  it('refuses a long stop that would sit on or below liquidation', () => {
+  it('refuses a long stop that would sit on or below liquidation (or inside the pad)', () => {
     const pm = make();
     assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 10), false);
     assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 9), false);
+    // Inside the 0.2% pad: 10.10 < 10.20 -> refused even though above liq.
+    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 10 * (1 + PAD) * 0.99), false);
+    // Just outside the pad: allowed.
+    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 10 * (1 + PAD) * 1.01), true);
   });
   it('mirrors the rule for shorts: the stop stays below the liquidation price', () => {
     const pm = make();
     assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 7), true);
     assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 9), false);
     assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 11), false);
+    assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 9 * (1 - PAD) * 1.01), false);
+    assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 9 * (1 - PAD) * 0.99), true);
   });
   it('fails closed when the liquidation price is missing or invalid', () => {
     const pm = make();
