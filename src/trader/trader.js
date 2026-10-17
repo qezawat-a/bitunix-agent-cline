@@ -142,6 +142,14 @@ export class Trader {
     lastReportData: null,
     lastMarketDirection: null,
     confirmations: new Map(),
+    // Daily-loss circuit breaker bookkeeping. dayStartBalance is the available
+    // balance at the start of the UTC day; realizedToday sums realizedPNL from
+    // the exchange's closed-position history for trades closed today. Both are
+    // reset by refreshLossBreakers() when the UTC date rolls over.
+    dayKey: null,
+    dayStartBalance: null,
+    realizedToday: 0,
+    lossBreakerFired: null,
   };
   entryInFlight = new Set();
   guardInFlight = null;
@@ -369,6 +377,11 @@ export class Trader {
     if (!CONFIG.auto_trade) throw new Error('auto_trade is disabled');
     if (!['bullish', 'bearish'].includes(direction)) throw new Error('invalid trade direction');
     if (!validPositive(entryPrice)) throw new Error('entry price must be positive');
+    // The two breakers that stopped the 0.40→0.07 bleed: the account may not
+    // be below the balance floor, and today's realized losses may not have
+    // crossed the daily loss limit. Both checked before sizing or estimating
+    // anything, so a trip never costs a round trip to the exchange.
+    await this.checkLossBreakers();
     this.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
     this.state.confirmations.delete(symbol);
 
@@ -556,6 +569,9 @@ export class Trader {
     }
 
     const pair = await this.getPairMetadata(normalizedSymbol);
+    // The breakers apply to manual entries too: an explicit request is not a
+    // reason to open a position into a breached loss limit or a dust balance.
+    await this.checkLossBreakers();
     const open = await this.reconcilePositions();
     if (open.length >= Number(CONFIG.max_positions)) {
       throw new Error(`already holding ${open.length} position(s); max_positions is ${CONFIG.max_positions}`);
@@ -771,6 +787,72 @@ export class Trader {
     if (now < this.state.lastReport + CONFIG.report_interval_sec * 1000) return;
     console.log(`[Report ${new Date().toISOString()}] symbol=${CONFIG.symbol} positions=${this.state.positions.length}`);
     this.state.lastReport = now;
+  }
+
+  // Daily-loss circuit breaker.
+  //
+  // The account bled 0.40 USDT down to ~0 in one session because every stop-out
+  // re-entered on the next scan, so the bot traded right down to zero. Two
+  // independent breakers exist so that cannot happen again:
+  //
+  //   max_daily_loss_pct — realized PnL from trades closed TODAY (UTC) summed
+  //     from the exchange's own closed-position history, compared against a
+  //     percentage of the available balance at the start of the UTC day. A
+  //     breach halts auto_trade for the rest of the day. 0 disables.
+  //
+  //   min_balance        — the account simply may not open a position while its
+  //     available USDT is below the floor. A 0.07 USDT balance cannot carry a
+  //     position whose fees alone would eat it; 0 disables.
+  //
+  // Both are checked in openPosition, the only path a position can be created
+  // through, and re-armed on the next UTC day.
+  async refreshLossBreakers() {
+    const dayKey = new Date().toISOString().slice(0, 10);
+    if (this.state.dayKey === dayKey) return;
+    const account = await this.client.getAccount('USDT');
+    const available = Number(account?.available);
+    this.state.dayKey = dayKey;
+    this.state.dayStartBalance = Number.isFinite(available) ? available : 0;
+    // Closed positions closed today, UTC. Tolerate a client without the method
+    // (tests, partial stubs): the daily-loss check then just sees 0 realized
+    // today, which can only make the breaker conservative, never permissive.
+    const sinceUtcMidnight = Math.floor(Date.now() / 86400000) * 86400000;
+    const history = this.client.getHistoryPositions
+      ? await this.client.getHistoryPositions().catch(() => [])
+      : [];
+    let realizedToday = 0;
+    for (const row of Array.isArray(history) ? history : []) {
+      if (Number(row?.mtime) < sinceUtcMidnight) continue;
+      realizedToday += Number(row?.realizedPNL ?? row?.realizedPnl ?? 0) || 0;
+    }
+    this.state.realizedToday = realizedToday;
+    this.state.lossBreakerFired = null;
+  }
+
+  async checkLossBreakers() {
+    await this.refreshLossBreakers();
+    // min_balance: the floor is on the live available balance, not the
+    // day-start one, so a same-day bleed below the floor halts new entries.
+    const account = await this.client.getAccount('USDT');
+    const available = Number(account?.available);
+    const minBalance = Number(CONFIG.min_balance ?? 0);
+    if (minBalance > 0 && Number.isFinite(available) && available < minBalance) {
+      this.state.lossBreakerFired = this.state.lossBreakerFired ?? 'min_balance';
+      throw new Error(
+        `minimum balance floor: available ${available} USDT < min_balance ${minBalance} — no new positions`,
+      );
+    }
+    const limit = Number(CONFIG.max_daily_loss_pct ?? 0);
+    if (limit > 0 && this.state.dayStartBalance > 0) {
+      const worst = this.state.realizedToday < 0 ? Math.abs(this.state.realizedToday) : 0;
+      if (worst >= this.state.dayStartBalance * limit / 100) {
+        this.state.lossBreakerFired = this.state.lossBreakerFired ?? 'daily_loss';
+        throw new Error(
+          `daily loss limit: ${worst.toFixed(2)} USDT realized today >= ${limit}% of day-start `
+          + `${this.state.dayStartBalance.toFixed(2)} USDT — auto-trade halted until the next UTC day`,
+        );
+      }
+    }
   }
 
   async scanCycle() {

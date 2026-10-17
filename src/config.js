@@ -117,6 +117,8 @@ export const CONFIG = {
   trailing_callback_pct: Number(S('trailing_callback_pct', 5)),
   account_tp_roi_pct: Number(S('account_tp_roi_pct', 0)),
   account_sl_roi_pct: Number(S('account_sl_roi_pct', 0)),
+  max_daily_loss_pct: Number(S('max_daily_loss_pct', 20)),
+  min_balance: Number(S('min_balance', 10)),
   position_sizing_margin_pct: Number(S('position_sizing_margin_pct', 2)),
   auto_trade: B(S('AUTO_TRADE', '0'), false, 'AUTO_TRADE'),
   // Telegram position-lifecycle notifications.
@@ -141,6 +143,7 @@ const FILE_TRADER_KEYS = new Set([
   'report_interval_sec', 'mid_manage_interval_sec', 'order_unit', 'position_sizing_margin_pct',
   'tpsl_method', 'partial_tp_fractions', 'partial_tp_roi_steps', 'trailing_callback_pct',
   'account_tp_roi_pct', 'account_sl_roi_pct',
+  'max_daily_loss_pct', 'min_balance',
   'notify_open', 'notify_close', 'notify_tpsl',
 ]);
 

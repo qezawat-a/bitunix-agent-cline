@@ -731,6 +731,7 @@ describe('every entry carries a take-profit and a stop-loss', () => {
       ],
       getPendingPositions: async () => [],
       getPendingTPSL: async () => calls.tpsl,
+      getHistoryPositions: async () => [],
       placeTPSL: async (body) => { calls.tpsl.push({ ...body, positionId: 'p1' }); return { orderId: 't1' }; },
       closePosition: async (...args) => { calls.closed.push(args); return {}; },
       placeOrder: async (body) => { calls.orders.push(body); return { orderId: 'o1' }; },

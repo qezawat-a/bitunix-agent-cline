@@ -61,6 +61,14 @@ export const DEFAULTS = {
   account_tp_roi_pct: 0,
   account_sl_roi_pct: 0,
   position_sizing_margin_pct: 2,
+  // Loss circuit breakers (both 0 = disabled). The account bled to zero
+  // because every stop-out re-entered on the next scan; these stop that.
+  // max_daily_loss_pct: halt new entries when today's realized losses reach
+  // this percentage of the day-start available balance.
+  // min_balance: never open a position while the available USDT is below
+  // this floor — a dust balance cannot carry a position whose fees would eat it.
+  max_daily_loss_pct: 20,
+  min_balance: 10,
   auto_trade: false,
   // Telegram notifications. The position lifecycle was silent: the bot only
   // reported signals, so an entry or an exit happened with no message at all.
@@ -126,6 +134,8 @@ const NUMBER_KEYS = new Set([
   'trailing_callback_pct',
   'account_tp_roi_pct',
   'account_sl_roi_pct',
+  'max_daily_loss_pct',
+  'min_balance',
 ]);
 // Arrays that must hold finite numbers. Declared separately from timeframes,
 // which are validated as a set of unique interval strings.
@@ -249,6 +259,13 @@ export const SETTING_RANGES = Object.freeze({
   // 0 disables the account-level side, so the lower bound is 0 rather than >0.
   account_tp_roi_pct: [0, 10000],
   account_sl_roi_pct: [0, 10000],
+  // 0 disables the daily-loss circuit breaker; otherwise a percentage of the
+  // UTC-day starting balance that, once realized in losses, halts auto-trade
+  // for the rest of the day.
+  max_daily_loss_pct: [0, 100],
+  // 0 disables the floor; otherwise the minimum available USDT the account
+  // must hold before a new position may be opened.
+  min_balance: [0, 1e9],
 });
 
 // describeSettingBounds() -> the authoritative table, rendered for the agent prompt.
