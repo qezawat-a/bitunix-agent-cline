@@ -417,11 +417,25 @@ export class Trader {
     // account), and an order sent at a mismatched leverage carries a different
     // margin and liquidation distance from the one the bot sized and guarded.
     await this.verifyAccountSettings();
-    // There is deliberately no pre-entry "stop vs liquidation" estimate here. The
-    // official docs publish no liquidation-price formula (only liqPrice on an open
-    // position and the tier table), and an estimate refused entries the exchange
-    // itself allows. Once the position exists, the liquidation guard and the
-    // maintenance-margin guard act on the exchange's own liqPrice and marginRate.
+    // Pre-entry gate, now that a usable stop estimate exists. The official
+    // formula is published (entry / (1 +/- 1/L) + MMR, cross adjusts by
+    // balance), so a live stop-distance estimate is no longer a guess: if the
+    // mark is already inside the configured liquidation-safety distance of the
+    // estimated liquidation price, the trade dies at liquidation instead of at
+    // our stop — refuse the entry. Once the position exists, the liquidation
+    // guard re-checks the exchange's own liqPrice against the same distance.
+    // The estimate is also read through risk.liqDistanceOk, the same helper
+    // every live guard uses, so entry and guard can never disagree about
+    // what "safe" means.
+    if (estLiqPrice !== null && Number.isFinite(estLiqPrice) && estLiqPrice > 0) {
+      const { liqDistanceOk } = await import('../bitunix/risk.js');
+      if (!liqDistanceOk({ markPrice: entryPrice, liqPrice: estLiqPrice })) {
+        throw new Error(
+          `entry would sit inside the liquidation-safety distance `
+          + `(sl_liquidation_safety ${CONFIG.sl_liquidation_safety}%, estimated liq ${estLiqPrice} vs entry ${entryPrice}) — entry refused`,
+        );
+      }
+    }
     let order;
     try {
       order = await this.client.placeOrder(body);

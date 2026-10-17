@@ -364,7 +364,10 @@ describe('exchange safety', () => {
       getAccount: async () => ({ available: '100' }),
       getLeverageAndMarginMode: async () => ({ leverage: CONFIG.leverage, marginMode: CONFIG.position_type === 'isolated' ? 'ISOLATION' : 'CROSS' }),
       getPositionMode: async () => ({ positionMode: CONFIG.position_mode === 'hedge' ? 'HEDGE' : 'ONE_WAY' }),
-      getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001' }],
+      // Tight band so the pre-entry liquidation gate stays clear of this test:
+      // liq is only 8.5% below entry at 10x, well outside the 1% safety.
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001', minLeverage: 1, maxLeverage: 25 }],
+      getPositionTiers: async () => [{ endValue: 1e9, maintenanceMarginRate: 0.004 }],
       placeOrder: async body => { submitted = body; throw Object.assign(new Error('timeout'), { executionUnknown: true }); },
       getPendingOrders: async () => [{ clientId: submitted.clientId, orderId: 'o1', status: 'FILLED' }],
       getHistoryOrders: async () => [],
@@ -440,7 +443,8 @@ describe('exchange safety', () => {
       getAccount: async () => ({ available: '100' }),
       getLeverageAndMarginMode: async () => ({ leverage: CONFIG.leverage, marginMode: CONFIG.position_type === 'isolated' ? 'ISOLATION' : 'CROSS' }),
       getPositionMode: async () => ({ positionMode: CONFIG.position_mode === 'hedge' ? 'HEDGE' : 'ONE_WAY' }),
-      getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001' }],
+      getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001', minLeverage: 1, maxLeverage: 25 }],
+      getPositionTiers: async () => [{ endValue: 1e9, maintenanceMarginRate: 0.004 }],
       placeOrder: async () => { orders++; await new Promise(resolve => setTimeout(resolve, 10)); return { orderId: 'o1' }; },
     };
     const trader = new Trader(client);

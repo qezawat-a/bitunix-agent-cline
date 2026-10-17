@@ -24,15 +24,16 @@ function make(atrValue) {
   return { t, placed };
 }
 
-async function attempt(atrValue, opts = {}) {
-  const prior = { auto: CONFIG.auto_trade, lev: CONFIG.leverage, sym: CONFIG.symbol, type: CONFIG.position_type, pct: CONFIG.position_sizing_margin_pct };
+async function attempt(atrValue, opts = {}, safetyOverride) {
+  const prior = { auto: CONFIG.auto_trade, lev: CONFIG.leverage, sym: CONFIG.symbol, type: CONFIG.position_type, pct: CONFIG.position_sizing_margin_pct, safety: CONFIG.sl_liquidation_safety };
   CONFIG.auto_trade = true; CONFIG.leverage = 30; CONFIG.symbol = 'STRKUSDT';
   CONFIG.position_type = opts.type ?? 'isolated'; CONFIG.position_sizing_margin_pct = opts.pct ?? 2;
+  if (safetyOverride !== undefined) CONFIG.sl_liquidation_safety = safetyOverride;
   try {
     const { t, placed } = make(atrValue);
     const err = await t.openPosition('STRKUSDT', 0.12, 'bullish', atrValue, 90).then(() => null, e => e);
     return { err, placed };
-  } finally { CONFIG.auto_trade = prior.auto; CONFIG.leverage = prior.lev; CONFIG.symbol = prior.sym; CONFIG.position_type = prior.type; CONFIG.position_sizing_margin_pct = prior.pct; }
+  } finally { CONFIG.auto_trade = prior.auto; CONFIG.leverage = prior.lev; CONFIG.symbol = prior.sym; CONFIG.position_type = prior.type; CONFIG.position_sizing_margin_pct = prior.pct; CONFIG.sl_liquidation_safety = prior.safety; }
 }
 
 // A wide ATR stop is still placed (never refused) — but it is clamped inside
@@ -54,7 +55,7 @@ for (const [name, opts, cross, pct] of [
   ['cross', { type: 'crossed', pct: 45 }, true, 45],
   ['cross, all balance', { type: 'crossed', pct: 100 }, true, 100],
 ]) {
-  it(`places (never refuses) the wide stop, clamped inside liquidation: ${name}`, async () => {
+  it(`clamps the wide stop to the liquidation-safety distance inside liq: ${name}`, async () => {
     const atrValue = 0.0055 * 1.5;
     const { err, placed } = await attempt(atrValue, opts);
     assert.equal(err, null, `unexpected refusal: ${err?.message}`);
@@ -64,8 +65,8 @@ for (const [name, opts, cross, pct] of [
     const liq = cross ? estLiq(0.12, 'long', 30, null, 1000, true, pct) : estLiq(0.12, 'long', 30, null, null, false, pct);
     // expected stop = the raw ATR stop unless it falls on/below the liq price,
     // in which case it is clamped to the configured liquidation-safety
-    // distance inside it (sl_liquidation_safety 0.60% > the 0.2% padding floor).
-    const expected = rawStop <= liq ? liq * 1.006 : rawStop;
+    // distance inside it (default 1% now; the 0.2% padding is only the floor).
+    const expected = rawStop <= liq ? liq * 1.01 : rawStop;
     const rounded = Math.round(Number(placed[0].slPrice) * 10 ** pair.quotePrecision) / 10 ** pair.quotePrecision;
     const want = Math.round(expected * 10 ** pair.quotePrecision) / 10 ** pair.quotePrecision;
     assert.equal(rounded, want, `stop ${rounded} should sit just inside liq ${liq}`);

@@ -35,7 +35,11 @@ export const DEFAULTS = {
   trailing_trigger_roi_pct: 6,
   trailing_atr_multiple: 1.25,
   trailing_atr_strength_reduction: 0.25,
-  sl_liquidation_safety: 0.60,
+  // 1% is the floor that keeps a 50x entry out of its own liquidation
+  // distance; the pre-entry gate and the live guard both read it. 0.60 was
+  // the old default, and the operator's SAND losses at 50x were exactly a
+  // trade sitting inside that number.
+  sl_liquidation_safety: 1,
   on_tpsl_failure: 'close',
   reversal_enabled: true,
   reversal_confidence: 85,
