@@ -588,8 +588,18 @@ export class PositionManager {
     // the stop, only pulls it back to somewhere it can fill.
     const liq = Number(liqPrice);
     if (finitePositive(liq) && finitePositive(slPrice)) {
-      if (isLong && slPrice <= liq) slPrice = liq * (1 + PositionManager.LIQ_STOP_PADDING);
-      if (!isLong && slPrice >= liq) slPrice = liq * (1 - PositionManager.LIQ_STOP_PADDING);
+      // Sit at least the configured liquidation-safety distance (a percent)
+      // clear of the liquidation price, so the stop fills before the exchange
+      // force-closes. The fixed padding is the floor when that distance is not
+      // usable. This only ever tightens the stop toward entry — the whole
+      // point of clamping at 50x — and never puts a stop on the wrong side
+      // of liq.
+      const safety = finitePositive(this.settings?.sl_liquidation_safety)
+        ? Number(this.settings.sl_liquidation_safety) / 100
+        : 0;
+      const pad = Math.max(safety, PositionManager.LIQ_STOP_PADDING);
+      if (isLong && slPrice <= liq * (1 + pad)) slPrice = liq * (1 + pad);
+      if (!isLong && slPrice >= liq * (1 - pad)) slPrice = liq * (1 - pad);
     }
 
     return {

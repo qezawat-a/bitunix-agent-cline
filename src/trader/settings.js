@@ -159,6 +159,22 @@ function normalizeValue(key, value) {
   }
   if (key === 'position_type' || key === 'position_mode') return String(value).trim().toLowerCase();
   if (key === 'order_unit' || key === 'on_tpsl_failure') return String(value).trim().toLowerCase();
+  // An agent tool call often arrives with the value as a string ("0.9").
+  // Every write path goes through normalizePatch, so coerce here: the
+  // validator's validNumber() then sees a real number instead of refusing
+  // a value the operator typed correctly ("sl_liquidation_safety must be
+  // 0.01-1" on an in-range 0.9 was exactly that bug).
+  if (BOOLEAN_KEYS.has(key)) {
+    const word = String(value).trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(word)) return true;
+    if (['0', 'false', 'no', 'off'].includes(word)) return false;
+    return value;
+  }
+  if ((NUMBER_KEYS.has(key) || INTEGER_KEYS.has(key)) && typeof value !== 'number'
+      && value !== null && value !== undefined && String(value).trim() !== '') {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
   return value;
 }
 
@@ -403,6 +419,10 @@ const NL_PHRASES = {
   'margin risk': 'margin_risk_pct',
   'margin percentage': 'margin_risk_pct',
   'margin amount': 'margin_risk_pct',
+  'sl liquid safety': 'sl_liquidation_safety',
+  'sl liquidation safety': 'sl_liquidation_safety',
+  'liquidation safety': 'sl_liquidation_safety',
+  'liquidation guard distance': 'sl_liquidation_safety',
   'risk per trade': 'position_sizing_margin_pct',
   'position sizing': 'position_sizing_margin_pct',
   'position size': 'position_sizing_margin_pct',
@@ -421,7 +441,11 @@ const NL_PHRASES = {
 export function parseNaturalSetting(text) {
   const raw = String(text || '').trim();
   if (!raw || raw.startsWith('/')) return null;
-  if (!/^(please\s+)?(set|change|update|adjust|make|put|raise|increase|lower|reduce|switch|use|set\s+the)\b/i.test(raw)) return null;
+  // A settings command either uses an imperative ("set the margin risk to 30")
+  // or names a setting with its value ("sl liquid safety 0.9", "cooldown 5").
+  // Anything else is not a settings command and stays a question for the agent.
+  if (!/^(please\s+)?(set|change|update|adjust|make|put|raise|increase|lower|reduce|switch|use|make\s+the|set\s+the)\b/i.test(raw)
+      && !/^(sl\s+liquid(?:ation)?\s+safety|liquidation\s+(?:safety|guard\s+distance)|liq\s+safety|margin\s+risk|risk\s+per\s+trade|position\s+size(?:ing)?|min\s+confidence|confidence|efficiency|adx|score\s+margin|cooldown|max\s+positions)\b/i.test(raw)) return null;
 
   const normalized = raw.toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
   // Longest phrase wins, so "position sizing" beats a bare "sizing".
@@ -430,11 +454,12 @@ export function parseNaturalSetting(text) {
     .sort((a, b) => b.length - a.length)[0];
   if (!phrase) return null;
 
-  // Prefer a number after the value preposition ("to", "at", "="), else the last one.
-  const tail = normalized.split(/\b(?:to|at|=|as)\b/).pop() || '';
-  const found = tail.match(/\d+(?:\.\d+)?/g) || normalized.match(/\d+(?:\.\d+)?/g);
-  if (!found || !found.length) return null;
-
   const canonical = resolveSettingKey(NL_PHRASES[phrase]);
+  // Read the number from the raw text, not the slug above: the slug replaced
+  // "." with a space, so "SL liquid safety 0.9" would have parsed as 9.
+  // Prefer the value after a preposition, else the last number in the sentence.
+  const afterPrep = raw.split(/\b(?:to|at|=|as)\b/i).pop() || '';
+  const found = afterPrep.match(/\d+(?:\.\d+)?/g) || raw.match(/\d+(?:\.\d+)?/g);
+  if (!found || !found.length) return null;
   return { key: canonical, value: parseSettingValue(canonical, found[found.length - 1]) };
 }

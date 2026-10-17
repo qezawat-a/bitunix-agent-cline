@@ -82,7 +82,10 @@ export function directionEmoji(side) {
 export function positionRoiPct({ entryPrice, closePrice, side, leverage }) {
   const entry = num(entryPrice);
   const exit = num(closePrice);
-  if (entry === null || exit === null || entry <= 0) return null;
+  // A close price of 0 is never real — it means the exchange payload did not
+  // carry the exit price. Dividing by a missing exit printed a fabricated
+  // "-5000%" on a trade that actually lost cents; show no ROI rather than that.
+  if (entry === null || exit === null || entry <= 0 || exit <= 0) return null;
   const direction = normalizeSide(side) === 'SELL' ? -1 : 1;
   const lev = num(leverage) > 0 ? num(leverage) : 1;
   return ((exit - entry) / entry) * 100 * direction * lev;

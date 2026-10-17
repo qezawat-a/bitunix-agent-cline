@@ -63,8 +63,9 @@ for (const [name, opts, cross, pct] of [
     const rawStop = 0.12 - (1.55 - 0.9 * 0.45) * atrValue; // 0.11055
     const liq = cross ? estLiq(0.12, 'long', 30, null, 1000, true, pct) : estLiq(0.12, 'long', 30, null, null, false, pct);
     // expected stop = the raw ATR stop unless it falls on/below the liq price,
-    // in which case it is clamped to just inside it (LIQ_STOP_PADDING 0.002).
-    const expected = rawStop <= liq ? liq * 1.002 : rawStop;
+    // in which case it is clamped to the configured liquidation-safety
+    // distance inside it (sl_liquidation_safety 0.60% > the 0.2% padding floor).
+    const expected = rawStop <= liq ? liq * 1.006 : rawStop;
     const rounded = Math.round(Number(placed[0].slPrice) * 10 ** pair.quotePrecision) / 10 ** pair.quotePrecision;
     const want = Math.round(expected * 10 ** pair.quotePrecision) / 10 ** pair.quotePrecision;
     assert.equal(rounded, want, `stop ${rounded} should sit just inside liq ${liq}`);
