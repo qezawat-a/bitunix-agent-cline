@@ -1,0 +1,948 @@
+diff -ruN -x node_modules a/settings.json b/settings.json
+--- a/settings.json	2026-10-18 11:12:33.000000000 +0000
++++ b/settings.json	2026-10-18 11:36:32.857878925 +0000
+@@ -23,8 +23,8 @@
+     "guard_interval_sec": 15,
+     "mid_manage_interval_sec": 15,
+     "report_interval_sec": 30,
+-    "breakeven_threshold_pct": 4,
+-    "trailing_trigger_roi_pct": 6,
++    "breakeven_threshold_pct": 20,
++    "trailing_trigger_roi_pct": 25,
+     "reversal_enabled": true,
+     "reversal_confidence": 85,
+     "on_tpsl_failure": "close",
+diff -ruN -x node_modules a/src/bitunix/risk.js b/src/bitunix/risk.js
+--- a/src/bitunix/risk.js	2026-10-18 11:12:33.000000000 +0000
++++ b/src/bitunix/risk.js	2026-10-18 11:36:32.858203130 +0000
+@@ -41,12 +41,9 @@
+   // trusts it skip a position sitting on top of its liquidation price.
+   if (!Number.isFinite(liquidation) || liquidation <= 0) return false;
+   const distance = Math.abs(Number(markPrice) - liquidation) / Number(markPrice);
+-  const minimum = Number(CONFIG.sl_liquidation_safety);
+-
+-  // Validation: ensure safety parameter is reasonable
+-  if (!Number.isFinite(minimum) || minimum <= 0 || minimum > 1) {
+-    throw new Error(`sl_liquidation_safety must be between 0.01 and 1.0 (got ${CONFIG.sl_liquidation_safety})`);
+-  }
++  // sl_liquidation_safety is a PERCENT of price (0.60 = 0.60%), the same unit
++  // PositionManager.checkLiquidationGuard and the settings validator use.
++  const minimum = Number(CONFIG.sl_liquidation_safety) / 100;
+ 
+   return Number.isFinite(distance) && Number.isFinite(minimum) && distance >= minimum;
+ }
+diff -ruN -x node_modules a/src/config.js b/src/config.js
+--- a/src/config.js	2026-10-18 11:12:33.000000000 +0000
++++ b/src/config.js	2026-10-18 11:36:32.856652078 +0000
+@@ -100,8 +100,8 @@
+   position_mode: S('position_mode', 'hedge'),
+   scan_interval_sec: Number(S('scan_interval_sec', 15)),
+   guard_interval_sec: Number(S('guard_interval_sec', 15)),
+-  breakeven_threshold_pct: Number(S('breakeven_threshold_pct', 4)),
+-  trailing_trigger_roi_pct: Number(S('trailing_trigger_roi_pct', 6)),
++  breakeven_threshold_pct: Number(S('breakeven_threshold_pct', 20)),
++  trailing_trigger_roi_pct: Number(S('trailing_trigger_roi_pct', 25)),
+   trailing_atr_multiple: Number(S('trailing_atr_multiple', 1.25)),
+   trailing_atr_strength_reduction: Number(S('trailing_atr_strength_reduction', 0.25)),
+   sl_liquidation_safety: (() => {
+diff -ruN -x node_modules a/src/main.js b/src/main.js
+--- a/src/main.js	2026-10-18 11:12:33.000000000 +0000
++++ b/src/main.js	2026-10-18 16:46:19.374153490 +0000
+@@ -241,6 +241,11 @@
+ 
+   let stopping = false;
+   let scanTimer = null;
++  // Any exit the notifier saw (stop or target filled on the exchange, a manual
++  // close in the app) starts the rest period, whoever closed the position.
++  const noteExits = events => {
++    if (Array.isArray(events) && events.some(event => event?.type === 'closed')) trader.startCooldown();
++  };
+   // Entry refusals and failures used to go to the console only, so a tradeable
+   // signal with no position looked like a bot that was ignoring you.
+   const tradeNotices = new Map();
+@@ -257,7 +262,7 @@
+         const signal = await trader.scanCycle();
+         // Diff the position list before acting on a new signal, so an entry is
+         // reported as soon as it appears on the exchange.
+-        await notifier.sync().catch(() => {});
++        noteExits(await notifier.sync().catch(() => []));
+         if (signal) {
+           // scanCycle() only *produces* a signal. Turning it into a live order is
+           // a separate step, and it has to happen here: without this call the
+@@ -270,7 +275,7 @@
+               if (result?.executed) {
+                 console.log(`[trade] ${CONFIG.symbol} ${signal.signal} @ ${result.price}`);
+               } else if (result?.reason) {
+-                console.log(`[trade] skipped: ${result.reason}`);
++                console.log(`[trade] skipped: ${result.reason}${result.secondsLeft ? ` (${result.secondsLeft}s left)` : ''}`);
+                 if (!['cooldown', 'confirmation_pending', 'entry_in_flight'].includes(result.reason)) {
+                   await noticeTrade(`skip:${result.reason}`, `⚠️ <b>Entry skipped</b> <code>${esc(CONFIG.symbol)}</code> ${esc(signal.signal)}: <code>${esc(result.reason)}</code>`);
+                 }
+@@ -332,7 +337,7 @@
+         await Promise.allSettled([trader.guard(), trader.midManage(), trader.report()]);
+         // Exits still need reporting when scanning is off, e.g. a stop or a
+         // liquidation guard closing a position.
+-        await notifier.sync().catch(() => {});
++        noteExits(await notifier.sync().catch(() => []));
+       }
+     } catch (error) {
+       console.error('loop error:', error.message);
+diff -ruN -x node_modules a/src/trader/position-manager.js b/src/trader/position-manager.js
+--- a/src/trader/position-manager.js	2026-10-18 11:12:33.000000000 +0000
++++ b/src/trader/position-manager.js	2026-10-18 16:46:19.373688300 +0000
+@@ -95,25 +95,12 @@
+   // with the timeout as a backstop for a close that never registered.
+   closedRecently = new Map();
+   static CLOSE_DEDUPE_MS = 60000;
+-  // Break-even stop sits this far (percent of price) beyond the entry, on the
+-  // profit side, so a break-even exit covers taker fees instead of losing them.
+-  static BREAKEVEN_BUFFER_PCT = 0.15;
+-  // Size the break-even / trailing ROI triggers against the ATR stop and target.
+-  static ATR_SIZED_TRIGGERS = true;
+-  // A break-even trigger must land somewhere the position can actually reach
+-  // before its target: at low leverage the take-profit's ROI is below one stop
+-  // distance, so no ATR-sized break-even trigger exists and the configured
+-  // value is used instead. Quarter the target band: at the midpoint the trigger
+-  // only fires after half the profit band is already on the table, which on a
+-  // tight ATR stop is effectively the same tick the target would fill.
+-  static ATR_SIZED_BE_CEIL = 0.25;
+   // Working room kept between a clamped stop and its own liquidation price.
+   // A stop sitting exactly on liquidation races the exchange's own engine,
+   // so it is held this fraction of the liq price on the fillable side.
+   static LIQ_STOP_PADDING = LIQ_STOP_PADDING;
+   // The stop may use at most this share of the entry-to-liquidation distance.
+   static STOP_MAX_LIQ_FRACTION = 0.6;
+-  triggerAtrCache = new Map();
+   // When break-even was last applied to a position, and at which stop price.
+   //
+   // checkBreakeven could re-fire forever on a position it had already fixed. It
+@@ -129,10 +116,6 @@
+   // modify cannot improve on that. If the stop is later genuinely lost, the
+   // ensureProtection/repair path re-arms it, which clears the marker.
+   breakEvenApplied = new Map();
+-  // Stop-ladder rungs applied per position: positionId -> { rung, slPrice }.
+-  // A rung fires once and is remembered, so a stop is never re-sent at the
+-  // same level and the ladder only ever ratchets forward.
+-  stepApplied = new Map();
+   // Stops the exchange refused to move: positionId -> { side, slPrice }. The bot
+   // enforces them itself (checkSoftStop) until a move is finally confirmed.
+   softStops = new Map();
+@@ -238,6 +221,16 @@
+           if (!finitePositive(position.markPrice)) position.markPrice = markPrice;
+         }
+       }
++      // A position that was open on the last look and is gone now was closed:
++      // by its stop or target on the exchange, by the operator in the app, or by
++      // a guard. Only the bot's own closes used to start the cooldown, so a
++      // stop-loss that filled on the exchange was followed by an immediate new
++      // entry. Whatever closed it, the rest period starts now.
++      const wasOpen = this.state.positions.map(position => String(position.positionId));
++      const nowOpen = new Set(normalized.map(position => String(position.positionId)));
++      if (wasOpen.some(id => !nowOpen.has(id))) {
++        this.state.cooldownUntil = Math.max(this.state.cooldownUntil || 0, Date.now() + Number(this.settings.cooldown_minutes) * 60000);
++      }
+       this.state.positions = normalized;
+       // A trailing peak only means something while its position is open;
+       // keeping a stale peak would arm a future position against old history.
+@@ -262,9 +255,6 @@
+       }
+       // The cached ATR trigger belongs to one position: a positionId that later
+       // reappears is a different trade that must not inherit the prior ATR.
+-      for (const key of this.triggerAtrCache.keys()) {
+-        if (!live.has(key)) this.triggerAtrCache.delete(key);
+-      }
+       for (const [key, at] of this.closedRecently) {
+         // Dropped as soon as the id stops being listed (a genuinely reopened
+         // position carries a new id, so it is free to close immediately), with
+@@ -975,85 +965,26 @@
+     return result;
+   }
+ 
+-  // A stop move that would sit on the far side of the liquidation price buys
+-  // nothing: the exchange force-closes at liquidation before our stop ever
+-  // fills, converting "hold at break-even" into a full loss. Refuse to move a
+-  // stop across its own liquidation price — for a long the stop stays above
+-  // liq, for a short it stays below liq. A missing liqPrice cannot be
+-  // verified, so it fails closed like the risk gate does.
++  // A stop on the far side of the position's own liquidation price never fills:
++  // the exchange liquidates first and the "protected" position is a full loss.
++  // This only asks which SIDE of liquidation the candidate stop is on (with
++  // LIQ_STOP_PADDING of working room). It is NOT the sl_liquidation_safety
++  // percentage: that setting is a percent of price (0.60 = 0.60%) and is the
++  // guard's distance-to-liquidation trigger. Comparing a stop against it as a
++  // fraction demanded a stop 60% beyond liquidation, so every break-even and
++  // trailing move was refused and the stop never moved. No liquidation price
++  // (absent or <= 0, e.g. none reported right now) means there is nothing to
++  // be on the wrong side of, so the move is allowed.
+   liqDistanceOk(position, candidateStop) {
+-    if (!Number.isFinite(candidateStop) || candidateStop < 0) return false;
++    if (!finitePositive(candidateStop)) return false;
+     const liq = Number(position.liqPrice);
+-    if (!Number.isFinite(liq) || liq <= 0) return false;
+-
+-    // Validate safety parameter from config (use same logic as risk.js)
+-    const minimum = Number(CONFIG.sl_liquidation_safety);
+-    if (!Number.isFinite(minimum) || minimum <= 0 || minimum > 1) {
+-      throw new Error(`sl_liquidation_safety must be between 0.01 and 1.0 (got ${CONFIG.sl_liquidation_safety})`);
+-    }
+-
+-    // For consistency with risk.js calculation, use the same percentage-based approach
+-    // Calculate if the candidate stop is at least the minimum distance from liquidation
+-    if (position.side === 'BUY') {
+-      const distance = (candidateStop - liq) / liq;
+-      return distance >= minimum;
+-    }
+-    if (position.side === 'SELL') {
+-      const distance = (liq - candidateStop) / liq;
+-      return distance >= minimum;
+-    }
++    if (!finitePositive(liq)) return true;
++    const pad = PositionManager.LIQ_STOP_PADDING;
++    if (position.side === 'BUY') return candidateStop > liq * (1 + pad);
++    if (position.side === 'SELL') return candidateStop < liq * (1 - pad);
+     return true;
+   }
+ 
+-  breakEvenPrice(entry, side) {
+-    const buffer = PositionManager.BREAKEVEN_BUFFER_PCT / 100;
+-    // Validate buffer percentage is reasonable
+-    if (!Number.isFinite(buffer) || buffer <= 0 || buffer > 1) {
+-      throw new Error(`BREAKEVEN_BUFFER_PCT must be between 0.01 and 1.0 (got ${PositionManager.BREAKEVEN_BUFFER_PCT})`);
+-    }
+-    return side === 'SELL' ? entry * (1 - buffer) : entry * (1 + buffer);
+-  }
+-
+-  // The configured ROI triggers are leveraged percentages while the stop and
+-  // target are ATR distances, so the two drift apart with leverage: at 10x a 20%
+-  // trigger is usually beyond the take-profit and never fires, at 40-50x it is
+-  // inside the stop distance and moves the stop on noise. The configured value is
+-  // kept, but clamped to [floorR x stop distance, ceilTp x target distance].
+-  async effectiveTriggerRoi(position, configured, floorR = 1, ceilTp = 0.85) {
+-    const configuredRoi = Number(configured);
+-    if (!Number.isFinite(configuredRoi) || !PositionManager.ATR_SIZED_TRIGGERS) return configuredRoi;
+-    try {
+-      const entry = Number(position.avgPrice);
+-      const leverage = finitePositive(position.leverage)
+-        ? Number(position.leverage)
+-        : finitePositive(this.settings.leverage) ? Number(this.settings.leverage) : 1;
+-      const key = String(position.positionId);
+-      let atr;
+-      const cached = this.triggerAtrCache.get(key);
+-      if (cached && Date.now() - cached.at < 60000) atr = cached.value;
+-      else {
+-        atr = await this.getAtrForPosition(position);
+-        this.triggerAtrCache.set(key, { value: atr, at: Date.now() });
+-      }
+-      const { stopMultiple, targetMultiple } = atrMultiples(position.signalConfidence ?? this.settings.min_confidence);
+-      const toRoi = distance => (distance / entry) * 100 * leverage;
+-      const floor = toRoi(atr * stopMultiple) * floorR;
+-      let ceiling = toRoi(atr * targetMultiple) * ceilTp;
+-      if (!(floor > 0) || !(ceiling >= floor)) return configuredRoi;
+-      if (floorR === 1 && ceilTp === 0.6) {
+-        // Break-even only: hold the trigger back to the first quarter of the
+-        // take-profit band so it fires on real progress toward the target —
+-        // a midpoint trigger only engages on the last ticks before the
+-        // target fills, which is no protection at all on a tight stop.
+-        ceiling = toRoi(atr * targetMultiple) * PositionManager.ATR_SIZED_BE_CEIL;
+-        if (ceiling < floor) ceiling = floor;
+-      }
+-      return Math.min(Math.max(configuredRoi, floor), ceiling);
+-    } catch {
+-      return configuredRoi;
+-    }
+-  }
+-
+   async checkBreakeven(position) {
+     const entry = Number(position.avgPrice);
+     if (!finitePositive(entry)) throw new Error('position entry price must be positive');
+@@ -1065,30 +996,21 @@
+     // "where is the stop now?" lookup kept failing to see the move we had just
+     // made. A tolerance is used so the same entry price re-sent at a different
+     // quotePrecision is still recognised as the same level.
+-    const target = this.breakEvenPrice(entry, position.side);
+     const applied = this.breakEvenApplied.get(key);
+-    if (applied && samePrice(applied.slPrice, target, applied.precision)) {
++    if (applied && samePrice(applied.slPrice, entry, applied.precision)) {
+       return { skipped: 'break-even already applied', slPrice: String(applied.slPrice) };
+     }
+-    const roiCheck = this.favorableRoiPct(position) >= await this.effectiveTriggerRoi(position, this.settings.breakeven_threshold_pct, 1, 0.6);
+-    if (roiCheck) {
++    if (this.favorableRoiPct(position) >= Number(this.settings.breakeven_threshold_pct)) {
+       const current = await this.currentStop(position);
+-      if (current && position.side === 'BUY' && target <= current) return { skipped: 'stop already favorable' };
+-      if (current && position.side === 'SELL' && target >= current) return { skipped: 'stop already favorable' };
+-      const markNow = Number(position.markPrice);
+-      if (finitePositive(markNow) && (position.side === 'BUY' ? target >= markNow : target <= markNow)) {
+-        return { skipped: 'break-even buffer not yet covered by price' };
+-      }
+-      // The buffer side keeps the exchange liquidating before the stop can
+-      // fill: a stop on the far side of its own liquidation price buys
+-      // nothing, so the move is skipped instead of sent.
+-      if (!this.liqDistanceOk(position, target)) return { skipped: 'break-even would sit inside the liquidation distance' };
+-      const result = await this.moveSLToEntry(position.positionId, target, positionMagnitude(position), position.side);
++      if (current && position.side === 'BUY' && entry <= current) return { skipped: 'stop already favorable' };
++      if (current && position.side === 'SELL' && entry >= current) return { skipped: 'stop already favorable' };
++      if (!this.liqDistanceOk(position, entry)) return { skipped: 'break-even would sit inside the liquidation distance' };
++      const result = await this.moveSLToEntry(position.positionId, entry, positionMagnitude(position), position.side);
+       // Recorded only once the move actually reached the exchange, so a failed
+       // modify is retried on the next tick rather than being remembered as done.
+-      this.breakEvenApplied.set(key, { slPrice: target, precision: await this.getQuotePrecision() });
+-      this.reportStopMove?.(position, 'breakeven', target);
+-      return { ...result, slPrice: formatPrice(target, await this.getQuotePrecision()) };
++      this.breakEvenApplied.set(key, { slPrice: entry, precision: await this.getQuotePrecision() });
++      this.reportStopMove?.(position, 'breakeven', entry);
++      return { ...result, slPrice: formatPrice(entry, await this.getQuotePrecision()) };
+     }
+     return { skipped: 'threshold not reached' };
+   }
+@@ -1118,105 +1040,18 @@
+     return this.confirmedStopMove(params, positionId, positionQty, side);
+   }
+ 
+-  // The stop ladder rides trailing_trigger_roi_pct (ROI-on-margin percent, the
+-  // same unit the trailing trigger is quoted in): a rung fires every time the
+-  // favourable ROI crosses the next multiple of the spacing — e.g. spacing
+-  // 100 gives the 100 / 200 / 300 ladder. Each rung ratchets the stop up to
+-  // the PRIOR rung's line: the rung 1 stop sits at the entry (the break-even
+-  // line, which is what fires it early instead of waiting for the ATR
+-  // trigger), the rung 2 stop one spacing into the profit, rung 3 two. The
+-  // stop therefore always lags the price by one rung, so a pullback fills it
+-  // inside the profit instead of round-tripping the move. 0 disables trailing,
+-  // and with it the ladder.
+-  async checkStopStep(position) {
+-    // The stop ladder: the rungs ride the EXISTING trailing_trigger_roi_pct,
+-    // the same ROI-on-margin unit the trailing trigger already uses. Rung 1
+-    // fires at that trigger and lands the stop on the break-even line, so
+-    // break-even arms at the trailing trigger instead of waiting for the ATR
+-    // trigger; every later multiple of the trigger adds one more rung, each
+-    // holding the stop one trigger-step (trigger/leverage percent of price)
+-    // ahead of entry. 0 disables trailing, and with it the ladder.
+-    const spacing = Number(this.settings.trailing_trigger_roi_pct) || 0;
+-    if (!(spacing > 0)) return { skipped: 'stop ladder disabled' };
+-    const move = this.favorableRoiPct(position);
+-    if (!Number.isFinite(move)) return { skipped: 'stop ladder: ROI not readable' };
+-    const key = String(position.positionId);
+-    const rungApplied = Number(this.stepApplied.get(key)?.rung) || 0;
+-    const nextRung = rungApplied + 1;
+-    if (move < nextRung * spacing) return { skipped: 'stop ladder threshold not reached' };
+-    const entry = Number(position.avgPrice);
+-    if (!finitePositive(entry)) throw new Error('entry price must be positive');
+-    const sign = position.side === 'BUY' ? 1 : -1;
+-    // Rung nextRung places the stop on the rungApplied line — the lag, above.
+-    // The break-even line carries the fee buffer; later lines sit one rung
+-    // spacing ahead of entry each. A ROI-on-margin unit scales with leverage:
+-    // a +X% price move is X*L ROI on margin, so one spacing unit of ROI is
+-    // spacing/L percent of price (both read as percentages).
+-    const leverage = finitePositive(position.leverage)
+-      ? Number(position.leverage)
+-      : finitePositive(this.settings.leverage) ? Number(this.settings.leverage) : 1;
+-    const spacingPricePct = spacing / leverage;
+-    // The break-even line carries the fee buffer; later lines sit one rung
+-    // spacing ahead of entry each.
+-    const buffer = rungApplied === 0
+-      ? PositionManager.BREAKEVEN_BUFFER_PCT
+-      : rungApplied * spacingPricePct;
+-    const candidate = entry * (1 + sign * (buffer / 100));
+-    // A rung only ever ratchets the stop forward: if the stop already sits
+-    // at or ahead of this rung's line, re-sending the identical or a
+-    // looser level is noise.
+-    const current = await this.currentStop(position);
+-    if (current !== null && !this.shouldTighten(position, candidate, current)) {
+-      return { skipped: 'stop ladder already at or ahead of this rung' };
+-    }
+-    // The stop still sits behind the rung's line: fire it.
+-    const markNow = Number(position.markPrice);
+-    if (finitePositive(markNow) && (position.side === 'BUY' ? candidate >= markNow : candidate <= markNow)) {
+-      return { skipped: 'stop ladder line not yet covered by price' };
+-    }
+-    if (!this.liqDistanceOk(position, candidate)) return { skipped: 'stop ladder would sit inside the liquidation distance' };
+-    const result = await this.moveSLToStep(position.positionId, candidate, positionMagnitude(position), position.side);
+-    this.stepApplied.set(key, { rung: nextRung, slPrice: String(candidate) });
+-    // The first rung IS the break-even line, so claim it in the break-even
+-    // record too: checkBreakeven then reads it as already applied instead of
+-    // re-sending the identical modify on every later tick.
+-    if (rungApplied === 0) {
+-      this.breakEvenApplied.set(key, { slPrice: candidate, precision: await this.getQuotePrecision() });
+-    }
+-    this.reportStopMove?.(position, `stop_step_${nextRung}`, candidate);
+-    return { ...result, rung: nextRung, slPrice: formatPrice(candidate, await this.getQuotePrecision()) };
+-  }
+-
+-  async moveSLToStep(positionId, slPrice, positionQty = null, side = null) {
+-    // The whole-pair replace rule is the same as moveSLToEntry: carry the
+-    // take-profit or it is deleted by the stop-only modify.
+-    const existing = await this.preserveTakeProfit(positionId, positionQty);
+-    const params = {
+-      symbol: this.symbol,
+-      positionId,
+-      slPrice: formatPrice(slPrice, await this.getQuotePrecision()),
+-      slStopType: 'MARK_PRICE',
+-    };
+-    Object.assign(params, existing);
+-    return this.confirmedStopMove(params, positionId, positionQty, side);
+-  }
+-
+   async checkTrailing(position) {
+     const mark = Number(position.markPrice);
+     if (!finitePositive(mark)) throw new Error('position mark price must be positive');
+-    if (this.favorableRoiPct(position) >= await this.effectiveTriggerRoi(position, this.settings.trailing_trigger_roi_pct, 1.25, 0.85)) {
++    if (this.favorableRoiPct(position) >= Number(this.settings.trailing_trigger_roi_pct)) {
+       const atr = await this.getAtrForPosition(position);
+       const strength = Math.max(0, Math.min(100, Number(position.signalConfidence ?? this.settings.min_confidence))) / 100;
+       const multiple = Number(this.settings.trailing_atr_multiple) || 1.25;
+       const reduction = Number(this.settings.trailing_atr_strength_reduction) || 0.25;
+       const trailDistance = atr * (multiple - strength * reduction);
+       const newSL = position.side === 'BUY' ? mark - trailDistance : mark + trailDistance;
+-      if (!finitePositive(newSL)) return { skipped: 'trailing stop not positive' };
+-      // A stop on the wrong side of the mark has already filled: never send it.
+-      if (position.side === 'BUY' && newSL >= mark) return { skipped: 'trailing stop above mark price' };
+-      if (position.side === 'SELL' && newSL <= mark) return { skipped: 'trailing stop below mark price' };
+       const current = await this.currentStop(position);
+-      if (!this.shouldTighten(position, newSL, current)) return { skipped: 'trailing would loosen stop' };
++      if (!finitePositive(newSL) || !this.shouldTighten(position, newSL, current)) return { skipped: 'trailing would loosen stop' };
+       if (!this.liqDistanceOk(position, newSL)) return { skipped: 'trailing would sit inside the liquidation distance' };
+       const result = await this.updateTrailingSL(position.positionId, newSL, positionMagnitude(position), position.side);
+       this.reportStopMove?.(position, 'trailing', newSL);
+@@ -1344,19 +1179,6 @@
+     return { rearm: true, target, ...(result || {}) };
+   }
+ 
+-  async moveSLToEntry(positionId, entryPrice, positionQty = null, side = null) {
+-    const quotePrecision = await this.getQuotePrecision();
+-    const existing = await this.preserveTakeProfit(positionId, positionQty);
+-    const params = {
+-      symbol: this.symbol,
+-      positionId,
+-      slPrice: formatPrice(entryPrice, quotePrecision),
+-      slStopType: 'MARK_PRICE',
+-    };
+-    Object.assign(params, existing);
+-    return this.confirmedStopMove(params, positionId, positionQty, side);
+-  }
+-
+   async checkLiquidationGuard(position) {
+     const mark = Number(position.markPrice);
+     const liq = Number(position.liqPrice);
+@@ -1567,10 +1389,6 @@
+         // Profit-side management only once the position is known to be safe.
+         const breakeven = await this.checkBreakeven(position);
+         if (breakeven?.slPrice && !breakeven.skipped) position.slPrice = breakeven.slPrice;
+-        // Rung 1 of the ladder lands the stop at the entry; rungs above 1
+-        // hold it one trigger-step ahead of entry each.
+-        const stopStep = await this.checkStopStep(position);
+-        if (stopStep?.slPrice && !stopStep.skipped) position.slPrice = stopStep.slPrice;
+         const trailing = await this.checkTrailing(position);
+         if (trailing?.slPrice && !trailing.skipped) position.slPrice = trailing.slPrice;
+         // Method 3: the peak/callback exit only runs under the trailing method;
+diff -ruN -x node_modules a/src/trader/settings.js b/src/trader/settings.js
+--- a/src/trader/settings.js	2026-10-18 11:12:33.000000000 +0000
++++ b/src/trader/settings.js	2026-10-18 11:36:32.857415849 +0000
+@@ -3,7 +3,7 @@
+ export const DEFAULTS = {
+   symbol: 'BTCUSDT',
+   leverage: 10,
+-  position_type: 'isolated',
++  position_type: 'crossed',
+   timeframes: ['1m', '3m', '5m', '15m', '1h'],
+   min_confidence: 80,
+   tf_min_confidence: 60,
+@@ -27,12 +27,8 @@
+   position_mode: 'hedge',
+   scan_interval_sec: 15,
+   guard_interval_sec: 15,
+-  // ROI-on-margin triggers (price move x leverage). They must sit BELOW the
+-  // take-profit's own ROI or the stop can never move: the ATR target is ~1.8-3x
+-  // the 15m ATR, which at 10x is only ~6-9% ROI, so the old 20/25 were never
+-  // reached before the TP or SL closed the trade.
+-  breakeven_threshold_pct: 4,
+-  trailing_trigger_roi_pct: 6,
++  breakeven_threshold_pct: 20,
++  trailing_trigger_roi_pct: 25,
+   trailing_atr_multiple: 1.25,
+   trailing_atr_strength_reduction: 0.25,
+   sl_liquidation_safety: 0.60,
+diff -ruN -x node_modules a/src/trader/trader.js b/src/trader/trader.js
+--- a/src/trader/trader.js	2026-10-18 11:12:33.000000000 +0000
++++ b/src/trader/trader.js	2026-10-18 16:46:19.372879675 +0000
+@@ -136,6 +136,7 @@
+     lastManage: 0,
+     cooldownUntil: 0,
+     orderUnknownUntil: 0,
++    retryAfter: 0,
+     positions: [],
+     lastPrivateEvent: null,
+     lastSignal: null,
+@@ -303,17 +304,43 @@
+     return { ...result, confirmations, executed: false };
+   }
+ 
++  // The reason entries are currently locked out, or null. cooldownUntil is the
++  // rest period after an exit; orderUnknownUntil is "an order may be live on the
++  // exchange, do not stack another"; retryAfter is a short pause after the
++  // exchange definitely refused an order.
++  entryLock(now = Date.now()) {
++    this.state.cooldownUntil = Math.max(this.state.cooldownUntil || 0, this.positionManager.state.cooldownUntil || 0);
++    const left = until => Math.max(1, Math.ceil((until - now) / 1000));
++    if (now < this.state.cooldownUntil) return { reason: 'cooldown', secondsLeft: left(this.state.cooldownUntil) };
++    if (now < this.state.orderUnknownUntil) return { reason: 'order_unknown', secondsLeft: left(this.state.orderUnknownUntil) };
++    if (now < (this.state.retryAfter || 0)) return { reason: 'order_rejected_backoff', secondsLeft: left(this.state.retryAfter) };
++    return null;
++  }
++
++  startCooldown() {
++    this.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
++  }
++
+   async executeSignal(signal) {
+     if (!signal || !['bullish', 'bearish'].includes(signal.signal)) return { executed: false, reason: 'no directional signal' };
+     if (!CONFIG.auto_trade) return { executed: false, reason: 'auto_trade_disabled' };
+     if ((signal.confirmations || 0) < CONFIG.signal_confirm_scans) return { executed: false, reason: 'confirmation_pending' };
+     const symbol = CONFIG.symbol;
+     const now = Date.now();
+-    if (now < this.state.cooldownUntil || now < this.state.orderUnknownUntil) return { executed: false, reason: 'cooldown' };
++    // Three different locks used to share the one word "cooldown", so a lock
++    // caused by a failed order read exactly like the post-exit rest period.
++    // They are reported separately, with the time left.
++    const lock = this.entryLock(now);
++    if (lock) return { executed: false, ...lock };
+     if (this.entryInFlight.has(symbol)) return { executed: false, reason: 'entry_in_flight' };
+     this.entryInFlight.add(symbol);
+     try {
+       await this.reconcilePositions();
++      // reconcilePositions() is what notices a position that vanished since the
++      // last look (stop or target filled on the exchange). Re-check the lock
++      // now, otherwise the entry fires in the very tick that saw the exit.
++      const lockAfterSync = this.entryLock(Date.now());
++      if (lockAfterSync) return { executed: false, ...lockAfterSync };
+       if (this.state.positions.length >= CONFIG.max_positions) return { executed: false, reason: 'max_positions' };
+       // One live position per symbol. Without this a fresh entry fired every
+       // cooldown and stacked exposure on the same side, and a flipped signal
+@@ -369,7 +396,11 @@
+     if (!CONFIG.auto_trade) throw new Error('auto_trade is disabled');
+     if (!['bullish', 'bearish'].includes(direction)) throw new Error('invalid trade direction');
+     if (!validPositive(entryPrice)) throw new Error('entry price must be positive');
+-    this.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
++    // The cooldown is started only once an order really exists (below). It used
++    // to start here, before sizing, the account-settings check and the order, so
++    // any refusal on the way (balance, minimum volume, leverage mismatch, a
++    // rejected order) locked entries out for cooldown_minutes with no position
++    // and no stop-loss ever hit.
+     this.state.confirmations.delete(symbol);
+ 
+     const { qty, pair, available } = await this.computePositionSize(entryPrice, 'MARKET');
+@@ -428,11 +459,20 @@
+     } catch (error) {
+       const reconciled = await this.reconcileOrder(symbol, clientId);
+       if (!reconciled) {
+-        this.state.orderUnknownUntil = Date.now() + Math.max(Number(CONFIG.cooldown_minutes) * 60000, 300000);
++        if (error?.executionUnknown) {
++          // Network failure on a write: the order may be live, so block stacking.
++          this.state.orderUnknownUntil = Date.now() + Math.max(Number(CONFIG.cooldown_minutes) * 60000, 300000);
++        } else {
++          // The exchange answered and refused it (or the client rejected it
++          // locally): no order exists, so there is nothing to wait out. A short
++          // pause only stops a refused order being resent every scan.
++          this.state.retryAfter = Date.now() + 60000;
++        }
+         throw error;
+       }
+       order = reconciled;
+     }
++    this.startCooldown();
+     await this.reconcilePositions();
+     try {
+       // reconcilePositions() returns a trimmed view (no qty, avgPrice or liqPrice).
+@@ -546,7 +586,6 @@
+     if (open.length >= Number(CONFIG.max_positions)) {
+       throw new Error(`already holding ${open.length} position(s); max_positions is ${CONFIG.max_positions}`);
+     }
+-    this.state.cooldownUntil = Date.now() + Number(CONFIG.cooldown_minutes) * 60000;
+     this.state.confirmations.delete(normalizedSymbol);
+ 
+     // A MARKET entry has no price of its own, so the levels are derived from
+@@ -574,9 +613,12 @@
+       // A write failure is ambiguous: the order may already be live on the
+       // exchange. Block further entries until that has settled, exactly as the
+       // autonomous path does.
+-      this.state.orderUnknownUntil = Date.now() + Math.max(Number(CONFIG.cooldown_minutes) * 60000, 300000);
++      if (error?.executionUnknown) {
++        this.state.orderUnknownUntil = Date.now() + Math.max(Number(CONFIG.cooldown_minutes) * 60000, 300000);
++      }
+       throw error;
+     }
++    this.startCooldown();
+ 
+     const positions = await this.reconcilePositions();
+     // Belt and braces: the TP/SL is already armed on the order above, so this
+diff -ruN -x node_modules a/tests/api-contract.test.js b/tests/api-contract.test.js
+--- a/tests/api-contract.test.js	2026-10-18 11:12:33.000000000 +0000
++++ b/tests/api-contract.test.js	2026-10-18 11:36:38.490426686 +0000
+@@ -45,8 +45,6 @@
+ import { formatPositions, positionStatus } from '../src/trader/notifier.js';
+ 
+ // These suites pin the stop to the exact entry price; the break-even fee buffer has its own test.
+-PositionManager.BREAKEVEN_BUFFER_PCT = 0;
+-PositionManager.ATR_SIZED_TRIGGERS = false;
+ 
+ // computeTPSL is an instance method but is pure, so it is exercised through a
+ // client-less PositionManager rather than a network double.
+diff -ruN -x node_modules a/tests/breakeven-buffer.test.js b/tests/breakeven-buffer.test.js
+--- a/tests/breakeven-buffer.test.js	2026-10-18 11:12:33.000000000 +0000
++++ b/tests/breakeven-buffer.test.js	1970-01-01 00:00:00.000000000 +0000
+@@ -1,88 +0,0 @@
+-import { describe, it } from 'node:test';
+-import assert from 'node:assert/strict';
+-import { PositionManager } from '../src/trader/position-manager.js';
+-
+-const settings = { symbol: 'OGNUSDT', leverage: 50, min_confidence: 80 };
+-const make = () => new PositionManager({}, 'OGNUSDT', settings);
+-const near = (actual, expected, tolerance = 0.5) => assert.ok(Math.abs(actual - expected) <= tolerance, `${actual} is not within ${tolerance} of ${expected}`);
+-
+-describe('break-even covers fees', () => {
+-  it('puts the stop past the entry on the profit side', () => {
+-    const pm = make();
+-    near(pm.breakEvenPrice(100, 'BUY'), 100.15, 1e-9);
+-    near(pm.breakEvenPrice(100, 'SELL'), 99.85, 1e-9);
+-  });
+-});
+-
+-describe('ROI triggers are sized against the ATR stop and target', () => {
+-  // OGNUSDT-like: 15m ATR is 3.6% of price, 50x leverage.
+-  const position = { positionId: "p1", symbol: "OGNUSDT", avgPrice: "0.03881", leverage: 50, atr: 0.0014 };
+-const positionTrailing = { positionId: "p2", symbol: "OGNUSDT", avgPrice: "0.03881", leverage: 50, atr: 0.0014, signalConfidence: 80 };
+-
+-  it('lifts a trigger that sits inside normal noise (4% ROI at 50x is 0.08% of price) to one stop distance', async () => {
+-    near(await make().effectiveTriggerRoi(position, 4, 1, 0.6), 214.6);
+-  });
+-  it('leaves a trigger already between one stop distance and the target alone', async () => {
+-    // 250 is above the break-even cap, but at 50x the cap sits BELOW one stop
+-    // distance, so the floor (one stop distance) still wins: the trigger is
+-    // lifted to 214.6, not capped to the cap.
+-    near(await make().effectiveTriggerRoi(position, 250, 1, 0.6), 214.6);
+-  });
+-  it('pulls a trigger that is beyond the take-profit back inside it', async () => {
+-    near(await make().effectiveTriggerRoi(position, 1000, 1, 0.6), 214.6);
+-  });
+-  it('keeps the configured value when no ATR can be read', async () => {
+-    assert.equal(await make().effectiveTriggerRoi({ ...position, atr: undefined }, 4, 1, 0.6), 4);
+-  });
+-
+-  // WALUSDT-like: 25x leverage, stop at 4.5% of price, target at 12%. The
+-  // ATR stop is therefore 112% on margin and the target 300% on margin.
+-  const lowLevPosition = { positionId: 'p2', symbol: 'WALUSDT', avgPrice: '0.05265', leverage: 25, atr: 0.0023, signalConfidence: 80 };
+-
+-  it('caps the break-even trigger to the first quarter of the target band instead of letting it fire at the target ROI', async () => {
+-    // One stop distance = 130% on margin; a quarter of the target band (301%)
+-    // is 75%, below that floor, so the trigger sits at the stop distance —
+-    // the floor is the binding constraint here, and the cap only keeps a
+-    // looser configured value from firing near the target.
+-    near(await make().effectiveTriggerRoi(lowLevPosition, 4, 1, 0.6), 130);
+-  });
+-  it('does not cap a trailing trigger inside the take-profit band', async () => {
+-    // Trailing (floorR 1.25) may trail above the take-profit band: the callback
+-    // owns the exit, the stop just holds it in. 1.25 x 130 = 162.5.
+-    near(await make().effectiveTriggerRoi(lowLevPosition, 6, 1.25, 0.85), 162.5);
+-  });
+-});
+-
+-describe('stop moves keep at least sl_liquidation_safety away from the liquidation price', () => {
+-  const settings = { symbol: 'OGNUSDT', leverage: 50, min_confidence: 80, sl_liquidation_safety: 20 };
+-  const make = () => new PositionManager({}, 'OGNUSDT', settings);
+-  const PAD = PositionManager.LIQ_STOP_PADDING;
+-
+-  it('allows a long stop that is comfortably above its liquidation price', () => {
+-    const pm = make();
+-    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 12), true);
+-  });
+-  it('refuses a long stop that would sit on or below liquidation (or inside the pad)', () => {
+-    const pm = make();
+-    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 10), false);
+-    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 9), false);
+-    // Inside the 0.2% pad: 10.10 < 10.20 -> refused even though above liq.
+-    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 10 * (1 + PAD) * 0.99), false);
+-    // Just outside the pad: allowed.
+-    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '10' }, 10 * (1 + PAD) * 1.01), true);
+-  });
+-  it('mirrors the rule for shorts: the stop stays below the liquidation price', () => {
+-    const pm = make();
+-    assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 7), true);
+-    assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 9), false);
+-    assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 11), false);
+-    assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 9 * (1 - PAD) * 1.01), false);
+-    assert.equal(pm.liqDistanceOk({ side: 'SELL', liqPrice: '9' }, 9 * (1 - PAD) * 0.99), true);
+-  });
+-  it('fails closed when the liquidation price is missing or invalid', () => {
+-    const pm = make();
+-    assert.equal(pm.liqDistanceOk({ side: 'BUY' }, 12), false);
+-    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: '0' }, 12), false);
+-    assert.equal(pm.liqDistanceOk({ side: 'BUY', liqPrice: undefined }, 12), false);
+-  });
+-});
+diff -ruN -x node_modules a/tests/cooldown.test.js b/tests/cooldown.test.js
+--- a/tests/cooldown.test.js	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/cooldown.test.js	2026-10-18 16:46:35.439773336 +0000
+@@ -0,0 +1,84 @@
++import { describe, it, beforeEach } from 'node:test';
++import assert from 'node:assert/strict';
++import { CONFIG } from '../src/config.js';
++import { Trader } from '../src/trader/trader.js';
++import { PositionManager } from '../src/trader/position-manager.js';
++
++const position = { symbol: 'BTCUSDT', positionId: 'p1', side: 'LONG', qty: '1', avgOpenPrice: '100', markPrice: '100' };
++
++function openClient(overrides = {}) {
++  return {
++    getAccount: async () => ({ available: '100' }),
++    getLeverageAndMarginMode: async () => ({ leverage: CONFIG.leverage, marginMode: CONFIG.position_type === 'isolated' ? 'ISOLATION' : 'CROSS' }),
++    getPositionMode: async () => ({ positionMode: CONFIG.position_mode === 'hedge' ? 'HEDGE' : 'ONE_WAY' }),
++    getTradingPairs: async () => [{ symbol: 'BTCUSDT', basePrecision: 8, minTradeVolume: '0.001' }],
++    getPendingPositions: async () => [],
++    getPendingOrders: async () => [],
++    getHistoryOrders: async () => [],
++    placeOrder: async () => ({ orderId: 'o1' }),
++    ...overrides,
++  };
++}
++
++describe('cooldown', () => {
++  beforeEach(() => {
++    Object.assign(CONFIG, {
++      symbol: 'BTCUSDT', auto_trade: true, leverage: 10, cooldown_minutes: 5,
++      signal_confirm_scans: 1, max_positions: 3, order_unit: 'cost', position_sizing_margin_pct: 2,
++    });
++  });
++
++  it('a position that disappears on the exchange (stop or target filled there) starts the cooldown', async () => {
++    let open = [position];
++    const pm = new PositionManager({ getPendingPositions: async () => open }, 'BTCUSDT', CONFIG);
++    await pm.fetchPositions();
++    assert.equal(pm.state.cooldownUntil, 0, 'an open position alone is not an exit');
++    open = [];
++    await pm.fetchPositions();
++    assert.ok(pm.state.cooldownUntil > Date.now() + 4 * 60000, 'the exit started a 5 minute rest');
++  });
++
++  it('the first look after a restart is not an exit', async () => {
++    const pm = new PositionManager({ getPendingPositions: async () => [] }, 'BTCUSDT', CONFIG);
++    await pm.fetchPositions();
++    assert.equal(pm.state.cooldownUntil, 0);
++  });
++
++  it('executeSignal refuses an entry in the very tick that first sees the exit', async () => {
++    let open = [position];
++    const trader = new Trader(openClient({ getPendingPositions: async () => open }));
++    await trader.positionManager.fetchPositions();
++    open = [];
++    const res = await trader.executeSignal({ signal: 'bullish', confirmations: 1, lastPrice: 100, confidence: 90, tfSignals: {} });
++    assert.equal(res.executed, false);
++    assert.equal(res.reason, 'cooldown');
++    assert.ok(res.secondsLeft > 0);
++  });
++
++  it('a refusal before the order exists does NOT start a cooldown', async () => {
++    const trader = new Trader(openClient({ getAccount: async () => ({ available: '0' }) }));
++    await assert.rejects(() => trader.openPosition('BTCUSDT', 100, 'bullish', 2), /positive/);
++    assert.equal(trader.state.cooldownUntil, 0);
++    assert.equal(trader.entryLock(), null);
++  });
++
++  it('an order the exchange rejected is a short backoff, not a cooldown or an unknown order', async () => {
++    const trader = new Trader(openClient({ placeOrder: async () => { throw new Error('Bitunix rejected: 10002'); } }));
++    await assert.rejects(() => trader.openPosition('BTCUSDT', 100, 'bullish', 2), /rejected/);
++    assert.equal(trader.state.cooldownUntil, 0);
++    assert.equal(trader.state.orderUnknownUntil, 0);
++    assert.equal(trader.entryLock().reason, 'order_rejected_backoff');
++  });
++
++  it('a network failure on the write still blocks stacking (order may be live)', async () => {
++    const trader = new Trader(openClient({ placeOrder: async () => { throw Object.assign(new Error('timeout'), { executionUnknown: true }); } }));
++    await assert.rejects(() => trader.openPosition('BTCUSDT', 100, 'bullish', 2), /timeout/);
++    assert.equal(trader.entryLock().reason, 'order_unknown');
++  });
++
++  it('a real entry starts the cooldown', async () => {
++    const trader = new Trader(openClient());
++    await trader.openPosition('BTCUSDT', 100, 'bullish', 2);
++    assert.equal(trader.entryLock().reason, 'cooldown');
++  });
++});
+diff -ruN -x node_modules a/tests/stop-move.test.js b/tests/stop-move.test.js
+--- a/tests/stop-move.test.js	2026-10-18 11:12:33.000000000 +0000
++++ b/tests/stop-move.test.js	2026-10-18 11:37:12.021858593 +0000
+@@ -3,8 +3,6 @@
+ import { PositionManager } from '../src/trader/position-manager.js';
+ 
+ // These suites pin the stop to the exact entry price; the break-even fee buffer has its own test.
+-PositionManager.BREAKEVEN_BUFFER_PCT = 0;
+-PositionManager.ATR_SIZED_TRIGGERS = false;
+ 
+ // Regression: the entry order carries its stop attached, which is an ORDER-level
+ // TP/SL row. /tpsl/position/modify_order answers code 0 for it and changes
+@@ -177,10 +175,24 @@
+     assert.equal(result?.skipped, 'trailing would sit inside the liquidation distance');
+   });
+ 
+-  it('a missing liqPrice fails closed', async () => {
++  it('a missing liqPrice does not block the move', async () => {
+     rows.length = 0;
+     const pm = new PositionManager(client, 'WALUSDT', settings());
+     const result = await pm.checkBreakeven(tight({ liqPrice: undefined }));
+-    assert.equal(result?.skipped, 'break-even would sit inside the liquidation distance');
++    assert.notEqual(result?.skipped, 'break-even would sit inside the liquidation distance');
++  });
++
++  // Regression: sl_liquidation_safety is a PERCENT (0.60 = 0.60%). It was once
++  // compared as a fraction, which demanded a stop 60% beyond liquidation and
++  // refused every break-even / trailing move at the default setting.
++  it('the default sl_liquidation_safety never blocks a normal break-even or trailing move', async () => {
++    rows.length = 0;
++    const pm = new PositionManager(client, 'WALUSDT', { ...settings(), sl_liquidation_safety: 0.6 });
++    const be = await pm.checkBreakeven(tight());
++    assert.equal(be?.skipped, undefined, 'break-even fired at the default safety');
++    rows.length = 0;
++    rows.push({ id: 's1', positionId: 'w1', slPrice: '0.0600', slQty: '38' });
++    const tr = await pm.checkTrailing(tight({ markPrice: '0.0640', atr: 0.0005 }));
++    assert.equal(tr?.skipped, undefined, 'trailing fired at the default safety');
+   });
+ });
+diff -ruN -x node_modules a/tests/stop-step.test.js b/tests/stop-step.test.js
+--- a/tests/stop-step.test.js	2026-10-18 11:12:33.000000000 +0000
++++ b/tests/stop-step.test.js	1970-01-01 00:00:00.000000000 +0000
+@@ -1,125 +0,0 @@
+-import { describe, it } from 'node:test';
+-import assert from 'node:assert/strict';
+-import { PositionManager } from '../src/trader/position-manager.js';
+-
+-// The stop ladder: a rung fires every time the favorable ROI crosses the next
+-// multiple of trailing_trigger_roi_pct — e.g. trigger 4 -> the 4 / 8 / 12
+-// ladder — and ratchets the stop up to the PRIOR rung's line, lagging the
+-// price by one rung. It rides the EXISTING trigger setting; 0 disables.
+-
+-PositionManager.STOP_VERIFY_DELAY_MS = 0;
+-PositionManager.ATR_SIZED_TRIGGERS = false;
+-PositionManager.BREAKEVEN_BUFFER_PCT = 0; // pin the buffer so levels are exact
+-
+-const settings = (trigger) => ({
+-  symbol: 'BTCUSDT', leverage: 10, min_confidence: 80, tpsl_method: 'position',
+-  breakeven_threshold_pct: 5, trailing_trigger_roi_pct: trigger, trailing_callback_pct: 5,
+-  sl_liquidation_safety: 10,
+-  cooldown_minutes: 1, on_tpsl_failure: 'close', max_positions: 3,
+-  account_tp_roi_pct: 0, account_sl_roi_pct: 0,
+-  partial_tp_fractions: [0.3, 0.4, 0.3], partial_tp_roi_steps: [1, 2, 3],
+-});
+-
+-// Long, entry 100, leverage 10x: a +4% price move is 40 ROI, +8% is 80.
+-// liqPrice 90 keeps the liquidation guard clear of every move.
+-const long = (over = {}) => ({
+-  positionId: 'p1', symbol: 'BTCUSDT', side: 'BUY', qty: '1', leverage: 10,
+-  avgPrice: '100', markPrice: '104', liqPrice: '90', ...over,
+-});
+-
+-function exchange({ work = false } = {}) {
+-  const calls = [];
+-  const rows = [];
+-  const client = {
+-    calls, rows,
+-    getPendingTPSL: async () => rows.map(row => ({ ...row })),
+-    modifyTPSL: async (params) => {
+-      calls.push('modifyTPSL');
+-      if (work) rows.push({ id: 'att-1', positionId: 'p1', slPrice: params.slPrice, slQty: '1' });
+-      return { orderId: 'att-1' };
+-    },
+-    closePosition: async () => { throw new Error('unexpected close'); },
+-    getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 1, basePrecision: 4 }],
+-  };
+-  return client;
+-}
+-
+-describe('stop ladder (trailing_trigger_roi_pct)', () => {
+-  it('is a no-op when the trailing trigger is 0', async () => {
+-    const client = exchange();
+-    const pm = new PositionManager(client, 'BTCUSDT', settings(0));
+-    const result = await pm.checkStopStep(long({ markPrice: '200' }));
+-    assert.equal(result.skipped, 'stop ladder disabled');
+-    assert.equal(client.calls.length, 0);
+-  });
+-
+-  it('fires at the first rung and lands the stop on the break-even line', async () => {
+-    const client = exchange({ work: true });
+-    const pm = new PositionManager(client, 'BTCUSDT', settings(40));
+-    // +4% price at 10x = 40 ROI: clears the trigger-40 rung-1 threshold.
+-    const result = await pm.checkStopStep(long());
+-    assert.equal(result.rung, 1);
+-    assert.equal(result.slPrice, '100', 'rung 1 is the entry/break-even line');
+-    assert.deepEqual(client.calls, ['modifyTPSL']);
+-  });
+-
+-  it('does not fire below the first rung', async () => {
+-    const client = exchange();
+-    const pm = new PositionManager(client, 'BTCUSDT', settings(80));
+-    // +4% price = 40 ROI: under the 80-ROI rung-1 threshold.
+-    const result = await pm.checkStopStep(long());
+-    assert.equal(result.skipped, 'stop ladder threshold not reached');
+-    assert.equal(client.calls.length, 0);
+-  });
+-
+-  it('climbs the ladder one rung per multiple and never re-sends', async () => {
+-    const client = exchange({ work: true });
+-    const pm = new PositionManager(client, 'BTCUSDT', settings(40));
+-    // Rung 1 at +4%: stop to the entry line.
+-    assert.equal((await pm.checkStopStep(long())).rung, 1);
+-    // +6% price = 60 ROI: still under rung 2's 80-ROI threshold — the rung
+-    // waits rather than re-sending rung 1's modify.
+-    assert.equal((await pm.checkStopStep(long({ markPrice: '106' }))).skipped, 'stop ladder threshold not reached');
+-    // +8% price = 80 ROI clears rung 2: stop to the +4% price line.
+-    const rung2 = await pm.checkStopStep(long({ markPrice: '108' }));
+-    assert.equal(rung2.rung, 2);
+-    assert.equal(rung2.slPrice, '104');
+-    // +12% price = 120 ROI clears rung 3: stop to the +8% price line.
+-    const rung3 = await pm.checkStopStep(long({ markPrice: '112' }));
+-    assert.equal(rung3.rung, 3);
+-    assert.equal(rung3.slPrice, '108');
+-    assert.equal(client.calls.length, 3, 'one modify per rung, no resends');
+-  });
+-
+-  it('never drags the stop back down from a higher level', async () => {
+-    // Trailing already left the stop at 108, ahead of this rung's 104 line:
+-    // the rung cannot move the stop backward, so it is skipped instead of sent.
+-    const client = exchange();
+-    client.rows.push({ id: 's1', positionId: 'p1', slPrice: '108', slQty: '1' });
+-    const pm = new PositionManager(client, 'BTCUSDT', settings(40));
+-    pm.stepApplied.set('p1', { rung: 1, slPrice: '100' });
+-    const result = await pm.checkStopStep(long({ markPrice: '112' }));
+-    assert.equal(result.skipped, 'stop ladder already at or ahead of this rung');
+-    assert.equal(client.calls.length, 0);
+-  });
+-
+-  it('refuses a rung that would sit inside the liquidation distance', async () => {
+-    // liq 104.5 sits above the rung-2 candidate 104: the exchange would
+-    // liquidate before the stop fills, so the rung is refused and never sent.
+-    const client = exchange();
+-    const pm = new PositionManager(client, 'BTCUSDT', settings(40));
+-    pm.stepApplied.set('p1', { rung: 1, slPrice: '100' });
+-    const result = await pm.checkStopStep(long({ markPrice: '108', liqPrice: '104.5' }));
+-    assert.equal(result.skipped, 'stop ladder would sit inside the liquidation distance');
+-    assert.equal(client.calls.length, 0);
+-  });
+-
+-  it('waits while the price has not covered the rung line', async () => {
+-    // +3.9% price = 39 ROI: under the 40-ROI rung threshold — not reached.
+-    const client = exchange();
+-    const pm = new PositionManager(client, 'BTCUSDT', settings(40));
+-    const result = await pm.checkStopStep(long({ markPrice: '103.9' }));
+-    assert.equal(result.skipped, 'stop ladder threshold not reached');
+-    assert.equal(client.calls.length, 0);
+-  });
+-});
+diff -ruN -x node_modules a/tests/trailing-follow.test.js b/tests/trailing-follow.test.js
+--- a/tests/trailing-follow.test.js	2026-10-18 11:12:33.000000000 +0000
++++ b/tests/trailing-follow.test.js	2026-10-18 11:36:38.492067243 +0000
+@@ -3,8 +3,6 @@
+ import { PositionManager } from '../src/trader/position-manager.js';
+ 
+ PositionManager.STOP_VERIFY_DELAY_MS = 0;
+-PositionManager.BREAKEVEN_BUFFER_PCT = 0;
+-PositionManager.ATR_SIZED_TRIGGERS = false;
+ 
+ // A long, entry 100, ATR 1, 10x. Several manage ticks against a stateful exchange.
+ function run(marks) {
