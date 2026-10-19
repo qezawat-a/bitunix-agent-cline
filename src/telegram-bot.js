@@ -107,6 +107,7 @@ export async function setCommands() {
     { command: 'trades', description: 'Recent trades' },
     { command: 'pnl', description: 'PnL report' },
     { command: 'close', description: 'Close one position' },
+    { command: 'breakeven', description: 'Move SL to entry on open positions now' },
     { command: 'close_all', description: 'Close all with confirmation' },
     { command: 'autotrade', description: 'Enable/disable agent auto trade' },
     { command: 'scan', description: 'scan on|off' },

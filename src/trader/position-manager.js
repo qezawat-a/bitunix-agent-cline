@@ -1015,6 +1015,19 @@ export class PositionManager {
     return { skipped: 'threshold not reached' };
   }
 
+  async forceBreakeven(position) {
+    const entry = Number(position.avgPrice);
+    const mark = Number(position.markPrice);
+    if (!finitePositive(entry) || !finitePositive(mark)) throw new Error("position entry/mark price missing");
+    const inProfit = position.side === "BUY" ? mark > entry : mark < entry;
+    if (!inProfit) return { skipped: "position is not in profit; a stop at the entry would fire immediately" };
+    if (!this.liqDistanceOk(position, entry)) return { skipped: "stop at the entry would sit inside the liquidation distance" };
+    const result = await this.moveSLToEntry(position.positionId, entry, positionMagnitude(position), position.side);
+    const precision = await this.getQuotePrecision();
+    this.breakEvenApplied.set(String(position.positionId), { slPrice: entry, precision });
+    this.reportStopMove?.(position, "breakeven", entry);
+    return { ...result, slPrice: formatPrice(entry, precision) };
+  }
   async moveSLToEntry(positionId, entryPrice, positionQty = null, side = null) {
     const quotePrecision = await this.getQuotePrecision();
     // /tpsl/position/modify_order takes only symbol, positionId, the tp*/sl*

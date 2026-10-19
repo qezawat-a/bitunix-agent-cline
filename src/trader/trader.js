@@ -691,6 +691,27 @@ export class Trader {
     return { qty: sized.qty, pair, available };
   }
 
+  alert = null;
+  errorSeen = new Map();
+
+  reportErrors(kind, errors) {
+    if (!Array.isArray(errors) || !errors.length) return;
+    const now = Date.now();
+    const html = v => String(v ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    if (this.errorSeen.size > 200) this.errorSeen.clear();
+    for (const err of errors) {
+      const id = err?.positionId ?? "-";
+      const message = err?.message ?? String(err);
+      console.error(`[${kind}] ${id}: ${message}`);
+      const key = `${kind}|${id}|${message}`;
+      if (now - (this.errorSeen.get(key) || 0) < 600000) continue;
+      this.errorSeen.set(key, now);
+      if (typeof this.alert === "function") {
+        const text = `⚠️ <b>${html(kind)}</b> <code>${html(id)}</code>\n<code>${html(message)}</code>`;
+        Promise.resolve(this.alert(text)).catch(() => {});
+      }
+    }
+  }
   async guard() {
     if (this.guardInFlight) return this.guardInFlight;
     const now = Date.now();
@@ -712,6 +733,7 @@ export class Trader {
         }
       }
       this.state.cooldownUntil = Math.max(this.state.cooldownUntil, this.positionManager.state.cooldownUntil);
+      this.reportErrors('guard', errors);
       this.state.positions = positions.map(position => ({ positionId: position.positionId, symbol: position.symbol, side: position.side }));
       return errors;
     })();
@@ -730,6 +752,7 @@ export class Trader {
     this.manageInFlight = this.positionManager.midManage();
     try {
       const errors = await this.manageInFlight;
+      this.reportErrors('manage', errors);
       this.state.cooldownUntil = Math.max(this.state.cooldownUntil, this.positionManager.state.cooldownUntil);
       this.state.positions = this.positionManager.state.positions.map(position => ({ positionId: position.positionId, symbol: position.symbol, side: position.side }));
       return errors;

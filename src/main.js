@@ -67,6 +67,7 @@ async function main() {
   const client = new BitunixClient();
   const scanner = new Scanner(client);
   const trader = new Trader(client);
+  trader.alert = text => (CONFIG.ALLOWED_USER_ID ? sendMessage(CONFIG.ALLOWED_USER_ID, text) : null);
   // Last "permanent" entry-failure notice per symbol. The scan loop would
   // otherwise re-announce the same refusal (a pair minimum the size can never
   // reach, a delisted symbol) on every tick. Keyed on the symbol so that a /set

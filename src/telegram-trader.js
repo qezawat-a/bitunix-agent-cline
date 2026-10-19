@@ -72,7 +72,7 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           return true;
         }
         case 'help': {
-          await sendMessage(chatId, '<b>Commands</b>\n/start /stop /status /help /settings /set /get /signal /balance /positions /trades /pnl /close &lt;symbol&gt; &lt;positionId&gt; /close_all &lt;symbol&gt; confirm /autotrade /scan /report /leverage /symbol /margin_mode /position_mode /order_unit /position_sizing /models /thinking /memory /resume /reset /ask /skills /skill /mcp /tools /diag');
+          await sendMessage(chatId, '<b>Commands</b>\n/start /stop /status /help /settings /set /get /signal /balance /positions /trades /pnl /close &lt;symbol&gt; &lt;positionId&gt; /breakeven /close_all &lt;symbol&gt; confirm /autotrade /scan /report /leverage /symbol /margin_mode /position_mode /order_unit /position_sizing /models /thinking /memory /resume /reset /ask /skills /skill /mcp /tools /diag');
           return true;
         }
         case 'status': {
@@ -155,6 +155,28 @@ export function createTraderCommands({ client, scanner, trader, agent, tools = [
           // report it as an unexplained exchange-side close.
           notifier?.noteClose(positionId, 'manual');
           await notifier?.sync().catch(() => {});
+          return true;
+        }
+        case 'breakeven': {
+          const pm = trader?.positionManager;
+          if (!pm) return usage(chatId, 'Position manager is not ready.');
+          pm.resetTpslCache();
+          const open = await pm.fetchPositions();
+          if (!open.length) { await sendMessage(chatId, 'No open positions.'); return true; }
+          const lines = [];
+          for (const position of open) {
+            const label = `${esc(position.side)} <code>${esc(position.symbol)}</code> <code>${esc(position.positionId)}</code>`;
+            try {
+              pm.resetTpslCache();
+              const res = await pm.forceBreakeven(position);
+              lines.push(res.skipped
+                ? `${label}: skipped, ${esc(res.skipped)}`
+                : `${label}: SL moved to <code>${esc(res.slPrice)}</code> (${esc(res.via || "ok")})`);
+            } catch (error) {
+              lines.push(`${label}: FAILED, <code>${esc(error.message)}</code>`);
+            }
+          }
+          await sendMessage(chatId, `<b>Break-even</b>\n${lines.join('\n')}`);
           return true;
         }
         case 'close_all': {
