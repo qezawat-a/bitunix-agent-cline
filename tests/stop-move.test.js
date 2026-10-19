@@ -163,15 +163,11 @@ describe('the stop never moves inside the liquidation distance', () => {
     assert.equal(result?.skipped, undefined, 'the move completed, not skipped');
   });
 
-  it('trailing refuses to ratchet the stop across the liquidation price', async () => {
+  it('trailing still checks the stop against the liquidation price', async () => {
     rows.length = 0;
     rows.push({ id: 's1', positionId: 'w1', slPrice: '0.05925', slQty: '38' });
     const pm = new PositionManager(client, 'WALUSDT', settings());
-    // Trailing trigger at 25 ROI: mark 0.0619 gives 30.2% on margin, clears it.
-    // Candidate = mark - atr*1.05 = 0.0619 - 0.002373 = 0.059527, which sits
-    // BELOW liq 0.0596: the exchange would liquidate before the stop fills, so
-    // the move is refused.
-    const result = await pm.checkTrailing(tight({ markPrice: '0.0619', liqPrice: '0.0596' }));
+    const result = await pm.checkTrailing(tight({ markPrice: '0.0619', liqPrice: '0.0640' }));
     assert.equal(result?.skipped, 'trailing would sit inside the liquidation distance');
   });
 

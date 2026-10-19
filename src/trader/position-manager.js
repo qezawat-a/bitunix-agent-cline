@@ -1040,24 +1040,41 @@ export class PositionManager {
     return this.confirmedStopMove(params, positionId, positionQty, side);
   }
 
+  // Trailing in ROI steps. trailing_trigger_roi_pct is both the point where
+  // trailing starts and the size of every step after it: each time the position's
+  // ROI on margin climbs another full step, the stop climbs one step too, always
+  // staying one step behind. With a step of 15: at +15% ROI the stop sits at the
+  // entry (0%), at +30% it sits at +15%, at +45% at +30%, and so on. The stop is
+  // converted to a price with the position's own leverage, and it only ever
+  // tightens. ATR is not involved: it sizes the first stop and target, not this.
   async checkTrailing(position) {
     const mark = Number(position.markPrice);
     if (!finitePositive(mark)) throw new Error('position mark price must be positive');
-    if (this.favorableRoiPct(position) >= Number(this.settings.trailing_trigger_roi_pct)) {
-      const atr = await this.getAtrForPosition(position);
-      const strength = Math.max(0, Math.min(100, Number(position.signalConfidence ?? this.settings.min_confidence))) / 100;
-      const multiple = Number(this.settings.trailing_atr_multiple) || 1.25;
-      const reduction = Number(this.settings.trailing_atr_strength_reduction) || 0.25;
-      const trailDistance = atr * (multiple - strength * reduction);
-      const newSL = position.side === 'BUY' ? mark - trailDistance : mark + trailDistance;
-      const current = await this.currentStop(position);
-      if (!finitePositive(newSL) || !this.shouldTighten(position, newSL, current)) return { skipped: 'trailing would loosen stop' };
-      if (!this.liqDistanceOk(position, newSL)) return { skipped: 'trailing would sit inside the liquidation distance' };
-      const result = await this.updateTrailingSL(position.positionId, newSL, positionMagnitude(position), position.side);
-      this.reportStopMove?.(position, 'trailing', newSL);
-      return { ...result, slPrice: formatPrice(newSL, await this.getQuotePrecision()) };
+    const entry = Number(position.avgPrice);
+    if (!finitePositive(entry)) throw new Error('position entry price must be positive');
+    const step = Number(this.settings.trailing_trigger_roi_pct);
+    if (!finitePositive(step)) return { skipped: 'trailing disabled (trailing_trigger_roi_pct is 0)' };
+    const roi = this.favorableRoiPct(position);
+    if (roi < step) return { skipped: 'threshold not reached' };
+    const steps = Math.floor(roi / step);
+    const stopRoi = (steps - 1) * step;
+    const leverage = finitePositive(position.leverage)
+      ? Number(position.leverage)
+      : finitePositive(this.settings.leverage) ? Number(this.settings.leverage) : 1;
+    const direction = position.side === 'BUY' ? 1 : -1;
+    const newSL = entry * (1 + direction * (stopRoi / 100) / leverage);
+    const current = await this.currentStop(position);
+    if (!finitePositive(newSL) || !this.shouldTighten(position, newSL, current)) {
+      return { skipped: 'trailing would loosen stop' };
     }
-    return { skipped: 'threshold not reached' };
+    if (!this.liqDistanceOk(position, newSL)) {
+      return { skipped: 'trailing would sit inside the liquidation distance' };
+    }
+    const result = await this.updateTrailingSL(
+      position.positionId, newSL, positionMagnitude(position), position.side);
+    this.reportStopMove?.(position, 'trailing', newSL);
+    const slPrice = formatPrice(newSL, await this.getQuotePrecision());
+    return { ...result, slPrice, roi, stopRoi };
   }
 
   async updateTrailingSL(positionId, newSL, positionQty = null, side = null) {

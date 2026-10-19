@@ -2736,7 +2736,7 @@ describe('break-even is applied once per position, not once per manage tick', ()
     const stale = [{ positionId: 'p1', tpPrice: '0.09', slPrice: '0.06', tpStopType: 'MARK_PRICE', slStopType: 'MARK_PRICE' }];
     const client = buildClient({ rows: stale });
     const announced = [];
-    const pm = new PositionManager(reflecting(client), 'BTCUSDT', settings());
+    const pm = new PositionManager(reflecting(client), 'BTCUSDT', settings({ trailing_trigger_roi_pct: 100000 }));
     pm.notifier = { reportStopMove: (p, action, price) => announced.push([action, price]) };
     await pm.midManage();
     assert.equal(client.sent.length, 1, 'the first tick moves the stop once');

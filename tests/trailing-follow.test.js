@@ -35,7 +35,7 @@ function run(marks) {
 describe('the stop follows price up and never back down', () => {
   it('trails higher on every new high, then holds when price retraces', async () => {
     const stops = await run([100.6, 101, 102, 103, 104, 103.5, 102.5, 105]);
-    assert.deepEqual(stops.map(s => Math.round(s * 100) / 100), [100, 100, 100.95, 101.95, 102.95, 102.95, 102.95, 103.95]);
+    assert.deepEqual(stops.map(s => Math.round(s * 100) / 100), [100, 100, 100.8, 101.6, 103.2, 103.2, 103.2, 104]);
     for (let i = 1; i < stops.length; i += 1) assert.ok(stops[i] >= stops[i - 1], `stop loosened at tick ${i}`);
   });
 });
