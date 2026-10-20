@@ -1,0 +1,39 @@
+strategy_id: jrock_pivot_A_range_fade_v1
+parent_strategy: jrock_consensus_trend_v1
+technique: assumption_inversion
+tier: research_only
+novelty_score: 9
+quality_potential: 7
+rank: 1
+hypothesis: When efficiency below 20 and ADX below 25, the consensus engine correctly refuses trend trades, but that chop itself is tradeable. Fade band extremes with tight time stops instead of chasing breakouts.
+archetype: mean_reversion
+why_structural: Inverts core assumption from trend persistence to range persistence. Reuses bollinger plus rsi plus volume voters as primary rather than residual weight.
+universe:
+  exchange: bitunix
+  symbols: [BTCUSDT]
+  leverage: 5
+timeframes: [5m, 15m]
+entry:
+  long: price below lower Bollinger band and RSI below 30 and volume expansion and efficiency below 15
+  short: price above upper Bollinger band and RSI above 70 and volume expansion and efficiency below 15
+  veto: efficiency above 20 or ADX above 25 or funding extreme against direction above 0.05pct per 8h
+exits:
+  take_profit_atr_multiple: 1.0
+  stop_loss_atr_multiple: 0.8
+  time_stop_minutes: 45
+  breakeven_at_r: 0.4
+risk:
+  position_sizing_margin_pct: 1
+  max_positions: 2
+  sl_liquidation_safety_pct: 0.6
+  cooldown_minutes: 10
+expected_effect:
+  - trades only when parent would sit out, decorrelated return stream
+  - lower leverage plus time stop caps chop-tail
+  - costs still matter: requires limit or post-only fills where possible
+validation:
+  - backtest on range-tagged segments where parent fill rate below 30pct
+  - require OOS PF above 1.2 before export
+manual_design_needed:
+  - port bollinger plus rsi plus volume logic from indicators.js into standalone fade scorer
+  - wire time-stop into position-manager guard loop

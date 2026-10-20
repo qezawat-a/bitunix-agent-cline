@@ -29,6 +29,10 @@ export const DEFAULTS = {
   guard_interval_sec: 15,
   breakeven_threshold_pct: 20,
   trailing_trigger_roi_pct: 25,
+  // DEPRECATED: trailing_atr_multiple and trailing_atr_strength_reduction were
+  // used by the old ATR-based trailing stop (replaced by ROI-step trailing in
+  // commit 314e995). They remain in DEFAULTS for backward compatibility with
+  // existing settings.json files but are no longer read by any code path.
   trailing_atr_multiple: 1.25,
   trailing_atr_strength_reduction: 0.25,
   sl_liquidation_safety: 0.60,

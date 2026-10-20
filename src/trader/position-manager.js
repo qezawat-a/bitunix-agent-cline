@@ -126,6 +126,10 @@ export class PositionManager {
   // most once per tick and reset by resetTpslCache(), so the whole manage pass
   // sees one consistent view of what the exchange actually has armed.
   tpslCache = null;
+  // Reversal signal from the latest scan (bullish/bearish/neutral). Set by the
+  // trader before each midManage tick. When a reversal fires, positions whose
+  // side opposes the new market direction are closed at the next manage tick.
+  reversal = null;
   // Live TP/SL state pushed on the private `tpsl` WebSocket channel, keyed by
   // positionId.
   //
@@ -508,6 +512,69 @@ export class PositionManager {
     return tiers;
   }
 
+  // The maintenance-margin rate a notional falls into, read from the exchange's
+  // tiered risk-limit table. 0.004 (the tier-1 rate the docs publish for small
+  // notionals) when the table is unreachable — the safest (closest) choice,
+  // since a lower rate estimates liquidation further from the entry.
+  async tierMaintenanceRate(notional) {
+    const tiers = await this.getPositionTiers();
+    if (Array.isArray(tiers) && tiers.length) {
+      for (const row of tiers) {
+        const end = Number(row?.endValue ?? row?.end_value);
+        const rate = Number(row?.maintenanceMarginRate ?? row?.maintenance_margin_rate);
+        if (Number.isFinite(end) && Number.isFinite(rate) && notional <= end) return rate;
+      }
+    }
+    return 0.004;
+  }
+
+  // The margin mode the ACCOUNT actually runs, when it can be asked. Bitunix
+  // margin mode is per-exchange state the operator can flip in the app without
+  // touching the config — JCTUSDT 2026-10-20: the account traded the bot's
+  // entry under ISOLATION while position_type still said the default
+  // 'crossed', and the cross formula (which adds the whole account balance as
+  // a cushion) placed the estimated liquidation far enough from the entry that
+  // the 60% clamp never fired and the ATR stop shipped BELOW the exchange's
+  // own liquidation price: SL 0.003973 under a live liq 0.003988 — a stop the
+  // exchange can never fill. Arithmetic follows the exchange; settings remain
+  // the declared intent used only when the account cannot be asked.
+  async accountMarginMode(symbol = this.symbol) {
+    if (typeof this.client?.getLeverageAndMarginMode !== 'function') return null;
+    try {
+      const info = await this.client.getLeverageAndMarginMode(symbol, 'USDT');
+      const mode = String(info?.marginMode ?? '').trim().toUpperCase();
+      return mode === 'ISOLATION' || mode === 'CROSS' ? mode : null;
+    } catch {
+      return null;
+    }
+  }
+
+  // The liquidation boundary a LIVE position actually faces. The exchange's
+  // own liqPrice is authoritative whenever the row carries one. But rows are
+  // observed reporting liqPrice "0" while the position still traded (JCTUSDT
+  // 2026-10-20 dumped liqPrice "0" on a 30x row), and every consumer below
+  // treats liq <= 0 as "nothing to guard" — blindness at exactly the most
+  // dangerous moment. So zero/absent falls back to an estimate from the row's
+  // own entry and leverage. The ISOLATED formula is used even for a cross
+  // account on purpose: without the account balance in hand, its estimate sits
+  // CLOSER to the entry than the real cross liquidation, which is the safe
+  // direction for a guard (it may act early, never late). Returns null only
+  // when the row gives no entry/leverage to estimate from — callers keep their
+  // documented no-liq behaviour then.
+  async effectiveLiqPrice(position) {
+    const liq = Number(position?.liqPrice);
+    if (Number.isFinite(liq) && liq > 0) return liq;
+    const entry = Number(position?.avgPrice ?? position?.avgOpenPrice ?? position?.entryPrice);
+    const leverage = Number(position?.leverage);
+    const qty = positionMagnitude(position) ?? Number(position?.maxQty);
+    if (!finitePositive(entry) || !finitePositive(leverage) || leverage <= 0 || !finitePositive(qty)) return null;
+    const isLong = position.side === 'BUY' || position.side === 'LONG';
+    const mmr = await this.tierMaintenanceRate(entry * Math.abs(qty));
+    return isLong
+      ? entry * (1 - 1 / leverage + mmr)
+      : entry * (1 + 1 / leverage - mmr);
+  }
+
   // Estimate the liquidation price for a position that has not been opened yet.
   // Uses the tiered maintenance-margin table (get_position_tiers) and the standard
   // maintenance-margin model below. NOTE: Bitunix's liquidation-mechanism article
@@ -524,25 +591,16 @@ export class PositionManager {
   // unreachable the method falls back to 0.004 (the tier-1 rate the doc
   // publishes for small notionals), which is the safest (closest) estimate.
   //
-  // Note: Bitunix's margin mode is per-exchange, not per-order. If the account
-  // is actually running in ISOLATED mode, the cross-margin estimate here is
-  // wrong — but it is still the best available pre-entry estimate, and the
-  // liquidation guard + tiered maintenance-margin check will catch any
-  // divergence once the position is live.
+  // The margin mode is asked from the account itself (see accountMarginMode);
+  // position_type branches only when the account cannot be asked.
   async estimateLiqPrice(entryPrice, side, qty, balance, leverage) {
     if (!finitePositive(entryPrice) || !finitePositive(qty)) return null;
     const notional = entryPrice * qty;
-    const tiers = await this.getPositionTiers();
-    let mmr = 0.004; // tier-1 fallback from the docs
-    if (Array.isArray(tiers) && tiers.length) {
-      for (const row of tiers) {
-        const end = Number(row?.endValue ?? row?.end_value);
-        const rate = Number(row?.maintenanceMarginRate ?? row?.maintenance_margin_rate);
-        if (Number.isFinite(end) && Number.isFinite(rate) && notional <= end) { mmr = rate; break; }
-      }
-    }
+    const mmr = await this.tierMaintenanceRate(notional);
     const isLong = side === 'BUY' || side === 'LONG';
-    const cross = String(this.settings?.position_type ?? 'crossed').toLowerCase().includes('cross');
+    const mode = await this.accountMarginMode();
+    const cross = mode ? mode === 'CROSS'
+      : String(this.settings?.position_type ?? 'crossed').toLowerCase().includes('cross');
     if (cross) {
       const bal = finitePositive(balance) ? Number(balance) : 0;
       return isLong
@@ -1186,7 +1244,11 @@ export class PositionManager {
   // so a stop that got too close (e.g. because the liqPrice shifted after
   // opening, or because the move was to a level close to liq) gets re-armed.
   async rearmStopIfInsideLiq(position) {
-    const liq = Number(position.liqPrice);
+    // The exchange's liqPrice is preferred; a row that reports "0" (or lost it
+    // mid-trade) is re-armed against the ESTIMATED boundary instead, so the
+    // stop does not become decorative just because the exchange stopped
+    // publishing a number. See effectiveLiqPrice.
+    const liq = await this.effectiveLiqPrice(position);
     if (!Number.isFinite(liq) || liq <= 0) return null;
     const current = await this.currentStop(position);
     if (!Number.isFinite(current) || current <= 0) return null;
@@ -1211,13 +1273,26 @@ export class PositionManager {
 
   async checkLiquidationGuard(position) {
     const mark = Number(position.markPrice);
-    const liq = Number(position.liqPrice);
     if (!finitePositive(mark)) throw new Error('liquidation guard requires a mark price');
-    if (position.liqPrice === undefined || position.liqPrice === null || position.liqPrice === '') throw new Error('liquidation guard requires a liquidation price');
-    if (!Number.isFinite(liq) || liq <= 0) return { skipped: 'no active liquidation price' };
+    const rowLiq = Number(position.liqPrice);
+    const fromRow = Number.isFinite(rowLiq) && rowLiq > 0;
+    // A zeroed/missing liquidation price on a STILL-OPEN position used to be
+    // read as "nothing active to guard" — the guard silently disarmed itself
+    // for exactly the rows most at risk (JCTUSDT 2026-10-20 reported
+    // liqPrice "0" on a live 30x row). Estimate the boundary from the
+    // position's own numbers instead; only a row that cannot be estimated at
+    // all falls back to the old behaviour.
+    const liq = fromRow ? rowLiq : await this.effectiveLiqPrice(position);
+    if (!Number.isFinite(liq) || liq <= 0) {
+      if (position.liqPrice === undefined || position.liqPrice === null || position.liqPrice === '') {
+        throw new Error('liquidation guard requires a liquidation price');
+      }
+      return { skipped: 'no active liquidation price' };
+    }
     const distance = Math.abs(mark - liq) / mark;
     if (distance >= Number(this.settings.sl_liquidation_safety) / 100) return { skipped: 'liquidation distance safe' };
-    return this.emergencyClose(position, 'liquidation_guard');
+    const result = await this.emergencyClose(position, 'liquidation_guard');
+    return fromRow ? result : { ...result, liqEstimated: true };
   }
 
   // The tiered risk limit's own trigger, stated by the tiers endpoint verbatim:
@@ -1302,7 +1377,12 @@ export class PositionManager {
       const atr = await this.getAtrForPosition(position);
       const confidence = position.signalConfidence ?? this.settings.min_confidence;
       const entryPrice = Number(position.avgPrice);
-      const liqPrice = position.liqPrice ?? position.liq ?? null;
+      // The clamp must face the boundary the position actually has: a row
+      // reporting liqPrice "0" gets the estimate, otherwise computeTPSL would
+      // ship the raw ATR stop while the exchange's real liquidation sits
+      // above it (JCTUSDT 2026-10-20: SL 0.003973 under a live liq 0.003988).
+      const rowLiq = Number(position.liqPrice ?? position.liq);
+      const liqPrice = Number.isFinite(rowLiq) && rowLiq > 0 ? rowLiq : await this.effectiveLiqPrice(position);
       // Method dispatch: 'partial' replaces the single all-in TP with an
       // order-level ladder; 'trailing' and 'account' keep the position-level
       // pair because that is the only pair that exits the whole position at
@@ -1359,12 +1439,52 @@ export class PositionManager {
     }
   }
 
+  // Reversal handling: when the scanner detects a direction flip with high
+  // confidence (reversal_enabled && reversal_confidence met), close every open
+  // position whose side opposes the new market direction. Returns { closedCount }.
+  async checkReversal() {
+    if (!this.settings.reversal_enabled) return { closedCount: 0 };
+    const direction = this.reversal;
+    if (!direction || direction === 'neutral') return { closedCount: 0 };
+    // Only act on a fresh reversal: the trader sets this.state.reversal on each
+    // scanOnly() call, and we clear it after consuming so a reversal doesn't
+    // close positions on every subsequent tick.
+    if (!this._reversalConsumed) {
+      this._reversalConsumed = true;
+    } else {
+      return { closedCount: 0 };
+    }
+    const isLong = direction === 'bullish';
+    let closedCount = 0;
+    for (const position of this.state.positions) {
+      const positionIsLong = position.side === 'BUY' || position.side === 'LONG';
+      // Close positions opposing the new direction: longs on a bearish reversal,
+      // shorts on a bullish reversal.
+      if (positionIsLong === isLong) continue;
+      try {
+        const key = String(position.positionId);
+        if (this.closedThisCycle.has(key)) continue;
+        this.noteClose(key, 'reversal');
+        await this.client.closePosition(this.symbol, position.positionId, position);
+        this.closedThisCycle.add(key);
+        this.closedRecently.set(key, Date.now());
+        closedCount += 1;
+      } catch (error) {
+        // A reversal close failure is logged but must not block other positions.
+        console.error(`[reversal] failed to close ${position.positionId}: ${error.message}`);
+      }
+    }
+    return { closedCount };
+  }
+
   async midManage() {
     await this.fetchPositions();
     const errors = [];
     // The set is per-tick: a position closed now is gone on the next fetch, and
     // the same positionId must be allowed to close again if it is ever reopened.
     this.closedThisCycle.clear();
+    // Reset so a fresh reversal signal from the next scan cycle can be acted on.
+    this._reversalConsumed = false;
     // One TP/SL view per tick. Every stop move this tick reads the same rows it
     // will write against, so a take-profit set by hand mid-tick is not clobbered
     // by a stale cache and the list is not re-fetched per position.
@@ -1377,6 +1497,12 @@ export class PositionManager {
     } catch (error) {
       errors.push({ positionId: 'account', message: error.message });
     }
+    // Reversal: if the market direction has flipped with high confidence, close
+    // every position whose side opposes the new direction before any profit-side
+    // management runs. This is the one place the computed `reversal` flag is
+    // actually acted on — previously it was set in trader.js but never consumed.
+    const reversal = await this.checkReversal();
+    if (reversal?.closedCount && reversal.closedCount > 0) return errors;
     for (const position of this.state.positions) {
       let protectionFailed = false;
       try {

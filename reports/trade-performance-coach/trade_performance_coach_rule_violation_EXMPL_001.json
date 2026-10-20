@@ -1,0 +1,149 @@
+{
+  "behavioral_pattern_tags": [
+    {
+      "confidence": "high",
+      "evidence": "Entry/journal evidence suggests fear of missing a move or entry before confirmation.",
+      "reflection_question": "What evidence did you have before entry that would not have been available after waiting for confirmation?",
+      "tag": "fomo_entry"
+    },
+    {
+      "confidence": "high",
+      "evidence": "actual.stop_moved is true and no pre-planned stop-change rule was provided.",
+      "reflection_question": "Was the new stop part of the plan before entry?",
+      "tag": "stop_moved"
+    },
+    {
+      "confidence": "high",
+      "evidence": "Actual risk exceeded the planned or maximum risk (actual.risk_r=1.8 > reference_r=1).",
+      "reflection_question": "What would this trade have looked like at the planned risk size?",
+      "tag": "size_creep"
+    },
+    {
+      "confidence": "medium",
+      "evidence": "Multiple process findings suggest possible rule drift.",
+      "reflection_question": "Which single rule should be simplified and enforced next session?",
+      "tag": "rule_drift"
+    }
+  ],
+  "coach_questions": [
+    "What evidence did you have before entry that would not have been available after waiting for confirmation?",
+    "Was the new stop part of the plan before entry?",
+    "What would this trade have looked like at the planned risk size?",
+    "Which single rule should be simplified and enforced next session?"
+  ],
+  "disclaimer": "This review is for trading-process improvement only. It is not financial advice, investment advice, therapy, mental-health diagnosis, or a trading signal. The human trader remains responsible for all decisions and risk.",
+  "execution_quality_assessment": [
+    {
+      "evidence": "actual.entry_before_confirmation is true",
+      "finding": "Entry appears to have occurred before planned confirmation.",
+      "phase": "entry",
+      "severity": "critical"
+    },
+    {
+      "evidence": "actual.stop_moved is true",
+      "finding": "Stop was moved without a documented pre-defined rule.",
+      "phase": "stop",
+      "severity": "critical"
+    }
+  ],
+  "generated_at": "2026-10-20T14:18:48.495182+00:00",
+  "human_decision_gate": {
+    "allowed_actions": [
+      "accept_rules",
+      "modify_rules",
+      "defer",
+      "journal_only"
+    ],
+    "default_action": "journal_only",
+    "question": "Do you accept these temporary operating rules, modify them, defer the decision, or journal this review only?"
+  },
+  "next_session_operating_rules": [
+    {
+      "duration": "next_two_trades",
+      "reason": "Actual risk exceeded the stated risk plan.",
+      "rule": "Cap risk at 0.5R for the next two trades unless the trader explicitly modifies the risk plan in the journal.",
+      "trigger": "size_creep tag"
+    },
+    {
+      "duration": "next_week",
+      "reason": "The review found evidence of entry before confirmation or fear of missing a move.",
+      "rule": "No new entry without a pre-entry thesis record, invalidation point, and setup-confirmation note.",
+      "trigger": "possible FOMO entry pattern"
+    },
+    {
+      "duration": "next_session",
+      "reason": "Repeated losses or revenge-trade evidence can escalate risk-taking.",
+      "rule": "Switch to review-only mode for the next session; do not add new risk until the rule review is journaled.",
+      "trigger": "possible revenge/cool-down condition"
+    },
+    {
+      "duration": "next_month",
+      "reason": "Stop discipline protects the loss limit and keeps outcomes reviewable.",
+      "rule": "Any stop adjustment must be written before entry; unplanned stop changes require immediate post-trade review.",
+      "trigger": "unplanned stop move"
+    }
+  ],
+  "overall_verdict": "COOL_DOWN",
+  "process_adherence_findings": [
+    {
+      "evidence": "planned.thesis_recorded_before_entry is false",
+      "rule": "pre_entry_thesis_record",
+      "severity": "warning",
+      "status": "missed"
+    },
+    {
+      "evidence": "Entry appears to have occurred before planned setup confirmation",
+      "rule": "setup_confirmation",
+      "severity": "critical",
+      "status": "missed"
+    },
+    {
+      "evidence": "Trade was taken while market_regime='restrictive' or actual.traded_against_regime=true",
+      "rule": "market_regime_gate",
+      "severity": "critical",
+      "status": "missed"
+    },
+    {
+      "evidence": "Stop was moved after entry without evidence of a pre-defined stop-change rule",
+      "rule": "stop_change_rule",
+      "severity": "critical",
+      "status": "missed"
+    }
+  ],
+  "review_id": "rule_violation_EXMPL_001",
+  "review_type": "single_trade",
+  "risk_manager_notes": [
+    {
+      "evidence": "actual.risk_r=1.8, reference_r=1",
+      "finding": "Actual risk materially exceeded the planned or maximum risk.",
+      "severity": "critical",
+      "topic": "position_size"
+    },
+    {
+      "evidence": "portfolio_heat_r=4.2, max_portfolio_heat_r=4",
+      "finding": "Portfolio heat exceeded the provided maximum.",
+      "severity": "critical",
+      "topic": "portfolio_heat"
+    }
+  ],
+  "schema_version": 1,
+  "scores": {
+    "execution_score": 40,
+    "process_score": 0,
+    "review_quality_score": 100,
+    "risk_score": 40
+  },
+  "source_records": [
+    "/root/.claude/skills/trade-performance-coach/scripts/tests/fixtures/single_trade_rule_violation_loss.json"
+  ],
+  "summary": {
+    "confidence": "high",
+    "outcome": "loss",
+    "primary_root_cause": "rule_violation",
+    "secondary_root_causes": [
+      "market_environment",
+      "risk_sizing",
+      "behavior_pattern"
+    ]
+  }
+}

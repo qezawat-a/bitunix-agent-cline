@@ -142,6 +142,7 @@ export class Trader {
     lastSignal: null,
     lastReportData: null,
     lastMarketDirection: null,
+    reversal: null,
     confirmations: new Map(),
   };
   entryInFlight = new Set();
@@ -295,6 +296,7 @@ export class Trader {
       && previousDirection !== result.rawDirection
       && result.rawConfidence >= CONFIG.reversal_confidence;
     if (result.rawDirection && result.rawDirection !== 'neutral') this.state.lastMarketDirection = result.rawDirection;
+    this.state.reversal = reversal;
     result.reversal = reversal;
     if (!['bullish', 'bearish'].includes(result.signal)) {
       this.updateConfirmation(symbol, 'neutral');
@@ -428,7 +430,7 @@ export class Trader {
     // the bot looked like it had gone quiet — and the fill that eventually
     // arrived minutes later relied entirely on the manage pass to re-derive
     // protection for a position nothing was watching.
-    const { body } = this.buildProtectedOrderBody({
+    const { body, slPrice } = this.buildProtectedOrderBody({
       symbol,
       side: direction === 'bullish' ? 'BUY' : 'SELL',
       qty,
@@ -440,6 +442,13 @@ export class Trader {
       clientId,
       liqPrice: estLiqPrice,
     });
+    const stopDistance = Math.abs(entryPrice - Number(slPrice)) / entryPrice;
+    if (Number.isFinite(estLiqPrice) && estLiqPrice > 0) {
+      const liqDistance = Math.abs(entryPrice - estLiqPrice) / entryPrice;
+      if (stopDistance >= liqDistance) {
+        throw new Error(`stop distance ${stopDistance.toFixed(4)} >= liq distance ${liqDistance.toFixed(4)}; stop must be inside liquidation`);
+      }
+    }
 
     if (!CONFIG.auto_trade) throw new Error('auto_trade was disabled before order submission');
     if (CONFIG.symbol !== symbol) throw new Error('symbol changed before order submission');
@@ -479,10 +488,27 @@ export class Trader {
       // Protection has to be checked against the FULL rows from get_pending_positions,
       // otherwise a position that already carries its TP/SL could not be sized for a
       // re-arm or a safety close, which surfaced as "position ... has no valid size".
-      for (const position of this.positionManager.state.positions) await this.positionManager.ensureProtection(position);
+      for (const position of this.positionManager.state.positions) {
+        await this.positionManager.ensureProtection({ ...position, atr, signalConfidence });
+      }
     } catch (error) {
       this.state.orderUnknownUntil = Date.now() + Math.max(Number(CONFIG.cooldown_minutes) * 60000, 300000);
       throw error;
+    }
+    // The stop that shipped on the entry order was clamped against the
+    // PRE-ENTRY estimate. The exchange's own liquidation price — visible only
+    // once the live position row exists — can sit closer to the entry than any
+    // estimate reachable before the fill: JCTUSDT 2026-10-20 reported an SL
+    // 0.003973 under a live liq 0.003988 in its very first message. Pull the
+    // stop inside the exchange's real boundary now, before the first report
+    // shows the operator a stop the exchange will never fill. The manage tick
+    // retries this every cycle, so a failure never blocks the entry.
+    try {
+      for (const position of this.positionManager.state.positions) {
+        await this.positionManager.rearmStopIfInsideLiq(position);
+      }
+    } catch (error) {
+      console.error('post-fill liquidation reconciliation failed:', error.message);
     }
     return order;
   }
@@ -514,9 +540,18 @@ export class Trader {
       // A LIMIT order without an effect is a parameter error on Bitunix, and
       // GTC is the documented default the docs also spell out explicitly.
       effect: 'GTC',
-      ...levels,
+      tpPrice: String(levels.tpPrice),
+      slPrice: String(levels.slPrice),
       tpOrderType: 'MARKET',
       slOrderType: 'MARKET',
+      // The trigger source of the attached levels. The SDK's PlaceOrderRequest
+      // types these as the StopTriggerType enum (LAST_PRICE / MARK_PRICE), and
+      // omitting them leaves the exchange to pick a trigger, which is not
+      // necessarily the mark price the levels were derived from. The
+      // position-level TP/SL path already uses MARK_PRICE, so the order-level
+      // path must agree with it.
+      tpStopType: 'MARK_PRICE',
+      slStopType: 'MARK_PRICE',
       reduceOnly: false,
       tradeSide: 'OPEN',
       ...(clientId ? { clientId } : {}),
@@ -625,8 +660,28 @@ export class Trader {
     // only verifies the exchange really has it. ensureProtection() applies the
     // configured on_tpsl_failure behaviour (close) if the check fails.
     const protection = [];
+    // A FRESH ATR for the post-fill protection pass, not the one used to price
+    // the entry. The order's levels were computed from the ATR known at
+    // submission time; by the time the fill is reconciled the market has
+    // moved, and the position-level TP/SL that gets armed (or re-armed) has to
+    // match the volatility that is actually there now. It is a separate
+    // declaration from the entry-time `atr` above on purpose — shadowing it
+    // would redeclare the same const in one block, which is a SyntaxError.
+    //
+    // When the fresh ATR cannot be computed the failure is passed INTO
+    // ensureProtection rather than thrown here or papered over with the
+    // entry-time ATR. Throwing abandons the position with nothing armed and
+    // skips the on_tpsl_failure policy — the one thing this pass exists to
+    // enforce. Reusing the entry-time ATR would silently arm a stop derived
+    // from stale volatility, and would also hide a broken kline feed. Instead
+    // the ATR is left undefined so ensureProtection re-derives it itself and
+    // reaches the same failure through the one path that reacts to it.
+    let protectAtr = null;
+    try {
+      protectAtr = await this.computeAtr(normalizedSymbol);
+    } catch { /* ensureProtection re-derives the ATR and applies the failure policy */ }
     for (const position of this.positionManager.state.positions) {
-      protection.push(await this.positionManager.ensureProtection(position));
+      protection.push(await this.positionManager.ensureProtection({ ...position, atr: protectAtr, signalConfidence: confidence }));
     }
     return {
       order,
@@ -749,6 +804,9 @@ export class Trader {
     const now = Date.now();
     if (now < this.state.lastManage + CONFIG.mid_manage_interval_sec * 1000) return null;
     this.state.lastManage = now;
+    // Pass the latest reversal signal (computed by scanOnly on this or a previous
+    // tick) into the position manager so it can close opposing positions.
+    this.positionManager.reversal = this.state.reversal;
     this.manageInFlight = this.positionManager.midManage();
     try {
       const errors = await this.manageInFlight;

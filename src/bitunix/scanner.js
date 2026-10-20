@@ -132,8 +132,16 @@ class Scanner {
     }
 
     const agreeingStrategies = Object.keys(strategyAgreement).length;
-    const averageConfidence = eligible.length
-      ? eligible.reduce((sum, result) => sum + result.confidence, 0) / eligible.length
+    // Confidence describes the direction that won, so it is averaged over the
+    // timeframes that AGREE with it. Averaging every eligible timeframe let a
+    // strong timeframe pointing the other way raise the confidence of the
+    // signal it was voting against. Opposing timeframes still count against the
+    // signal through the quorum and the net score above.
+    const alignedResults = direction === 'neutral'
+      ? []
+      : eligible.filter(result => result.direction === direction);
+    const averageConfidence = alignedResults.length
+      ? alignedResults.reduce((sum, result) => sum + result.confidence, 0) / alignedResults.length
       : 0;
 
     // ---- regime gates ------------------------------------------------------

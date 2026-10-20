@@ -1,0 +1,56 @@
+strategy_id: jrock_pivot_C_carry_filter_v1
+parent_strategy: jrock_consensus_trend_v1
+technique: objective_reframe
+tier: exportable
+novelty_score: 6
+quality_potential: 8
+rank: 3
+hypothesis: Reframe objective from maximizing win count to maximizing net-of-cost R with tail capped. Keep the consensus vote but gate it by volatility-normalized risk and funding carry, halve leverage, and enforce partial exits.
+archetype: risk_premia_filtered_trend
+why_structural: Changes what counts as success: fewer, larger, cheaper trades rather than more votes cleared. Funding veto plus partial ladder plus account-level stop are new skeleton pieces.
+universe:
+  exchange: bitunix
+  symbols: [BTCUSDT]
+  leverage: 5
+timeframes: [5m, 15m, 1h]
+entry:
+  base_vote: same 10-strategy vote with min_confidence 80 and eligible 2 and efficiency 20 and adx 25 and margin 12
+  additional_gates:
+    - funding aligned or neutral, never enter against funding above 0.05pct per 8h
+    - ATR-normalized stop distance above 1.0x ATR so stops survive microstructure
+    - skip if spread above trailing 20-bar median spread
+exits:
+  tpsl_method: partial
+  partial_tp_fractions: [0.4, 0.3, 0.3]
+  partial_tp_roi_steps: [1, 2, 3]
+  base_stop_atr_multiple: 1.2
+  account_sl_roi_pct: 4
+  breakeven_threshold_pct: 20
+risk:
+  position_sizing_margin_pct: 1.5
+  max_positions: 2
+  sl_liquidation_safety_pct: 0.6
+  cooldown_minutes: 15
+  reversal_enabled: false
+expected_effect:
+  - cuts cost defeat by removing against-carry entries and microstructure stops
+  - partial ladder locks R early; account stop bounds the -3R tail seen in eval 004
+  - disabling reversals removes double-risk flips on whipsaw
+validation:
+  - backtest with real fee plus spread plus funding model, not raw TP/SL marks
+  - require net OOS PF above 1.25 and tail VaR95 better than -2.0R
+candidate_ticket:
+  pipeline: edge-candidate-agent
+  inputs:
+    strategy_yaml: reports/strategy-pivot/pivot_drafts/exportable/pivot_C_carry_filter.yaml
+    diagnosis: reports/strategy-pivot/pivot_diagnosis_20261020.json
+    history: reports/strategy-pivot/iteration_history.json
+  next_action: run backtest-expert evaluate_backtest.py on this draft, then feed winner back for next iteration cycle
+settings_patch_hint:
+  leverage: 5
+  timeframes: [5m, 15m, 1h]
+  tpsl_method: partial
+  account_sl_roi_pct: 4
+  position_sizing_margin_pct: 1.5
+  max_positions: 2
+  reversal_enabled: false

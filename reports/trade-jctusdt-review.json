@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "review_type": "single_trade",
+  "trade_id": "jctusdt_roundtrip_2112547399398187008",
+  "ticker": "JCTUSDT",
+  "outcome": "loss",
+  "planned": {
+    "thesis": "Unknown - trade record not provided from plan",
+    "entry": 0.004362,
+    "stop": null,
+    "target": null,
+    "risk_r": null,
+    "thesis_recorded_before_entry": null,
+    "setup_confirmed": null,
+    "market_regime": "unknown"
+  },
+  "actual": {
+    "entry": 0.004362,
+    "exit": 0.004278,
+    "risk_r": null,
+    "portfolio_heat_r": null,
+    "stop_moved": false,
+    "stop_move_planned": false,
+    "entry_before_confirmation": null,
+    "traded_against_regime": null,
+    "side": "BUY",
+    "qty": 2039,
+    "realized_pnl": -0.171276,
+    "fees": 0.010570176
+  },
+  "risk_plan": {
+    "max_risk_per_trade_r": null,
+    "max_portfolio_heat_r": null,
+    "max_weekly_loss_r": null
+  },
+  "postmortem": {
+    "root_cause": "unknown",
+    "notes": [
+      "Filled BUY at 0.004362 (MARKET), filled SELL at 0.004278 (MARKET, reduceOnly) for JCTUSDT",
+      "Realized PnL -0.171276, fees ~0.01057"
+    ]
+  },
+  "journal": {
+    "reflection": "Trade data extracted from Bitunix orders/positions pasted from Railway; missing plan/risk/journal details.",
+    "emotions": []
+  },
+  "metadata": {
+    "source": "pasted_bitunix_data",
+    "entry_order_id": "2112547399398187008",
+    "exit_order_id": "2112550668715532288",
+    "position_id": "3011868380762555429",
+    "ctime_entry": "1792505523912",
+    "ctime_exit": "1792506303375"
+  }
+}

@@ -5,3 +5,4 @@ data/
 .DS_Store
 .prisma-composer/
 .alchemy/
+.crypto_regime_cache/

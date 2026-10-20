@@ -1,0 +1,50 @@
+strategy_id: jrock_consensus_trend_v1
+version: 1
+hypothesis: BTCUSDT trends persist long enough on 1m-1h that a 10-strategy weighted vote plus regime gates captures them
+archetype: trend_following_consensus
+universe:
+  exchange: bitunix
+  market: USDT-M_perpetual
+  symbols: [BTCUSDT]
+  margin_mode: crossed
+  position_mode: hedge
+  leverage: 10
+timeframes: [1m, 3m, 5m, 15m, 1h]
+signal:
+  strategies:
+    - { key: ema, weight: 18 }
+    - { key: rsi, weight: 14 }
+    - { key: macd, weight: 18 }
+    - { key: volume, weight: 10 }
+    - { key: momentum, weight: 14 }
+    - { key: ichimoku, weight: 14 }
+    - { key: bollinger, weight: 12 }
+    - { key: funding, weight: 6 }
+    - { key: supertrend, weight: 18 }
+    - { key: atr_breakout, weight: 22 }
+  total_weight: 146
+  breadth_floor: 0.4
+  rules:
+    - tf_confidence >= 60 and direction != neutral to qualify timeframe
+    - eligible_timeframes >= 2
+    - aligned_timeframes >= ceil(eligible/2)
+    - mean_confidence >= 80
+    - agreeing_strategies >= 2
+    - efficiency >= 20
+    - adx >= 25
+    - mean_net_score_per_tf >= 12
+execution:
+  order_unit: cost
+  position_sizing_margin_pct: 2
+  max_positions: 3
+  tpsl_method: position
+  breakeven_threshold_pct: 20
+  trailing_trigger_roi_pct: 25
+  sl_liquidation_safety_pct: 0.60
+  cooldown_minutes: 5
+  reversal_enabled: true
+  reversal_confidence: 85
+known_limits:
+  - honest ceiling of strong trend roughly 82/146 weight active; thin voters (funding, bollinger, volume) rarely fire
+  - stacked gates risk permanent silence; loosening any single gate adds noise without adding edge
+  - 1m/3m scalps pay full spread plus fees plus funding on 10x

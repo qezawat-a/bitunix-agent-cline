@@ -1,0 +1,70 @@
+{
+  "metadata": {
+    "as_of": "2026-10-20T15:56:08.998279+00:00",
+    "universe_size": 19
+  },
+  "components": {
+    "btc_trend": {
+      "score": 100,
+      "signal": "BULL STACK (price > 50DMA > 200DMA); 200DMA rising",
+      "data_available": true,
+      "price": 82379.07,
+      "ma50": 81562.25,
+      "ma200": 72642.25,
+      "ma200_rising": true,
+      "ma200_direction": "rising"
+    },
+    "alt_breadth": {
+      "score": 75,
+      "signal": "67% of 18 tracked alts above 200DMA (11% above 50DMA); short-term breadth rolling over",
+      "data_available": true,
+      "pct_above_200dma": 66.7,
+      "pct_above_50dma": 11.1,
+      "universe_size": 18,
+      "skipped": []
+    },
+    "dominance": {
+      "score": 50,
+      "signal": "NO DATA: Need >= 31 daily dominance points",
+      "data_available": false
+    },
+    "funding": {
+      "score": 75,
+      "signal": "NEUTRAL (funding near baseline); avg 0.0047%/8h (~5.2% annualized) across 10 perps",
+      "data_available": true,
+      "avg_funding_8h": 4.7437e-05,
+      "annualized_pct": 5.19,
+      "n_symbols": 10
+    },
+    "drawdown_vol": {
+      "score": 65,
+      "signal": "Drawdown 28.0% from 1y high; volatility compressed (bottom third of 1y range)",
+      "data_available": true,
+      "drawdown_pct": 28.0,
+      "realized_vol_30d": 0.2262,
+      "vol_percentile_1y": 0.0
+    },
+    "momentum_thrust": {
+      "score": 35,
+      "signal": "WEAK: 32% of 19 coins positive over 30d",
+      "data_available": true,
+      "pct_positive_30d": 31.6,
+      "universe_size": 19
+    }
+  },
+  "composite": {
+    "score": 75.9,
+    "zone": "NEUTRAL",
+    "guidance": "Mixed conditions observed; no strong regime conclusion",
+    "effective_weights": {
+      "btc_trend": 0.2941,
+      "alt_breadth": 0.2353,
+      "funding": 0.1765,
+      "drawdown_vol": 0.1765,
+      "momentum_thrust": 0.1176
+    },
+    "components_available": 5,
+    "components_total": 6,
+    "available_weight": 0.85
+  }
+}

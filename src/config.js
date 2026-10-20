@@ -102,6 +102,8 @@ export const CONFIG = {
   guard_interval_sec: Number(S('guard_interval_sec', 15)),
   breakeven_threshold_pct: Number(S('breakeven_threshold_pct', 20)),
   trailing_trigger_roi_pct: Number(S('trailing_trigger_roi_pct', 25)),
+  // DEPRECATED: no longer read by any code path (ATR trailing replaced by
+  // ROI-step trailing). Kept for backward compatibility with settings.json.
   trailing_atr_multiple: Number(S('trailing_atr_multiple', 1.25)),
   trailing_atr_strength_reduction: Number(S('trailing_atr_strength_reduction', 0.25)),
   sl_liquidation_safety: (() => {
