@@ -26,7 +26,7 @@
 - Run: `npm test` (runs `tests/*.test.js` with `--test-concurrency=1`).
 - Kline fixtures must be built in **wire order (newest-first)** and routed through `toChronological` (`asClientReturns`), matching what `BitunixClient.getKlines` returns. Bare indicator arrays stay ascending — see the comments in `tests/smoke.test.js`.
 - Stub `globalThis.fetch` / client objects instead of hitting the network.
-- 57 suites / 348 tests currently green. New safety behavior needs a regression test that reproduces the failure path.
+- 68 suites / 381 tests currently green (commit `3a5738d`). New safety behavior needs a regression test that reproduces the failure path.
 
 ## Build & Run
 
