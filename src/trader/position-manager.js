@@ -1535,7 +1535,21 @@ export class PositionManager {
         // exchange force-closes first. This runs after the guards (they own
         // the "already too close, close it" decision) so it only ever moves a
         // still-open position's stop back into the fillable zone.
-        await this.rearmStopIfInsideLiq(position);
+        //
+        // A refused rearm (the exchange will not confirm the move, so
+        // confirmedStopMove arms a software stop and throws) must NOT abort the
+        // rest of this position's tick. It used to: the throw escaped to the
+        // outer catch, which skipped checkSoftStop — the only code that ever
+        // enforces the software stop that was just armed — plus break-even and
+        // trailing, for a position whose stop is already inside its liquidation
+        // padding. That is the one position on the book that most needs the
+        // remaining steps to run. The failure is still recorded, so it reaches
+        // the operator through reportErrors.
+        try {
+          await this.rearmStopIfInsideLiq(position);
+        } catch (error) {
+          errors.push({ positionId: position.positionId, message: error.message });
+        }
 
         // A stop the exchange refused to move is enforced here, before any
         // further profit-side management.

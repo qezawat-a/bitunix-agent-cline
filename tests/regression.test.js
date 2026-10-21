@@ -227,8 +227,11 @@ describe('ATR failure policy (on_tpsl_failure)', () => {
     });
     const positions = await client.getPendingPositions();
     const position = positions[0];
-    const result = await pm.ensureProtection(position);
-    assert.ok(!result.closed, 'position should not be closed on alert policy');
+    await assert.rejects(
+      () => pm.ensureProtection(position),
+      /TP\/SL protection failed/,
+      'alert policy must report by throwing, not close',
+    );
   });
 });
 
@@ -242,9 +245,9 @@ describe('mid-management ordering', () => {
     let breakevenAfterGuard = false;
     const client = {
       getPendingPositions: async () => [
-        { positionId: 'p1', symbol: 'BTCUSDT', side: 'BUY', qty: '1', avgPrice: '100', markPrice: '100.5', leverage: 10, liqPrice: '99.5' },
+        { positionId: 'p1', symbol: 'BTCUSDT', side: 'BUY', qty: '1', avgPrice: '100', markPrice: '100.5', leverage: 10, liqPrice: '99.5', atr: 1 },
       ],
-      getPendingTPSL: async () => [],
+      getPendingTPSL: async () => [{ positionId: 'p1', tpPrice: '103', slPrice: '98' }],
       getTradingPairs: async () => [{ symbol: 'BTCUSDT', quotePrecision: 2, basePrecision: 4 }],
       closePosition: async () => { return {}; },
       modifyTPSL: async () => { return {}; },
