@@ -7,7 +7,9 @@
     "start": "node src/main.js",
     "agent": "node src/agent/tui.js",
     "harness": "node src/harness.js",
-    "test": "node --test --test-concurrency=1 tests/*.test.js"
+    "test": "node --test --test-concurrency=1 tests/*.test.js",
+    "check": "node scripts/check.js",
+    "test:ci": "npm run check && npm test"
   },
   "dependencies": {
     "dotenv": "^16.4",
