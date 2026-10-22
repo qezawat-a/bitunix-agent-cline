@@ -1,0 +1,23 @@
+# J-ROCK Bitunix Futures API Client
+
+> AI agent documentation for integrating the Bitunix USDT-M futures REST API into a Node.js trading engine. Provides endpoint methods, signing mechanism, error handling, and position management. Version: v1.0.0 | Last updated: 2026-10-21
+
+## Getting Started
+
+- [Install dependencies](https://raw.githubusercontent.com/qezawat-a/bitunix-agent-cline/main/docs/api-demo.md): npm install dotenv pg ws
+- [Initialize BitunixClient](https://raw.githubusercontent.com/qezawat-a/bitunix-agent-cline/main/src/bitunix/client.js): api-key setup, signature generation
+- [API endpoint catalog](url:docs/api-demo.md): all 38 REST endpoints with method signatures
+
+## Reference
+
+- [API Demo Documentation](https://raw.githubusercontent.com/qezawat-a/bitunix-agent-cline/main/docs/api-demo.md): Runnable tour with --list and --dry-run modes
+- [API Parity Table](https://raw.githubusercontent.com/qezawat-a/bitunix-agent-cline/main/docs/api-parity.md): Java SDK → Node.js mapping with discrepancies
+- [BitunixClient source](https://raw.githubusercontent.com/qezawat-a/bitunix-agent-cline/main/src/bitunix/client.js): main client implementation
+- [Position Manager](https://raw.githubusercontent.com/qezawat-a/bitunix-agent-cline/main/src/trader/position-manager.js): leverage, TP/SL, protection logic
+- [Test Suite](https://raw.githubusercontent.com/qezawat-a/bitunix-agent-cline/main/tests/): integration tests for all endpoints
+
+## Optional
+
+- [Error Codes Reference](src/bitunix/client.js#L150): Error code to human-readable mapping
+- [Trading Strategy Implementation](src/trader/trader.js): How position sizing uses API data
+- [WebSocket Client](src/bitunix/ws.js): Real-time market data channels
