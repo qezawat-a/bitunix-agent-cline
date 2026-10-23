@@ -186,6 +186,7 @@ export function positionSizeFromUnit({ available, unit, price, leverage, marginP
   const roundedTo = precisionOf(pair, 'basePrecision', 8);
   const qty = roundQty(rawQty, pair);
   const warnings = [];
+  if (budget < requested) warnings.push(`margin capped from ${requested} to ${budget} USDT to leave room for fees`);
   if (qty !== rawQty) warnings.push(`qty floored from ${rawQty} to ${qty} at basePrecision ${roundedTo}`);
 
   // Cost/nominal are reported for the size we would actually trade, so a log
