@@ -54,4 +54,32 @@
 
 - Git: commit messages are short/freeform (e.g. "apply-fixes"); no conventional-commit format in history.
 - CI (`.github/workflow/neon_workflow.yml`) only creates/deletes Neon PR branches; it does **not** run tests — run `npm test` locally before pushing.
+
+## Architecture Overview (how the pieces connect)
+
+```
+main.js (composition root)
+  ├─ wires Telegram polling (telegram-bot.js) + / commands (telegram-trader.js)
+  ├─ starts scan loop  → Scanner (bitunix/scanner.js) → 10 strategies → multi-timeframe gate
+  ├─ wires agent  → loop.js → brain.js (model auto-refresh) → memory/skills/mcp
+  ├─ wires Trader  → position-manager.js (guards) → tpsl.js → order-units.js
+  ├─ wires BitunixClient (client.js / ws.js) for REST + WS
+  └─ wires persistence (store/persist.js) + session-store.js
+
+State flow:
+  env → config.js (CONFIG singleton) → settings.json → Neon Postgres (or data/ fallback)
+  Settings mutated at runtime via /set, /leverage, /symbol; must be saved back after each change.
+```
+
+## Entry Points
+
+| To... | Run / Touch |
+|-------|-------------|
+| Live service | `npm start` — health on :3000 reports `auto_trade` state |
+| Interactive agent TUI | `npm run agent` — `src/agent/tui.js` |
+| JSONL eval harness | `npm run harness` — drive agent over stdin/stdout |
+| API demo | `node scripts/api-demo.js [--dry-run|--list]` (mutating needs `BITUNIX_DEMO_TRADE=1`) |
+| Database check | `node scripts/db-check.js` |
+| Start trading | `/autotrade on` in Telegram (after all keys configured) |
+
 - The exchange is the source of truth: validate leverage/orders against the pair's advertised bands (`getTradingPairs`), never a local constant.
