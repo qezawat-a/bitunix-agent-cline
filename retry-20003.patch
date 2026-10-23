@@ -1,0 +1,106 @@
+diff --git a/src/trader/trader.js b/src/trader/trader.js
+index 720025a..863800d 100644
+--- a/src/trader/trader.js
++++ b/src/trader/trader.js
+@@ -1,6 +1,6 @@
+ import Scanner from '../bitunix/scanner.js';
+ import { atr as calculateAtr } from '../bitunix/indicators.js';
+-import { positionSizeFromUnit, roundPrice } from '../bitunix/order-units.js';
++import { positionSizeFromUnit, roundPrice, roundQty } from '../bitunix/order-units.js';
+ import { PositionManager } from './position-manager.js';
+ import { CONFIG } from '../config.js';
+ 
+@@ -464,9 +464,9 @@ export class Trader {
+     // maintenance-margin guard act on the exchange's own liqPrice and marginRate.
+     let order;
+     try {
+-      order = await this.client.placeOrder(body);
++      order = await this.placeOrderShrinking(body, pair);
+     } catch (error) {
+-      const reconciled = await this.reconcileOrder(symbol, clientId);
++      const reconciled = await this.reconcileOrder(symbol, error?.lastClientId || clientId);
+       if (!reconciled) {
+         if (error?.executionUnknown) {
+           // Network failure on a write: the order may be live, so block stacking.
+@@ -513,6 +513,33 @@ export class Trader {
+     return order;
+   }
+ 
++  // 20003 "Insufficient balance" means the exchange needed more free balance than
++  // the size we computed leaves (fees, price buffers on a market order and the
++  // like are not published as a formula). A refused order opens nothing, so the
++  // safe answer is to resend a smaller one instead of locking entries out for
++  // 60s on every scan and never trading at all. Each retry gets its own clientId
++  // so a refusal can never collide with 30042 Client ID duplicate. Stops at the
++  // pair's minimum volume and after a few attempts.
++  async placeOrderShrinking(body, pair, { attempts = 4, factor = 0.9 } = {}) {
++    let current = body;
++    for (let attempt = 0; ; attempt += 1) {
++      try {
++        return await this.client.placeOrder(current);
++      } catch (error) {
++        const insufficient = /\b20003\b/.test(String(error?.message || ''));
++        const next = roundQty(Number(current.qty) * factor, pair);
++        const minVolume = Number(pair?.minTradeVolume);
++        const belowMin = Number.isFinite(minVolume) && minVolume > 0 && next < minVolume;
++        if (!insufficient || attempt >= attempts || !(next > 0) || belowMin) {
++          if (error && typeof error === 'object') error.lastClientId = current.clientId;
++          throw error;
++        }
++        console.error(`[trade] 20003 at qty ${current.qty}; retrying with qty ${next} (attempt ${attempt + 1}/${attempts})`);
++        current = { ...current, qty: String(next), clientId: `${body.clientId}-r${attempt + 1}` };
++      }
++    }
++  }
++
+   // The only place an OPEN order is assembled. Both entry paths — autonomous
+   // openPosition() and the agent's manual tool — go through it, so a position
+   // can never reach the exchange without a take-profit and a stop-loss riding
+@@ -743,6 +770,7 @@ export class Trader {
+           : 'is not a tradable size';
+       throw new Error(`position size ${sized.qty} ${detail}`);
+     }
++    console.log(`[size] available=${available} qty=${sized.qty} margin=${sized.marginCost} nominal=${sized.nominalValue} lev=${sized.leverage}${sized.warnings?.length ? ` | ${sized.warnings.join('; ')}` : ''}`);
+     return { qty: sized.qty, pair, available };
+   }
+ 
+diff --git a/tests/insufficient-balance-retry.test.js b/tests/insufficient-balance-retry.test.js
+new file mode 100644
+index 0000000..58f51be
+--- /dev/null
++++ b/tests/insufficient-balance-retry.test.js
+@@ -0,0 +1,34 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { Trader } from '../src/trader/trader.js';
++
++const pair = { symbol: 'BTRUSDT', basePrecision: 0, minTradeVolume: '10' };
++const make = (rejections) => {
++  const sent = [];
++  const t = Object.create(Trader.prototype);
++  t.client = { async placeOrder(body) {
++    sent.push(body);
++    if (sent.length <= rejections) throw new Error('Bitunix POST /api/v1/futures/trade/place_order rejected: 20003 Insufficient balance');
++    return { orderId: '1' };
++  } };
++  return { t, sent };
++};
++
++test('a 20003 rejection is retried with a smaller qty and a fresh clientId', async () => {
++  const { t, sent } = make(2);
++  const order = await t.placeOrderShrinking({ symbol: 'BTRUSDT', qty: '1000', clientId: 'c' }, pair);
++  assert.equal(order.orderId, '1');
++  assert.deepEqual(sent.map(b => b.qty), ['1000', '900', '810']);
++  assert.deepEqual(sent.map(b => b.clientId), ['c', 'c-r1', 'c-r2']);
++});
++
++test('other rejections are not retried, and the retry stops at the minimum volume', async () => {
++  const other = Object.create(Trader.prototype);
++  let calls = 0;
++  other.client = { async placeOrder() { calls += 1; throw new Error('rejected: 10002 Parameter error'); } };
++  await assert.rejects(other.placeOrderShrinking({ qty: '100', clientId: 'x' }, pair), /10002/);
++  assert.equal(calls, 1);
++  const { t, sent } = make(99);
++  await assert.rejects(t.placeOrderShrinking({ qty: '11', clientId: 'y' }, pair), /20003/);
++  assert.equal(sent.length, 1); // 11 * 0.9 = 9 < minTradeVolume 10
++});

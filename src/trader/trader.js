@@ -1,6 +1,6 @@
 import Scanner from '../bitunix/scanner.js';
 import { atr as calculateAtr } from '../bitunix/indicators.js';
-import { positionSizeFromUnit, roundPrice } from '../bitunix/order-units.js';
+import { positionSizeFromUnit, roundPrice, roundQty } from '../bitunix/order-units.js';
 import { PositionManager } from './position-manager.js';
 import { CONFIG } from '../config.js';
 
@@ -464,9 +464,9 @@ export class Trader {
     // maintenance-margin guard act on the exchange's own liqPrice and marginRate.
     let order;
     try {
-      order = await this.client.placeOrder(body);
+      order = await this.placeOrderShrinking(body, pair);
     } catch (error) {
-      const reconciled = await this.reconcileOrder(symbol, clientId);
+      const reconciled = await this.reconcileOrder(symbol, error?.lastClientId || clientId);
       if (!reconciled) {
         if (error?.executionUnknown) {
           // Network failure on a write: the order may be live, so block stacking.
@@ -511,6 +511,33 @@ export class Trader {
       console.error('post-fill liquidation reconciliation failed:', error.message);
     }
     return order;
+  }
+
+  // 20003 "Insufficient balance" means the exchange needed more free balance than
+  // the size we computed leaves (fees, price buffers on a market order and the
+  // like are not published as a formula). A refused order opens nothing, so the
+  // safe answer is to resend a smaller one instead of locking entries out for
+  // 60s on every scan and never trading at all. Each retry gets its own clientId
+  // so a refusal can never collide with 30042 Client ID duplicate. Stops at the
+  // pair's minimum volume and after a few attempts.
+  async placeOrderShrinking(body, pair, { attempts = 4, factor = 0.9 } = {}) {
+    let current = body;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.client.placeOrder(current);
+      } catch (error) {
+        const insufficient = /\b20003\b/.test(String(error?.message || ''));
+        const next = roundQty(Number(current.qty) * factor, pair);
+        const minVolume = Number(pair?.minTradeVolume);
+        const belowMin = Number.isFinite(minVolume) && minVolume > 0 && next < minVolume;
+        if (!insufficient || attempt >= attempts || !(next > 0) || belowMin) {
+          if (error && typeof error === 'object') error.lastClientId = current.clientId;
+          throw error;
+        }
+        console.error(`[trade] 20003 at qty ${current.qty}; retrying with qty ${next} (attempt ${attempt + 1}/${attempts})`);
+        current = { ...current, qty: String(next), clientId: `${body.clientId}-r${attempt + 1}` };
+      }
+    }
   }
 
   // The only place an OPEN order is assembled. Both entry paths — autonomous
@@ -743,6 +770,7 @@ export class Trader {
           : 'is not a tradable size';
       throw new Error(`position size ${sized.qty} ${detail}`);
     }
+    console.log(`[size] available=${available} qty=${sized.qty} margin=${sized.marginCost} nominal=${sized.nominalValue} lev=${sized.leverage}${sized.warnings?.length ? ` | ${sized.warnings.join('; ')}` : ''}`);
     return { qty: sized.qty, pair, available };
   }
 
