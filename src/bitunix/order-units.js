@@ -172,8 +172,17 @@ export function positionSizeFromUnit({ available, unit, price, leverage, marginP
   // All three units are anchored on the same margin budget (at most 100% of the
   // balance), so the branches collapse to one line: the unit changes how the
   // caller reads the number, not the size that ends up on the wire.
-  const budget = balance * pct / 100;  // USDT committed as initial margin
-  const rawQty = budget * lev / mark;   // nominal = cost * leverage; qty = nominal / price
+  side the balance, otherwise the exchange answers 20003.
+  const maxBudget = balance * BALANCE_SAFETY / (1 + 2 * lev * TAKER_FEE_RATE);
+  const requested = balance * pct / 100;
+  const budget = Math.min(requested, maxBudget);
+  const rawQty = budget * lev / mark;
+   // total = margin + fee(open) + fee(close reserve) = budget * (1 + 2 * lev * fee)
+  // must fit inside the balance, otherwise the exchange answers 20003.
+  const maxBudget = balance * BALANCE_SAFETY / (1 + 2 * lev * TAKER_FEE_RATE);
+  const requested = balance * pct / 100;
+  const budget = Math.min(requested, maxBudget);
+  const rawQty = budget * lev / mark;
   const roundedTo = precisionOf(pair, 'basePrecision', 8);
   const qty = roundQty(rawQty, pair);
   const warnings = [];
