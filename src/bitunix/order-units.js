@@ -39,6 +39,9 @@ const UNIT_ALIASES = {
 // trades, but they strip binary-float noise (0.1 * 3 === 0.30000000000000004).
 const QTY_DECIMALS = 12;
 const MONEY_DECIMALS = 8;
+// Bitunix taker fee 0.06%: opening fee comes out of the same balance as the margin.
+const TAKER_FEE_RATE = 0.0006;
+const BALANCE_SAFETY = 0.99; // 1% headroom for rounding / market slippage
 
 // Booleans and objects coerce to 1/0 through Number(), which would silently
 // pass validation, so only accept what could plausibly be a real measurement.
@@ -169,20 +172,14 @@ export function positionSizeFromUnit({ available, unit, price, leverage, marginP
   const type = String(orderType ?? 'MARKET').trim().toUpperCase();
   if (!['LIMIT', 'MARKET'].includes(type)) throw new Error(`orderType must be LIMIT or MARKET (got ${JSON.stringify(orderType)})`);
 
-  // All three units are anchored on the same margin budget (at most 100% of the
-  // balance), so the branches collapse to one line: the unit changes how the
-  // caller reads the number, not the size that ends up on the wire.
-  side the balance, otherwise the exchange answers 20003.
-  const maxBudget = balance * BALANCE_SAFETY / (1 + 2 * lev * TAKER_FEE_RATE);
+  // All three units are anchored on the same margin budget, so the unit only changes
+  // how the caller reads the number, not the size that ends up on the wire.
+  // total outlay = margin + fee(open) + fee(close reserve) = budget * (1 + 2 * lev * fee)
+  // and it must fit inside the balance, otherwise the exchange answers 20003.
   const requested = balance * pct / 100;
-  const budget = Math.min(requested, maxBudget);
-  const rawQty = budget * lev / mark;
-   // total = margin + fee(open) + fee(close reserve) = budget * (1 + 2 * lev * fee)
-  // must fit inside the balance, otherwise the exchange answers 20003.
   const maxBudget = balance * BALANCE_SAFETY / (1 + 2 * lev * TAKER_FEE_RATE);
-  const requested = balance * pct / 100;
   const budget = Math.min(requested, maxBudget);
-  const rawQty = budget * lev / mark;
+  const rawQty = budget * lev / mark;   // nominal = cost * leverage; qty = nominal / price
   const roundedTo = precisionOf(pair, 'basePrecision', 8);
   const qty = roundQty(rawQty, pair);
   const warnings = [];
@@ -215,7 +212,8 @@ export function positionSizeFromUnit({ available, unit, price, leverage, marginP
     // balance computed ~347 units against a 700-unit minimum on every single
     // signal, so the entry failed forever and the position was never opened.
     const costOfMin = minVolume * mark / lev;
-    if (Number.isFinite(costOfMin) && costOfMin <= balance) {
+    const outlayOfMin = costOfMin * (1 + 2 * lev * TAKER_FEE_RATE);
+    if (Number.isFinite(outlayOfMin) && outlayOfMin <= balance * BALANCE_SAFETY) {
       const minQty = roundQty(minVolume, pair);
       if (minQty >= minVolume) {
         return {

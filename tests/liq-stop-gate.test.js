@@ -45,7 +45,7 @@ const MMR = 0.004;
 function estLiq(entry, side, lev, qty, balance, cross, pct) {
   if (!cross) return entry * (1 - 1 / lev + MMR);
   // cross: budget = available*pct/100 margin; qty = budget*lev/entry (basePrec 1 -> floor)
-  const budget = 1000 * pct / 100;
+  const budget = Math.min(1000 * pct / 100, 1000 * 0.99 / (1 + 2 * lev * 0.0006));
   const q = Math.floor(budget * lev / entry);
   return side === 'long' ? entry * (1 + MMR) - 1000 / q : entry * (1 - MMR) + 1000 / q;
 }

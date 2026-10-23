@@ -1,0 +1,92 @@
+diff --git a/src/bitunix/order-units.js b/src/bitunix/order-units.js
+index 5453f50..6bdc340 100644
+--- a/src/bitunix/order-units.js
++++ b/src/bitunix/order-units.js
+@@ -40,6 +40,14 @@ const UNIT_ALIASES = {
+ const QTY_DECIMALS = 12;
+ const MONEY_DECIMALS = 8;
+ 
++// Bitunix USDT-M taker fee (0.06%). The exchange takes the opening fee out of the
++// SAME available balance that funds the margin, and a close needs room for its
++// own fee. Sizing the margin at 100% of the balance therefore always answered
++// "20003 Insufficient balance": margin + fee > balance. The budget is capped so
++// margin + open fee + close-fee reserve fits inside BALANCE_SAFETY of the balance.
++const TAKER_FEE_RATE = 0.0006;
++const BALANCE_SAFETY = 0.99; // 1% headroom for rounding and market-order slippage
++
+ // Booleans and objects coerce to 1/0 through Number(), which would silently
+ // pass validation, so only accept what could plausibly be a real measurement.
+ function numeric(value) {
+@@ -172,11 +180,17 @@ export function positionSizeFromUnit({ available, unit, price, leverage, marginP
+   // All three units are anchored on the same margin budget (at most 100% of the
+   // balance), so the branches collapse to one line: the unit changes how the
+   // caller reads the number, not the size that ends up on the wire.
+-  const budget = balance * pct / 100;  // USDT committed as initial margin
++  // total outlay = margin + fee(open) + fee(close reserve) = budget * (1 + 2 * lev * fee)
++  // and it must fit inside the balance, otherwise the exchange answers 20003.
++  // For small percentages the cap never binds, so those sizes are unchanged.
++  const requested = balance * pct / 100;  // USDT the operator asked to commit as margin
++  const maxBudget = balance * BALANCE_SAFETY / (1 + 2 * lev * TAKER_FEE_RATE);
++  const budget = Math.min(requested, maxBudget);
+   const rawQty = budget * lev / mark;   // nominal = cost * leverage; qty = nominal / price
+   const roundedTo = precisionOf(pair, 'basePrecision', 8);
+   const qty = roundQty(rawQty, pair);
+   const warnings = [];
++  if (budget < requested) warnings.push(`margin capped from ${requested} to ${budget} USDT to leave room for fees`);
+   if (qty !== rawQty) warnings.push(`qty floored from ${rawQty} to ${qty} at basePrecision ${roundedTo}`);
+ 
+   // Cost/nominal are reported for the size we would actually trade, so a log
+@@ -205,7 +219,9 @@ export function positionSizeFromUnit({ available, unit, price, leverage, marginP
+     // balance computed ~347 units against a 700-unit minimum on every single
+     // signal, so the entry failed forever and the position was never opened.
+     const costOfMin = minVolume * mark / lev;
+-    if (Number.isFinite(costOfMin) && costOfMin <= balance) {
++    // Fee-inclusive, for the same reason as the budget cap above.
++    const outlayOfMin = costOfMin * (1 + 2 * lev * TAKER_FEE_RATE);
++    if (Number.isFinite(outlayOfMin) && outlayOfMin <= balance * BALANCE_SAFETY) {
+       const minQty = roundQty(minVolume, pair);
+       if (minQty >= minVolume) {
+         return {
+diff --git a/tests/fee-headroom.test.js b/tests/fee-headroom.test.js
+new file mode 100644
+index 0000000..18ee8b4
+--- /dev/null
++++ b/tests/fee-headroom.test.js
+@@ -0,0 +1,22 @@
++import test from 'node:test';
++import assert from 'node:assert/strict';
++import { positionSizeFromUnit } from '../src/bitunix/order-units.js';
++
++const pair = { symbol: 'BTRUSDT', basePrecision: 0, quotePrecision: 5, minTradeVolume: '1', maxMarketOrderVolume: '1000000' };
++
++// position_sizing_margin_pct=100 sent the whole balance as margin, and Bitunix
++// answered "20003 Insufficient balance" because the open fee comes out of the same balance.
++test('100% margin leaves room for the open fee and the close reserve', () => {
++  const balance = 10;
++  const sized = positionSizeFromUnit({ available: balance, unit: 'cost', price: 0.065, leverage: 10, marginPct: 100, pair });
++  assert.equal(sized.ok, true);
++  const fee = sized.nominalValue * 0.0006;
++  assert.ok(sized.marginCost + fee * 2 <= balance, `margin ${sized.marginCost} + fees ${fee * 2} must fit in ${balance}`);
++  assert.ok(sized.warnings.some(w => /capped/.test(w)));
++});
++
++test('small percentages are not affected by the fee cap', () => {
++  const sized = positionSizeFromUnit({ available: 1000, unit: 'cost', price: 100, leverage: 10, marginPct: 2, pair: { ...pair, basePrecision: 3 } });
++  assert.equal(sized.qty, 2); // 20 USDT * 10 / 100
++  assert.ok(!sized.warnings.some(w => /capped/.test(w)));
++});
+diff --git a/tests/liq-stop-gate.test.js b/tests/liq-stop-gate.test.js
+index 8197569..62b570f 100644
+--- a/tests/liq-stop-gate.test.js
++++ b/tests/liq-stop-gate.test.js
+@@ -45,7 +45,9 @@ const MMR = 0.004;
+ function estLiq(entry, side, lev, qty, balance, cross, pct) {
+   if (!cross) return entry * (1 - 1 / lev + MMR);
+   // cross: budget = available*pct/100 margin; qty = budget*lev/entry (basePrec 1 -> floor)
+-  const budget = 1000 * pct / 100;
++  // Sizing caps the margin so margin + open fee + close-fee reserve fits in the
++  // balance (order-units.js); 100% used to be sent as-is and got 20003.
++  const budget = Math.min(1000 * pct / 100, 1000 * 0.99 / (1 + 2 * lev * 0.0006));
+   const q = Math.floor(budget * lev / entry);
+   return side === 'long' ? entry * (1 + MMR) - 1000 / q : entry * (1 - MMR) + 1000 / q;
+ }
